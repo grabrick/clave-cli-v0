@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use crate::Provider;
 
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 pub(crate) struct RunUsage {
@@ -36,11 +37,10 @@ impl SessionUsage {
         }
     }
 
-    pub(crate) fn record(&mut self, provider: &str, run: RunUsage) {
-        let slot = if provider == "claude" {
-            &mut self.claude
-        } else {
-            &mut self.codex
+    pub(crate) fn record(&mut self, provider: Provider, run: RunUsage) {
+        let slot = match provider {
+            Provider::Claude => &mut self.claude,
+            Provider::Codex => &mut self.codex,
         };
         slot.total.input += run.input;
         slot.total.output += run.output;
@@ -67,7 +67,7 @@ mod tests {
     fn record_accumulates_per_provider() {
         let mut s = SessionUsage::new();
         s.record(
-            "claude",
+            Provider::Claude,
             RunUsage {
                 input: 100,
                 output: 50,
@@ -77,7 +77,7 @@ mod tests {
             },
         );
         s.record(
-            "claude",
+            Provider::Claude,
             RunUsage {
                 input: 200,
                 output: 30,
@@ -87,7 +87,7 @@ mod tests {
             },
         );
         s.record(
-            "codex",
+            Provider::Codex,
             RunUsage {
                 input: 80,
                 output: 20,

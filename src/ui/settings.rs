@@ -3,13 +3,12 @@ use super::*;
 pub(crate) fn draw_settings_screen(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Clear, area);
 
-    let mut lines = Vec::new();
-    lines.push(Line::styled(
+    let mut lines = vec![Line::styled(
         "› /settings",
         Style::default()
             .fg(app.theme.accent())
             .add_modifier(Modifier::BOLD),
-    ));
+    )];
     lines.push(Line::styled(
         "─".repeat(area.width as usize),
         Style::default().fg(app.theme.accent_dim()),

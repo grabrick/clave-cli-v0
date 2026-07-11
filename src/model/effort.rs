@@ -5,11 +5,8 @@ pub(crate) fn effort_label(index: usize) -> &'static str {
 }
 
 pub(crate) fn provider_supports_effort(provider: &str, effort: &str) -> bool {
-    match provider {
-        "codex" => matches!(effort, "low" | "medium" | "high" | "xhigh"),
-        "claude" => matches!(effort, "low" | "medium" | "high" | "max"),
-        _ => false,
-    }
+    // Единый источник — таблицы allowed-efforts; matches! здесь дублировал бы CODEX/CLAUDE.
+    provider_allowed_efforts(provider).contains(&effort)
 }
 
 pub(crate) fn provider_allowed_efforts(provider: &str) -> &'static [&'static str] {
@@ -29,7 +26,7 @@ pub(crate) fn effort_index_for(effort: &str) -> usize {
 
 pub(crate) fn normalize_effort_index_for(allowed: &[&str], index: usize) -> usize {
     let effort = effort_label(index);
-    if allowed.iter().any(|allowed| *allowed == effort) {
+    if allowed.contains(&effort) {
         index
     } else {
         effort_index_for("high")

@@ -74,9 +74,9 @@ impl App {
         // Проверку логина НЕ делаем здесь синхронно (она спавнит CLI-подпроцессы и
         // морозит UI на пару секунд) — она ушла в воркер ниже. Сообщение и лоадер
         // показываются мгновенно.
-        let provider = self.direct_provider.as_str();
-        let provider_name = provider_display(provider, self.lang);
-        let effort = self.provider_effort(provider).to_string();
+        let provider = self.direct_provider;
+        let provider_name = provider_display(provider.as_str(), self.lang);
+        let effort = self.provider_effort(provider.as_str()).to_string();
         let lang = self.lang;
         let token_estimate = estimate_tokens(&prompt);
         let work_dir = self.resolved_work_dir();
@@ -105,14 +105,14 @@ impl App {
         }
 
         let tx = self.tx.clone();
-        thread::spawn(move || {
+        spawn_worker(self.tx.clone(), move || {
             // Логин проверяем здесь, в воркере (не морозя UI). Не залогинен → событие.
             if !provider_authenticated(provider) {
                 let _ = tx.send(WorkerEvent::AuthMissing(provider));
                 return;
             }
             let command_result = run_chat_provider(
-                provider,
+                provider.as_str(),
                 &effort,
                 &prompt,
                 &work_dir,
@@ -140,7 +140,7 @@ impl App {
                     } else {
                         // Показываем КОД выхода и причину — раньше код терялся, а пустой
                         // stderr давал немое «no stderr output» (см. chat_error_lines).
-                        for line in chat_error_lines(provider, code, stderr, lang) {
+                        for line in chat_error_lines(provider.as_str(), code, stderr, lang) {
                             let _ = tx.send(WorkerEvent::Line(line));
                         }
                     }
@@ -162,7 +162,7 @@ impl App {
                 Err(err) => {
                     let _ = tx.send(WorkerEvent::Failed(format!(
                         "{}: {}",
-                        provider_display(provider, lang),
+                        provider_display(provider.as_str(), lang),
                         err
                     )));
                 }
@@ -256,7 +256,7 @@ impl App {
             self.out_dir
         ));
 
-        thread::spawn(move || {
+        spawn_worker(self.tx.clone(), move || {
             let mut args = Vec::new();
 
             match mode {
@@ -303,13 +303,14 @@ impl App {
                 task,
             ]);
 
-            let mut child = match Command::new(&engine)
+            let mut engine_command = Command::new(&engine);
+            engine_command
                 .current_dir(&work_dir)
                 .args(args)
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-            {
+                .stderr(Stdio::piped());
+            configure_process_group(&mut engine_command);
+            let mut child = match engine_command.spawn() {
                 Ok(child) => child,
                 Err(err) => {
                     let _ = tx.send(WorkerEvent::Failed(format!(
@@ -330,8 +331,8 @@ impl App {
 
             loop {
                 if cancel_rx.try_recv().is_ok() {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    // Убиваем всю группу движка (spec-clave + порождённые им claude/codex).
+                    kill_process_tree(&mut child);
                     let _ = tx.send(WorkerEvent::Cancelled);
                     return;
                 }

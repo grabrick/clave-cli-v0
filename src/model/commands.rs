@@ -340,6 +340,9 @@ fn is_known_command_token(token: &str) -> bool {
     COMMANDS
         .iter()
         .any(|command| command.command_token() == token)
+        // Намеренные скрытые алиасы к каноническим командам (в палитру/справку не выносим):
+        // /language→/lang, /clave→/plan, /auth→/logout, /exit→/quit. Их обрабатывает
+        // App::handle_command; здесь распознаём как команду, а не как обычный ввод.
         || matches!(token, "/language" | "/clave" | "/auth" | "/exit")
 }
 
@@ -353,8 +356,7 @@ fn normalize_command_rest(command: &str, rest: &str) -> String {
             }
         }
         "/mode" | "/chat-model" | "/theme" | "/color" | "/roles" => {
-            let normalized = normalize_ru_keyboard_layout(rest);
-            normalized
+            normalize_ru_keyboard_layout(rest)
         }
         _ => rest.to_string(),
     }

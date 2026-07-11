@@ -174,6 +174,23 @@ pub(crate) fn theme_shimmer_color(theme: Theme, index: usize, tick: u64) -> Colo
     palette[color_index]
 }
 
+pub(crate) fn format_elapsed(duration: Duration) -> String {
+    let total = duration.as_secs();
+    if total < 60 {
+        return format!("{}s", total.max(1));
+    }
+
+    let minutes = total / 60;
+    let seconds = total % 60;
+    if minutes < 60 {
+        return format!("{}m {:02}s", minutes, seconds);
+    }
+
+    let hours = minutes / 60;
+    let minutes = minutes % 60;
+    format!("{}h {:02}m", hours, minutes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,21 +304,4 @@ mod tests {
         assert!(en.contains(&en_verb), "en verb из своего набора");
         assert!(!ru.contains(&en_verb), "en не из ru-набора");
     }
-}
-
-pub(crate) fn format_elapsed(duration: Duration) -> String {
-    let total = duration.as_secs();
-    if total < 60 {
-        return format!("{}s", total.max(1));
-    }
-
-    let minutes = total / 60;
-    let seconds = total % 60;
-    if minutes < 60 {
-        return format!("{}m {:02}s", minutes, seconds);
-    }
-
-    let hours = minutes / 60;
-    let minutes = minutes % 60;
-    format!("{}h {:02}m", hours, minutes)
 }

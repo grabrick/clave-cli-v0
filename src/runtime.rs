@@ -4,10 +4,6 @@ use crate::*;
 pub(crate) fn main_entry() -> AnyResult<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
 
-    if args.first().is_some_and(|arg| arg == "--serve") {
-        return run_server(&args[1..]);
-    }
-
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         print_usage();
         return Ok(());
@@ -22,7 +18,7 @@ pub(crate) fn main_entry() -> AnyResult<()> {
 
 pub(crate) fn print_usage() {
     println!(
-        "{APP_COMMAND}\n\nUsage:\n  {APP_COMMAND}                 Open TUI\n  {APP_COMMAND} --serve         Start mobile web remote\n  {APP_COMMAND} <task...>       Run task directly through {ENGINE_NAME}\n  {APP_COMMAND} --help          Show help\n"
+        "{APP_COMMAND}\n\nUsage:\n  {APP_COMMAND}                 Open TUI\n  {APP_COMMAND} <task...>       Run task directly through {ENGINE_NAME}\n  {APP_COMMAND} --help          Show help\n"
     );
 }
 
@@ -38,6 +34,7 @@ pub(crate) fn run_engine_direct(args: Vec<String>) -> AnyResult<()> {
 
 pub(crate) fn run_tui() -> AnyResult<()> {
     force_color_output(true);
+    install_panic_hook();
     let _guard = TerminalGuard::new()?;
     let mut app = App::new();
     // Welcome — при пустом старте ИЛИ когда в восстановленном чате нет реального
@@ -72,14 +69,38 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            DisableBracketedPaste,
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        );
+        restore_terminal();
     }
+}
+
+/// Возвращает терминал в нормальное состояние: снимает raw mode, выключает bracketed
+/// paste / alt-screen / mouse capture (на случай, если их включала модалка) и — важно —
+/// СНОВА показывает курсор. Рендер прячет курсор через Hide; без явного Show он остался
+/// бы невидимым после аварийного выхода или паники.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        crossterm::cursor::Show
+    );
+}
+
+/// Глобальный panic-hook: при панике ГЛАВНОГО (UI) потока сначала возвращает терминал в
+/// норму, затем печатает бэктрейс — иначе он выводится в raw-режиме «лесенкой», а курсор
+/// остаётся скрытым. Паники рабочих потоков терминал не трогают и не печатаются: их ловит
+/// `spawn_worker` и превращает в WorkerEvent::Failed (иначе бэктрейс испортил бы живой
+/// TUI, а лоадер завис бы навсегда).
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if thread::current().name() == Some("main") {
+            restore_terminal();
+            previous(info);
+        }
+    }));
 }
 
 /// Приветственный блок (Claude-style): логотип слева + имя/модель/cwd справа, без

@@ -52,7 +52,7 @@ python3 scripts/render_check.py target/release/clave <CLAVE_HOME>
 Clave has two layers:
 
 - `spec-clave` - a Bash architect/reviewer planning engine.
-- `src/` - the Rust TUI, direct chat runtime, settings, storage, and server.
+- `src/` - the Rust TUI, direct chat runtime, settings, and storage.
 
 Important Rust areas:
 

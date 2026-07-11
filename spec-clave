@@ -296,7 +296,7 @@ as if the developer wants a shippable 3-5 day MVP.
 
 Return exactly these markdown sections:
 
-VERDICT: APPROVE or VERDICT: REVISE
+On its own line, output your verdict as exactly VERDICT: APPROVE or VERDICT: REVISE and nothing else on that line (no "APPROVE WITH NOTES", no extra words).
 
 ## Blockers
 List only issues that truly block implementation.
@@ -441,7 +441,10 @@ run_reviewer() {
 }
 
 is_approved() {
-  grep -Eiq '^[[:space:]]*\**[[:space:]]*VERDICT:[[:space:]]*APPROVE' "$1"
+  # Якорим ВЕСЬ остаток строки: после APPROVE допустимы лишь пробелы/точки/звёздочки до
+  # конца строки. Иначе "APPROVE WITH NOTES", "APPROVED" или эхо строки-инструкции
+  # «VERDICT: APPROVE or VERDICT: REVISE» ложно засчитали бы одобрение.
+  grep -Eiq '^[[:space:]]*\**[[:space:]]*VERDICT:[[:space:]]*APPROVE[[:space:]]*[.*]*[[:space:]]*$' "$1"
 }
 
 SPEC_PATH="$RUN_DIR/01-architect-draft.md"

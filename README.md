@@ -98,7 +98,6 @@ Cargo run during development.
 ```bash
 clave                  # open the interactive TUI
 clave "<task>"         # run a task directly through the planning engine
-clave --serve          # start the experimental mobile web remote
 clave --help
 ```
 
@@ -196,19 +195,6 @@ scroll and drag to select text.
 - Full Access, Tandem, and `/plan` can execute code. Review plans and run Clave
   only inside repositories you trust.
 
-## Mobile Remote
-
-`clave --serve` starts an experimental local web remote powered by `tiny_http`.
-Use it to send tasks from a phone, switch modes, watch streamed output, and
-cancel a run.
-
-```bash
-CLAVE_SERVE_TOKEN=secret clave --serve --host <tailscale-ip> --port 8765
-```
-
-Only expose the remote on a trusted private network, such as Tailscale, and use a
-token. The remote is V0 and intentionally conservative.
-
 ## State And Environment
 
 State lives in `~/.clave/` by default:
@@ -246,7 +232,6 @@ Main Rust areas:
 - `src/ui/` - `ratatui` rendering that reads `&App`.
 - `src/runtime.rs` - entrypoint, event loop, key handling.
 - `src/worker.rs` - provider and engine execution, stream parsing.
-- `src/server/` - experimental mobile web remote.
 - `src/storage.rs`, `src/auth.rs`, `src/input.rs` - persistence, CLI auth checks,
   input helpers.
 
@@ -277,16 +262,14 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development conventions.
 ## Project Status
 
 Clave is an early `0.1.0` CLI-first tool built for local agent workflows. The
-core TUI, direct chat, planning loop, saved chats, settings, and experimental
-mobile remote exist today.
+core TUI, direct chat, planning loop, saved chats, and settings exist today.
 
 Near-term roadmap:
 
 - release CI for macOS, Linux, and Windows binaries;
 - Homebrew formula;
 - public demo clip / asciinema;
-- stronger docs for Tandem workflows;
-- more hardening around the experimental web remote.
+- stronger docs for Tandem workflows.
 
 ## Русская версия
 

@@ -31,11 +31,10 @@ pub(crate) fn missing_auth_text(mode: Mode, onboarding: &Onboarding, lang: Langu
 }
 
 /// Проверяет логин ОДНОГО провайдера (для воркера, без заморозки UI).
-pub(crate) fn provider_authenticated(provider: &str) -> bool {
+pub(crate) fn provider_authenticated(provider: Provider) -> bool {
     match provider {
-        "claude" => claude_auth_probe().authenticated,
-        "codex" => codex_auth_probe().authenticated,
-        _ => true,
+        Provider::Claude => claude_auth_probe().authenticated,
+        Provider::Codex => codex_auth_probe().authenticated,
     }
 }
 
@@ -98,19 +97,42 @@ pub(crate) fn claude_auth_probe() -> AuthProbe {
     }
 }
 
+/// Эвристика «залогинен ли провайдер» по выводу `*_auth_probe`. Стабильного контракта у
+/// чужих CLI нет, поэтому по приоритету: явные маркеры НЕ-логина перекрывают всё (их
+/// печатают и с exit 0), затем явный маркер логина (принимаем даже при ненулевом коде —
+/// бывает диагностический вывод), иначе — доверяемся коду выхода пробы.
 pub(crate) fn auth_output_looks_ready(success: bool, text: &str) -> bool {
-    if !success {
+    let lower = text.to_lowercase();
+
+    if AUTH_NOT_READY_MARKERS.iter().any(|m| lower.contains(m)) {
         return false;
     }
-
-    let lower = text.to_lowercase();
-    !lower.contains("not logged")
-        && !lower.contains("not authenticated")
-        && !lower.contains("not signed")
-        && !lower.contains("login required")
-        && !lower.contains("logged out")
-        && !lower.contains("no credentials")
+    if AUTH_READY_MARKERS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    success
 }
+
+const AUTH_NOT_READY_MARKERS: &[&str] = &[
+    "not logged",
+    "not authenticated",
+    "not signed",
+    "login required",
+    "please log in",
+    "please login",
+    "logged out",
+    "no credentials",
+    "unauthenticated",
+    "auth required",
+];
+
+const AUTH_READY_MARKERS: &[&str] = &[
+    "logged in",
+    "logged into",
+    "signed in",
+    "authenticated as",
+    "account:",
+];
 
 pub(crate) fn command_output_text(stdout: &[u8], stderr: &[u8]) -> String {
     let mut text = String::new();
@@ -160,4 +182,27 @@ pub(crate) fn run_external_command(command: &ExternalCommand) -> AnyResult<i32> 
 
     enable_raw_mode()?;
     Ok(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_ready_prefers_explicit_markers_over_exit_code() {
+        // Явный не-логин перекрывает даже успешный код выхода.
+        assert!(!auth_output_looks_ready(true, "You are not logged in."));
+        assert!(!auth_output_looks_ready(true, "Login required"));
+        // Явный логин принимается даже при ненулевом коде.
+        assert!(auth_output_looks_ready(
+            false,
+            "Logged in as user@example.com"
+        ));
+        assert!(auth_output_looks_ready(false, "Authenticated as acme"));
+        // Нейтральный вывод — доверяемся коду выхода пробы.
+        assert!(auth_output_looks_ready(true, "status: ok"));
+        assert!(!auth_output_looks_ready(false, "status: ok"));
+        // «not authenticated» не должен приниматься маркером «authenticated as».
+        assert!(!auth_output_looks_ready(true, "user is not authenticated"));
+    }
 }

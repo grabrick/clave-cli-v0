@@ -5,14 +5,12 @@ pub(crate) fn draw_effort_screen(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let tick = current_effort_tick();
     let scale_width = effort_scale_width(area.width);
     let scale_start = (area.width as usize).saturating_sub(scale_width) / 2;
-    let mut lines = Vec::new();
-
-    lines.push(Line::styled(
+    let mut lines = vec![Line::styled(
         "› /effort",
         Style::default()
             .fg(app.theme.accent())
             .add_modifier(Modifier::BOLD),
-    ));
+    )];
     lines.push(separator_line(area.width, app.theme));
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(

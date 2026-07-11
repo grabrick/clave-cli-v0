@@ -14,8 +14,8 @@ impl App {
             return;
         }
 
-        let executor = self.mode.architect_provider().as_str();
-        let critic = self.mode.reviewer_provider().as_str();
+        let executor = self.mode.architect_provider();
+        let critic = self.mode.reviewer_provider();
         if executor == critic {
             self.push_system(self.lang.choose(
                 "⚠ Тандем эффективнее с разными моделями — смени роли через /mode.",
@@ -23,8 +23,8 @@ impl App {
             ));
         }
 
-        let executor_effort = self.provider_effort(executor).to_string();
-        let critic_effort = self.provider_effort(critic).to_string();
+        let executor_effort = self.provider_effort(executor.as_str()).to_string();
+        let critic_effort = self.provider_effort(critic.as_str()).to_string();
         let rounds = self.rounds;
         let lang = self.lang;
         let work_dir = self.resolved_work_dir();
@@ -46,9 +46,9 @@ impl App {
         self.push_run_activity(format!(
             "{} {} · {} {}",
             self.lang.choose("исполнитель:", "executor:"),
-            executor,
+            executor.as_str(),
             self.lang.choose("критик:", "critic:"),
-            critic
+            critic.as_str()
         ));
         self.push_run_activity(format!(
             "{} {}",
@@ -62,10 +62,10 @@ impl App {
         ));
 
         let tx = self.tx.clone();
-        thread::spawn(move || {
+        spawn_worker(self.tx.clone(), move || {
             let result = run_tandem(
-                executor,
-                critic,
+                executor.as_str(),
+                critic.as_str(),
                 &executor_effort,
                 &critic_effort,
                 &task_run,

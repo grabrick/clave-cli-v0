@@ -10,12 +10,12 @@ pub(crate) enum WorkerEvent {
     ReasoningDelta(String),
     Activity(String),
     Done(i32),
-    ChatDone(&'static str, i32, Option<RunUsage>),
-    PlanReady(&'static str, String, i32, Option<RunUsage>),
+    ChatDone(Provider, i32, Option<RunUsage>),
+    PlanReady(Provider, String, i32, Option<RunUsage>),
     Cancelled,
     Failed(String),
     /// Провайдер не залогинен — проверка ушла в воркер, чтобы не морозить UI.
-    AuthMissing(&'static str),
+    AuthMissing(Provider),
 }
 
 pub(crate) enum ChatRunResult {
@@ -209,7 +209,7 @@ impl App {
                     if code != 0 {
                         self.push_system(format!(
                             "{} {} {}.",
-                            provider_display(provider, self.lang),
+                            provider_display(provider.as_str(), self.lang),
                             self.lang
                                 .choose("завершился с кодом", "finished with exit code"),
                             code
@@ -342,9 +342,7 @@ impl App {
                             self.history_index = None;
                         }
                     }
-                    if let Some(provider) = Provider::from_str(provider) {
-                        self.prompt_provider_login(provider);
-                    }
+                    self.prompt_provider_login(provider);
                 }
             }
         }

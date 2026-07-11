@@ -1,6 +1,57 @@
 use crate::prelude::*;
 use crate::*;
 
+/// Настраивает дочерний процесс лидером НОВОЙ группы процессов, чтобы его собственные
+/// под-процессы (Bash-инструменты агента) попадали в ту же группу. Тогда при отмене или
+/// таймауте всё дерево убивается разом (см. `kill_process_tree`), а не только сам CLI.
+/// На не-unix — no-op (там дерево завершает `child.kill()`).
+#[cfg(unix)]
+pub(crate) fn configure_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+pub(crate) fn configure_process_group(_command: &mut Command) {}
+
+/// Убивает дочерний процесс ВМЕСТЕ со всей его группой (внуками) и пожинает зомби.
+/// На unix шлём SIGKILL всей группе через отрицательный pid: процесс спавнился лидером
+/// группы (`configure_process_group`), значит pgid == его pid, и цель сигнала — `-pid`.
+/// Это закрывает stdout/stderr-пайпы, которые мог держать под-процесс агента, — иначе
+/// тред-ридер завис бы на `read` навсегда.
+pub(crate) fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        // SAFETY: kill(2) с отрицательным pid адресует группу процессов; аргументы —
+        // простые скаляры, предусловий на память нет.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+/// Спавнит рабочий поток, гарантируя терминальное событие даже при панике его тела.
+/// Без этого паника воркера оставила бы `running=true` и вечный лоадер (главный поток
+/// продолжает жить). Панику ловим (её вывод подавлен в panic-hook) и шлём Failed.
+pub(crate) fn spawn_worker<F>(fail_tx: Sender<WorkerEvent>, body: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    thread::spawn(move || {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_err() {
+            let _ = fail_tx.send(WorkerEvent::Failed(
+                "внутренняя ошибка Clave (паника рабочего потока)".to_string(),
+            ));
+        }
+    });
+}
+
 pub(crate) fn spawn_reader<R>(reader: R, tx: Sender<WorkerEvent>)
 where
     R: io::Read + Send + 'static,
@@ -180,14 +231,23 @@ pub(crate) fn refine_prompt(
     )
 }
 
-/// Последняя строка с `TANDEM:` определяет сигнал: CONSENSUS (и не CONTINUE) → true.
-/// Дефолт false (= CONTINUE) — безопаснее продолжить, чем ложно согласиться (P1).
+/// Ищет строку-СИГНАЛ (строго `TANDEM: CONSENSUS` / `TANDEM: CONTINUE`, снизу вверх):
+/// CONSENSUS → true. Дефолт false (= CONTINUE) — безопаснее продолжить, чем ложно
+/// согласиться (P1). Строгий разбор не даёт упоминанию `TANDEM:` в прозе завершить дебаты.
 pub(crate) fn parse_tandem_signal(text: &str) -> bool {
     for line in text.lines().rev() {
-        let up = line.to_uppercase();
-        if up.contains("TANDEM:") {
-            return up.contains("CONSENSUS") && !up.contains("CONTINUE");
-        }
+        // Считаем строку сигналом, только если после снятия markdown-обрамления она
+        // НАЧИНАЕТСЯ с `TANDEM:`, а остаток — ровно CONSENSUS или CONTINUE. Иначе фраза
+        // из рассуждений вроде «...output TANDEM: CONSENSUS when done» дала бы ложный
+        // консенсус и преждевременно завершила бы дебаты.
+        let cleaned = line
+            .trim()
+            .trim_matches(|c: char| c == '*' || c == '`' || c == '>' || c == ' ');
+        let upper = cleaned.to_uppercase();
+        let Some(rest) = upper.strip_prefix("TANDEM:") else {
+            continue;
+        };
+        return rest.trim() == "CONSENSUS";
     }
     false
 }
@@ -456,6 +516,8 @@ fn is_transient_chat_failure(result: &ChatRunResult) -> bool {
     )
 }
 
+// Связный набор параметров запуска провайдера; группировка ради порога lint не улучшит.
+#[allow(clippy::too_many_arguments)]
 fn run_chat_attempt(
     provider: &'static str,
     effort: &str,
@@ -499,6 +561,7 @@ fn run_chat_attempt(
         command
     };
 
+    configure_process_group(&mut command);
     let mut child = command
         .current_dir(work_dir)
         // stdin = /dev/null: агент получает промт из аргументов и НЕ должен делить
@@ -520,14 +583,13 @@ fn run_chat_attempt(
 
     loop {
         if cancel_rx.try_recv().is_ok() {
-            let _ = child.kill();
-            let _ = child.wait();
-            if let Some(handle) = stdout_handle {
-                let _ = handle.join();
-            }
-            if let Some(handle) = stderr_handle {
-                let _ = handle.join();
-            }
+            // Убиваем всю группу (CLI + его под-процессы) и роняем ридеры: после смерти
+            // группы пайпы закрываются, треды-ридеры завершатся сами по EOF. join здесь
+            // делать НЕЛЬЗЯ — read мог бы зависнуть, держи пайп внук.
+            kill_process_tree(&mut child);
+            drop(stdout_handle);
+            drop(stderr_handle);
+            let _ = fs::remove_file(&codex_out_file);
             return Ok(ChatRunResult::Cancelled);
         }
 
@@ -563,11 +625,9 @@ fn run_chat_attempt(
                     .unwrap_or_default()
                     >= idle_timeout()
                 {
-                    // Убиваем зависший CLI. Ридеры НЕ join-им: их read мог застрять на
-                    // pipe, который держит осиротевший под-процесс (kill бьёт только сам
-                    // CLI). Handle'ы роняем — нити завершатся сами по EOF.
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    // Зависший CLI: убиваем всю его группу (CLI + под-процессы), чтобы
+                    // закрылись пайпы, и роняем ридеры — они завершатся сами по EOF.
+                    kill_process_tree(&mut child);
                     drop(stdout_handle);
                     drop(stderr_handle);
                     let _ = fs::remove_file(&codex_out_file);
@@ -674,6 +734,7 @@ pub(crate) fn run_provider_once(
         command
     };
 
+    configure_process_group(&mut command);
     let mut child = command
         .current_dir(work_dir)
         // stdin = /dev/null: агент получает промт из аргументов и НЕ должен делить
@@ -695,14 +756,12 @@ pub(crate) fn run_provider_once(
 
     loop {
         if cancel_rx.try_recv().is_ok() {
-            let _ = child.kill();
-            let _ = child.wait();
-            if let Some(handle) = stdout_handle {
-                let _ = handle.join();
-            }
-            if let Some(handle) = stderr_handle {
-                let _ = handle.join();
-            }
+            // Убиваем всю группу (CLI + под-процессы) и роняем ридеры: после смерти
+            // группы пайпы закрываются, треды-ридеры завершатся сами по EOF. join здесь
+            // делать НЕЛЬЗЯ — read мог бы зависнуть, держи пайп внук.
+            kill_process_tree(&mut child);
+            drop(stdout_handle);
+            drop(stderr_handle);
             let _ = fs::remove_file(&codex_out_file);
             return Ok(None);
         }
@@ -737,10 +796,9 @@ pub(crate) fn run_provider_once(
                     .unwrap_or_default()
                     >= idle_timeout()
                 {
-                    // Зависший CLI: убиваем и НЕ join-им ридеры (read мог застрять на
-                    // pipe осиротевшего под-процесса). Handle'ы роняем.
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    // Зависший CLI: убиваем всю его группу (CLI + под-процессы), чтобы
+                    // закрылись пайпы, и роняем ридеры — они завершатся сами по EOF.
+                    kill_process_tree(&mut child);
                     drop(stdout_handle);
                     drop(stderr_handle);
                     let _ = fs::remove_file(&codex_out_file);
@@ -1469,17 +1527,6 @@ pub(crate) fn emit_chat_lines(tx: &Sender<WorkerEvent>, text: &str) {
     }
 }
 
-pub(crate) fn emit_error_lines(tx: &Sender<WorkerEvent>, text: &str) {
-    let mut emitted = 0;
-    for line in text.lines().filter(|line| !line.trim().is_empty()).take(40) {
-        let _ = tx.send(WorkerEvent::Line(format!("⎿ {}", line)));
-        emitted += 1;
-    }
-    if emitted == 0 {
-        let _ = tx.send(WorkerEvent::Line("⎿ no stderr output".to_string()));
-    }
-}
-
 /// Строки для показа при ошибке провайдера в чате: заголовок с КОДОМ выхода, затем
 /// детали из stderr — а если stderr пуст (claude шлёт ошибки в stdout stream-json и
 /// при обрыве до `result` они не доезжают), честная подсказка о транзиентной природе
@@ -1871,6 +1918,15 @@ mod tests {
         assert!(!parse_tandem_signal(
             "TANDEM: CONSENSUS\n...\nTANDEM: CONTINUE"
         ));
+        // строгий разбор: упоминание TANDEM: в прозе — НЕ сигнал
+        assert!(!parse_tandem_signal(
+            "I will output TANDEM: CONSENSUS when we are done."
+        ));
+        // markdown-обрамление снимается, чистый сигнал проходит
+        assert!(parse_tandem_signal("**TANDEM: CONSENSUS**"));
+        assert!(parse_tandem_signal("> TANDEM: CONSENSUS"));
+        // хвостовой текст после сигнала не засчитывается как консенсус
+        assert!(!parse_tandem_signal("TANDEM: CONSENSUS reached, ship it"));
     }
 
     #[test]
@@ -2031,5 +2087,70 @@ mod tests {
             None
         )));
         assert!(!is_transient_chat_failure(&ChatRunResult::Cancelled));
+    }
+
+    // Критично: при отмене/таймауте мы убиваем ВСЮ группу процессов, а не только сам
+    // CLI. Модель «процесс → под-процесс в той же группе»: внук должен умереть вместе с
+    // прямым потомком — иначе он держал бы stdout-пайп и тред-ридер завис бы навсегда.
+    #[cfg(unix)]
+    #[test]
+    fn kill_process_tree_reaps_grandchild() {
+        let marker = env::temp_dir().join(format!("clave-test-pgrp-{}.pid", std::process::id()));
+        let _ = fs::remove_file(&marker);
+
+        // Дочерний sh порождает фоновый sleep (внук) в той же группе и печатает его PID.
+        let script = format!("sleep 30 & echo $! > {}; wait", marker.to_string_lossy());
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_process_group(&mut command);
+        let mut child = command.spawn().expect("sh запускается");
+
+        let grandchild = wait_for_pid(&marker);
+        assert!(
+            process_alive(grandchild),
+            "внук должен быть жив до kill_process_tree"
+        );
+
+        kill_process_tree(&mut child);
+
+        // После убийства группы внук должен исчезнуть в пределах таймаута.
+        let mut dead = false;
+        for _ in 0..200 {
+            if !process_alive(grandchild) {
+                dead = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = fs::remove_file(&marker);
+        assert!(
+            dead,
+            "внук ({grandchild}) пережил kill_process_tree — группа не убита"
+        );
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pid(marker: &Path) -> i32 {
+        for _ in 0..300 {
+            if let Ok(text) = fs::read_to_string(marker) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    if pid > 0 {
+                        return pid;
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("внук не записал PID за отведённое время");
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: i32) -> bool {
+        // kill(pid, 0) сигнал не шлёт — только проверяет существование процесса.
+        unsafe { libc::kill(pid, 0) == 0 }
     }
 }

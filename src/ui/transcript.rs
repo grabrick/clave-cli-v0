@@ -640,7 +640,7 @@ mod tests {
 
     #[test]
     fn hides_markdown_code_fence_markers() {
-        let transcript = vec![
+        let transcript = [
             "⏺ Вот пример:".to_string(),
             "```text".to_string(),
             "Покажи текущее состояние проекта".to_string(),

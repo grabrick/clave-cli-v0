@@ -278,6 +278,30 @@ pub(crate) fn load_config(path: &Path) -> AppConfig {
     config
 }
 
+/// Атомарно записывает файл: пишет во временный файл рядом (в той же директории), синкает
+/// на диск и переименовывает на место — rename атомарен, поэтому падение/kill в середине
+/// записи не оставит усечённый config/history/чат (старый файл цел до последнего шага).
+fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("clave");
+    let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    {
+        let mut file = fs::File::create(&tmp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)
+}
+
+/// Убирает символы, которые разбили бы построчный `key="value"`-формат конфига (переводы
+/// строк). Обратно совместимо: обычные пути не меняются, а decode при чтении не нужен —
+/// значит Windows-пути с обратным слэшем не искажаются.
+fn config_value_sanitized(value: &str) -> String {
+    value.replace(['\n', '\r'], " ")
+}
+
 pub(crate) fn save_config(path: &Path, config: &AppConfig) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -306,8 +330,8 @@ pub(crate) fn save_config(path: &Path, config: &AppConfig) -> io::Result<()> {
         config.theme.as_str(),
         config.lang.as_str(),
         config.rounds,
-        config.work_dir,
-        config.out_dir,
+        config_value_sanitized(&config.work_dir),
+        config_value_sanitized(&config.out_dir),
         effort_label(config.effort_index),
         effort_label(config.codex_effort_index),
         effort_label(config.claude_effort_index),
@@ -322,7 +346,7 @@ pub(crate) fn save_config(path: &Path, config: &AppConfig) -> io::Result<()> {
             .map(PathTarget::as_config_str)
             .unwrap_or(""),
     );
-    fs::write(path, content)
+    write_atomic(path, content.as_bytes())
 }
 
 pub(crate) fn load_history(path: &Path) -> io::Result<Vec<String>> {
@@ -346,7 +370,7 @@ pub(crate) fn save_history(path: &Path, history: &[String]) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let mut file = fs::File::create(path)?;
+    let mut out = String::new();
     for line in history
         .iter()
         .rev()
@@ -355,9 +379,10 @@ pub(crate) fn save_history(path: &Path, history: &[String]) -> io::Result<()> {
         .into_iter()
         .rev()
     {
-        writeln!(file, "{}", encode_field(line))?;
+        out.push_str(&encode_field(line));
+        out.push('\n');
     }
-    Ok(())
+    write_atomic(path, out.as_bytes())
 }
 
 #[derive(Clone)]
@@ -432,15 +457,15 @@ pub(crate) fn save_chat_transcript(
         fs::create_dir_all(parent)?;
     }
 
-    let mut file = fs::File::create(path)?;
-    writeln!(file, "# Clave Chat")?;
-    writeln!(file, "id={}", chat_id)?;
-    writeln!(file, "created={}", unix_millis())?;
-    writeln!(file, "---")?;
+    let mut out = String::new();
+    out.push_str("# Clave Chat\n");
+    out.push_str(&format!("id={chat_id}\n"));
+    out.push_str(&format!("created={}\n", unix_millis()));
+    out.push_str("---\n");
     for line in transcript {
-        writeln!(file, "v1\t{}", encode_field(line))?;
+        out.push_str(&format!("v1\t{}\n", encode_field(line)));
     }
-    Ok(())
+    write_atomic(path, out.as_bytes())
 }
 
 pub(crate) fn append_chat_line(path: &Path, line: &str) -> io::Result<()> {
@@ -483,7 +508,7 @@ pub(crate) fn list_saved_chats(chats_dir: &Path, limit: usize) -> Vec<ChatSummar
         .filter_map(|path| chat_summary(&path))
         .collect::<Vec<_>>();
 
-    chats.sort_by(|left, right| right.modified.cmp(&left.modified));
+    chats.sort_by_key(|summary| std::cmp::Reverse(summary.modified));
     chats.truncate(limit);
     chats
 }
@@ -567,7 +592,7 @@ pub(crate) fn set_chat_title(path: &Path, chat_id: &str, title: &str) -> io::Res
         out.push_str(line);
         out.push('\n');
     }
-    fs::write(path, out)
+    write_atomic(path, out.as_bytes())
 }
 
 pub(crate) fn find_last_run(transcript: &[String]) -> Option<String> {
@@ -699,5 +724,38 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_atomic_replaces_and_leaves_no_tmp() {
+        let dir = env::temp_dir().join(format!("clave-atomic-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("data");
+
+        write_atomic(&path, b"first").expect("write 1");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first");
+        // Перезапись существующего файла заменяет содержимое и не оставляет мусора.
+        write_atomic(&path, b"second").expect("write 2");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second");
+
+        let tmp_left = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp"));
+        assert!(!tmp_left, "временный файл не был убран");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_value_sanitized_strips_newlines_keeps_backslashes() {
+        // Windows-путь с обратным слэшем не искажается (иначе сломался бы round-trip).
+        assert_eq!(
+            config_value_sanitized(r"C:\Users\me\proj"),
+            r"C:\Users\me\proj"
+        );
+        // Переводы строк, которые разбили бы формат key="value", убираются.
+        assert_eq!(config_value_sanitized("a\nb\rc"), "a b c");
     }
 }

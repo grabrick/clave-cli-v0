@@ -10,6 +10,16 @@ pub(crate) enum Theme {
 }
 
 impl Theme {
+    /// Все темы по порядку — единый источник для перебора (shifted и пр.), чтобы список
+    /// не дублировался внутри функций и не рассинхронился с вариантами enum.
+    pub(crate) const ALL: &'static [Theme] = &[
+        Theme::Purple,
+        Theme::Cyan,
+        Theme::Rose,
+        Theme::Amber,
+        Theme::Mono,
+    ];
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Theme::Purple => "purple",
@@ -42,23 +52,16 @@ impl Theme {
     }
 
     pub(crate) fn shifted(self, direction: isize) -> Self {
-        const THEMES: &[Theme] = &[
-            Theme::Purple,
-            Theme::Cyan,
-            Theme::Rose,
-            Theme::Amber,
-            Theme::Mono,
-        ];
-        let current = THEMES
+        let current = Self::ALL
             .iter()
             .position(|theme| *theme == self)
             .unwrap_or_default();
         let next = if direction < 0 {
             current.saturating_sub(1)
         } else {
-            (current + 1).min(THEMES.len() - 1)
+            (current + 1).min(Self::ALL.len() - 1)
         };
-        THEMES[next]
+        Self::ALL[next]
     }
 
     pub(crate) fn accent(self) -> Color {
@@ -99,5 +102,21 @@ impl Theme {
             Theme::Amber => Color::Indexed(94),
             Theme::Mono => Color::Indexed(238),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_themes_round_trip_and_stay_in_sync() {
+        // Каждая тема из ALL кодируется/декодируется обратно в себя — ловит опечатку в
+        // as_str/from_str и подтверждает, что ALL перечисляет реальные варианты.
+        for &theme in Theme::ALL {
+            assert_eq!(Theme::from_str(theme.as_str()), Some(theme));
+        }
+        // Напоминание держать ALL в синхроне с вариантами enum при добавлении темы.
+        assert_eq!(Theme::ALL.len(), 5);
     }
 }

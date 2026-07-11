@@ -211,6 +211,8 @@ pub(crate) fn onboarding_settings_lines(app: &App, onboarding: &Onboarding) -> V
     lines
 }
 
+// Связный набор данных строки статуса авторизации; дробить ради порога lint не нужно.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn auth_status_line(
     name: &'static str,
     needed: bool,
