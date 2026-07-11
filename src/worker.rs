@@ -52,6 +52,23 @@ where
     });
 }
 
+/// Приватный подкаталог для временных файлов (0700 на unix): вывод codex кладём туда,
+/// чтобы на многопользовательской машине его нельзя было подменить симлинком до записи —
+/// каталог принадлежит нам, посторонний в него не запишет. Если создать не удалось,
+/// падаем на общий temp_dir (лучше работать, чем упасть).
+fn private_temp_dir() -> PathBuf {
+    let dir = env::temp_dir().join(format!("clave-{}", std::process::id()));
+    if fs::create_dir_all(&dir).is_err() {
+        return env::temp_dir();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    }
+    dir
+}
+
 pub(crate) fn spawn_reader<R>(reader: R, tx: Sender<WorkerEvent>)
 where
     R: io::Read + Send + 'static,
@@ -528,9 +545,8 @@ fn run_chat_attempt(
     lang: Language,
     access: RunAccess,
 ) -> io::Result<ChatRunResult> {
-    let codex_out_file = env::temp_dir().join(format!(
-        "clave-codex-{}-{}.txt",
-        std::process::id(),
+    let codex_out_file = private_temp_dir().join(format!(
+        "codex-{}.txt",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -701,9 +717,8 @@ pub(crate) fn run_provider_once(
     tx: &Sender<WorkerEvent>,
     cancel_rx: &Receiver<()>,
 ) -> io::Result<Option<TandemStep>> {
-    let codex_out_file = env::temp_dir().join(format!(
-        "clave-tandem-{}-{}.txt",
-        std::process::id(),
+    let codex_out_file = private_temp_dir().join(format!(
+        "tandem-{}.txt",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
