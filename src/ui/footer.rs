@@ -29,7 +29,7 @@ pub(crate) fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let width = area.width as usize;
     let right_slot_width = footer_right_slot_width(app).min(width);
     let right = truncate_chars(&right, right_slot_width);
-    let right_width = right.chars().count();
+    let right_width = display_width(&right);
 
     let mode_width = mode_label.chars().count();
     let switch_width = switch.chars().count() + 1; // пробел перед серым хоткеем
@@ -98,11 +98,11 @@ pub(crate) fn footer_right_target(app: &App) -> String {
 }
 
 pub(crate) fn footer_right_slot_width(app: &App) -> usize {
-    let current_width = app.footer_right_text.chars().count();
+    let current_width = display_width(&app.footer_right_text);
     let previous_width = app
         .footer_right_previous_text
         .as_ref()
-        .map(|previous| previous.chars().count())
+        .map(|previous| display_width(previous))
         .unwrap_or(0);
 
     current_width.max(previous_width)

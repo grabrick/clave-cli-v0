@@ -84,7 +84,7 @@ pub(crate) fn user_message_lines(message: &str, width: u16, theme: Theme) -> Vec
     // Пузырь обнимает текст: ширина = самая длинная строка (не на всю ширину экрана).
     let bubble = wrapped
         .iter()
-        .map(|line| line.chars().count())
+        .map(|line| display_width(line))
         .max()
         .unwrap_or(0);
 
@@ -94,7 +94,7 @@ pub(crate) fn user_message_lines(message: &str, width: u16, theme: Theme) -> Vec
         .map(|(index, line)| {
             // Стрелка только на первой строке, продолжения — отступ под текст.
             let prefix = if index == 0 { "➤ " } else { "  " };
-            let pad = " ".repeat(bubble.saturating_sub(line.chars().count()));
+            let pad = " ".repeat(bubble.saturating_sub(display_width(line)));
             Line::from(vec![
                 Span::styled(prefix, arrow_style),
                 Span::styled(format!(" {line}{pad} "), bubble_style),

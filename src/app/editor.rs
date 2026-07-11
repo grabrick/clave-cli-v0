@@ -153,7 +153,7 @@ impl App {
         if line_start == 0 {
             return;
         }
-        let col = self.input[line_start..self.cursor].chars().count();
+        let col = display_width(&self.input[line_start..self.cursor]);
         let prev_newline = line_start - 1;
         let prev_start = line_start_boundary(&self.input, prev_newline);
         self.cursor = byte_at_column(&self.input, prev_start, prev_newline, col);
@@ -166,7 +166,7 @@ impl App {
             return;
         }
         let line_start = line_start_boundary(&self.input, self.cursor);
-        let col = self.input[line_start..self.cursor].chars().count();
+        let col = display_width(&self.input[line_start..self.cursor]);
         let next_start = line_end + 1;
         let next_end = line_end_boundary(&self.input, next_start);
         self.cursor = byte_at_column(&self.input, next_start, next_end, col);
@@ -210,12 +210,14 @@ impl App {
 
 /// Байтовая позиция `col`-го символа в `input[start..end]` (или `end`, если строка
 /// короче). Держит «колонку» курсора при переходе между строками.
-fn byte_at_column(input: &str, start: usize, end: usize, col: usize) -> usize {
+fn byte_at_column(input: &str, start: usize, end: usize, target_col: usize) -> usize {
     let mut pos = start;
-    for (count, ch) in input[start..end].chars().enumerate() {
-        if count >= col {
+    let mut col = 0usize;
+    for ch in input[start..end].chars() {
+        if col >= target_col {
             break;
         }
+        col += char_display_width(ch);
         pos += ch.len_utf8();
     }
     pos
@@ -224,6 +226,15 @@ fn byte_at_column(input: &str, start: usize, end: usize, col: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn byte_at_column_uses_display_width() {
+        // "aあb": a=col0, あ=cols1..2, b=col3. Колонка 3 → байт на 'b'.
+        let s = "aあb";
+        assert_eq!(byte_at_column(s, 0, s.len(), 3), "aあ".len());
+        // Колонка внутри широкого символа «прыгает» за него (курсор не встаёт внутрь).
+        assert_eq!(byte_at_column(s, 0, s.len(), 2), "aあ".len());
+    }
 
     #[test]
     fn history_round_trip_restores_draft() {

@@ -8,10 +8,10 @@ pub(crate) fn ask_panel_height(state: &AskState, width: u16, cap: u16) -> u16 {
         (state.confirm_rows() as u16).min(12)
     } else if let Some(question) = state.question() {
         // Высота с учётом переноса: строка(и) вопроса + варианты + «Свой ответ».
-        let mut rows = wrapped_rows(question.question.chars().count(), iw);
+        let mut rows = wrapped_rows(display_width(&question.question), iw);
         for opt in &question.options {
             // ~6 символов на маркер/номер/чекбокс перед текстом варианта.
-            rows += wrapped_rows(opt.label.chars().count() + 6, iw);
+            rows += wrapped_rows(display_width(&opt.label) + 6, iw);
         }
         rows += 1;
         rows as u16

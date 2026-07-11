@@ -74,7 +74,7 @@ fn top_rule_line_with_title(
     let title_room = total - (RIGHT_TAIL + MIN_LEFT + 2);
     let title = truncate_chars(title, title_room);
     let badge = format!(" {title} ");
-    let badge_len = badge.chars().count();
+    let badge_len = display_width(&badge);
     let left_len = total.saturating_sub(badge_len + RIGHT_TAIL);
 
     let mut spans = Vec::with_capacity(left_len + 1 + RIGHT_TAIL);

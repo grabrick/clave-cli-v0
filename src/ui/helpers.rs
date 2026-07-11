@@ -1,4 +1,17 @@
 use super::*;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// Ширина строки в терминальных колонках: CJK/эмодзи занимают 2, комбинирующие знаки — 0.
+/// В отличие от `chars().count()`, совпадает с числом ячеек, которые рисует терминал, —
+/// без этого курсор и перенос «съезжают» на широких символах.
+pub(crate) fn display_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text)
+}
+
+/// Ширина одного символа в колонках (0 для нулевой ширины/управляющих).
+pub(crate) fn char_display_width(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0)
+}
 
 pub(crate) fn composer_height(app: &App, width: u16) -> u16 {
     let lines = input_lines_wrapped(&app.input, width).len() as u16;
@@ -67,19 +80,27 @@ pub(crate) fn input_cursor_position_wrapped(
     width: u16,
 ) -> (usize, usize) {
     let content_width = width.saturating_sub(2).max(1) as usize;
-    let before = &input[..cursor];
-    let parts = before.split('\n').collect::<Vec<_>>();
     let mut visual_line = 0usize;
     let mut visual_col = 0usize;
+    let mut has_content = false;
 
-    for (index, line) in parts.iter().enumerate() {
-        let len = line.chars().count();
-        if index + 1 == parts.len() {
-            visual_line += len / content_width;
-            visual_col = len % content_width;
-        } else {
-            visual_line += (len / content_width) + 1;
+    // Идём тем же обходом, что и wrap_terminal_text_preserving_spaces, чтобы позиция
+    // курсора и перенос строк ВСЕГДА совпадали (иначе курсор «съезжает» на широких
+    // символах). Ширину считаем в колонках, а не в символах.
+    for ch in input[..cursor].chars() {
+        if ch == '\n' {
+            visual_line += 1;
+            visual_col = 0;
+            has_content = false;
+            continue;
         }
+        let w = char_display_width(ch);
+        if visual_col + w > content_width && has_content {
+            visual_line += 1;
+            visual_col = 0;
+        }
+        visual_col += w;
+        has_content = true;
     }
 
     (visual_line, visual_col)
@@ -90,31 +111,33 @@ pub(crate) fn wrap_terminal_line(text: &str, width: u16) -> Vec<String> {
     wrap_terminal_text_preserving_spaces(text, max_chars)
 }
 
-pub(crate) fn wrap_terminal_text_preserving_spaces(text: &str, max_chars: usize) -> Vec<String> {
-    let max_chars = max_chars.max(1);
+pub(crate) fn wrap_terminal_text_preserving_spaces(text: &str, max_cols: usize) -> Vec<String> {
+    let max_cols = max_cols.max(1);
     if text.is_empty() {
         return vec![String::new()];
     }
 
     let mut rows = Vec::new();
     let mut current = String::new();
-    // Длину ведём инкрементально: `current.chars().count()` в цикле давал O(n²)
-    // на длинных строках, а функция вызывается для каждой строки на каждом кадре.
-    let mut current_len = 0usize;
+    // Ширину ведём инкрементально в КОЛОНКАХ (CJK/эмодзи = 2): и ради O(n) на кадр, и
+    // чтобы перенос совпадал с раскладкой терминала и с input_cursor_position_wrapped.
+    let mut current_cols = 0usize;
 
     for ch in text.chars() {
         if ch == '\n' {
             rows.push(std::mem::take(&mut current));
-            current_len = 0;
+            current_cols = 0;
             continue;
         }
 
-        if current_len >= max_chars {
+        let w = char_display_width(ch);
+        // Широкий символ не влезает в остаток строки — переносим ПЕРЕД ним.
+        if current_cols + w > max_cols && !current.is_empty() {
             rows.push(std::mem::take(&mut current));
-            current_len = 0;
+            current_cols = 0;
         }
         current.push(ch);
-        current_len += 1;
+        current_cols += w;
     }
 
     rows.push(current);
@@ -131,8 +154,8 @@ pub(crate) fn wrap_chars(text: &str, max_chars: usize) -> Vec<String> {
     let mut current = String::new();
 
     for word in text.split_whitespace() {
-        let current_len = current.chars().count();
-        let word_len = word.chars().count();
+        let current_len = display_width(&current);
+        let word_len = display_width(word);
         let extra_space = usize::from(!current.is_empty());
 
         if current_len + extra_space + word_len > max_chars && !current.is_empty() {
@@ -148,7 +171,7 @@ pub(crate) fn wrap_chars(text: &str, max_chars: usize) -> Vec<String> {
 
             let mut chunk = String::new();
             for ch in word.chars() {
-                if chunk.chars().count() >= max_chars {
+                if display_width(&chunk) >= max_chars {
                     rows.push(chunk);
                     chunk = String::new();
                 }
@@ -210,5 +233,21 @@ mod tests {
             wrap_chars("see src/app.rs now", 10),
             vec!["see", "src/app.rs", "now"]
         );
+    }
+
+    #[test]
+    fn wrap_and_cursor_agree_on_wide_chars() {
+        // Широкий символ (あ = 2 колонки) переносится по КОЛОНКАМ, а не по символам.
+        assert_eq!(
+            wrap_terminal_text_preserving_spaces("aああ", 4),
+            vec!["aあ", "あ"]
+        );
+        // Перенос и позиция курсора идут одним обходом: строка курсора == число строк − 1,
+        // а колонка == ширине последней строки в колонках.
+        let input = "aあb\ncd";
+        let rows = input_lines_wrapped(input, 10); // content_width = 8
+        assert_eq!(rows, vec!["aあb", "cd"]);
+        let (line, col) = input_cursor_position_wrapped(input, input.len(), 10);
+        assert_eq!((line, col), (rows.len() - 1, display_width("cd")));
     }
 }
