@@ -9,6 +9,17 @@ pub(crate) fn main_entry() -> AnyResult<()> {
         return Ok(());
     }
 
+    // Неизвестный флаг (например, удалённый `--serve`) не должен молча уходить в движок
+    // как «задача» — это запустило бы платный цикл планирования. Задачи натуральным
+    // языком с дефиса не начинаются, поэтому показываем справку.
+    if let Some(first) = args.first() {
+        if first.starts_with('-') {
+            eprintln!("clave: unknown option '{first}'\n");
+            print_usage();
+            return Ok(());
+        }
+    }
+
     if !args.is_empty() {
         return run_engine_direct(args);
     }
