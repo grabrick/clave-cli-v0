@@ -44,6 +44,22 @@ python3 -m clave_dev "почини срез футера у правой сте�
   --severity-threshold medium --max-rounds 3
 ```
 
+### 4b. Точечный vision-probe (рекомендую для proof pass=false/true)
+
+Без полной петли — один скриншот + вердикт, быстро. Собери clave ветки (`cargo build`), затем:
+
+```bash
+cd <repo>/tools/clave-dev
+# узкое окно → ожидаем pass=false (срез у правой стенки)
+python3 -m clave_dev.vision_probe <repo>/target/debug/clave \
+  --width 380 --height 600 --terminal-profile clave-dev
+# нормальное окно → ожидаем pass=true
+python3 -m clave_dev.vision_probe <repo>/target/debug/clave \
+  --width 900 --height 640 --terminal-profile clave-dev
+```
+
+Печатает JSON-вердикт (`pass`, `issues`, `failed_required`, `open_critique`) и код выхода 0/1.
+
 ## 5. Ожидаемый результат (критерии proof)
 
 **Как получить контролируемо «битый» кадр** (без правок кода): сузь окно Terminal.app до
