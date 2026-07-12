@@ -7,6 +7,7 @@ from clave_dev.worktree import (
     DirtyTreeError,
     assert_clean,
     create_run_worktree,
+    git_root,
     remove_run_worktree,
 )
 
@@ -41,3 +42,13 @@ class WorktreeTest(unittest.TestCase):
             self.assertTrue((wt / "f.txt").is_file())
             remove_run_worktree(repo, wt)
             self.assertFalse(wt.exists())
+
+
+class GitRootTest(unittest.TestCase):
+    def test_git_root_from_subdir(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            _init_repo(repo)
+            sub = repo / "tools" / "x"
+            sub.mkdir(parents=True)
+            self.assertEqual(git_root(sub).resolve(), repo.resolve())

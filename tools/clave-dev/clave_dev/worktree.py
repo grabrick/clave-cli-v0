@@ -36,3 +36,16 @@ def create_run_worktree(repo: Path, base_ref: str, tmp_dir: Path) -> Path:
 def remove_run_worktree(repo: Path, worktree: Path) -> None:
     _git(repo, "worktree", "remove", "--force", str(worktree))
     _git(repo, "worktree", "prune")
+
+
+def git_root(path: Path) -> Path:
+    """Канонический git-корень для path (спека §4). Не git → RuntimeError."""
+    res = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"не git-репозиторий: {path}")
+    return Path(res.stdout.strip())
