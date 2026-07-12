@@ -36,13 +36,37 @@ def run_agent(
     env: dict,
     effort: Optional[str] = None,
     rounds: Optional[int] = None,
+    on_line=None,
 ) -> AgentResult:
+    """Гоняет агента и СТРИМИТ его вывод построчно в `on_line` по мере поступления.
+
+    Раньше вывод забирался буферизованно (`capture_output`) — и пользователь видел минуты
+    тишины, а сам ответ агента (для аналитических задач он и есть результат) никуда не шёл.
+    stderr сливаем в stdout, чтобы ошибки не терялись."""
     args = [str(known_good), "--run", "tandem", "--cwd", str(worktree), "--task-stdin"]
     if effort:
         args += ["--effort", effort]
     if rounds is not None:
         args += ["--rounds", str(rounds)]
-    proc = subprocess.run(
-        args, input=task, env=env, capture_output=True, text=True, check=False
+
+    proc = subprocess.Popen(
+        args,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        text=True,
+        bufsize=1,
     )
-    return parse_clave_run(proc.stdout, proc.returncode)
+    proc.stdin.write(task)
+    proc.stdin.close()
+    lines = []
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        lines.append(line)
+        # Машинную строку контракта наружу не льём — её разбирают, а не показывают.
+        if on_line and line and not line.startswith("CLAVE-RUN "):
+            on_line(line)
+    proc.stdout.close()
+    code = proc.wait()
+    return parse_clave_run("\n".join(lines), code)

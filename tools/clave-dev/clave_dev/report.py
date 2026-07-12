@@ -9,11 +9,17 @@ def render_report(report, repo: Path, worktree: Path) -> str:
     diff = subprocess.run(
         ["git", "-C", str(worktree), "diff"], capture_output=True, text=True
     ).stdout
+    status_ru = {
+        "converged": "сошлось (агент внёс правки, всё зелёное)",
+        "no_changes": "АГЕНТ НЕ ВНЁС ИЗМЕНЕНИЙ — это не успех, а no-op "
+                      "(зелёные проверки тут ничего не доказывают: репозиторий был зелёным и до него)",
+        "exhausted": "лимит раундов исчерпан, до зелёного не довели",
+    }.get(getattr(report, "status", "unknown"), "неизвестно")
     lines = [
         "# clave-dev: итог прогона (стоп перед финалом)",
         f"known-good: {report.known_good_version}",
         f"раундов: {report.rounds_used} / лимит {report.max_rounds}",
-        f"сошлось: {'да' if report.converged else 'нет'}",
+        f"исход: {status_ru}",
         "",
         "## Assertions (последний раунд)",
     ]

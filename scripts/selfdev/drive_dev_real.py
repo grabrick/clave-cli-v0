@@ -90,12 +90,14 @@ def main() -> int:
 
     print("=== ТРАНСКРИПТ ===")
     print(final)
+    # Моки код НЕ правят → правильный исход теперь no_changes, а НЕ «converged».
+    # Это регресс на реальный баг: зелёные проверки при пустом дифе выдавались за успех.
     checks = {
         "запуск /dev": "/dev prove" in final,
-        "progress-строки супервайзера": "раунд" in final or "проверки" in final,
-        "check-строки (build/test/clippy/fmt)": '"name"' in final or "build" in final,
-        "report-строка (converged)": "converged" in final,
-        "чистое завершение (код 0)": "кодом 0" in final or "exit code 0" in final,
+        "progress-строки супервайзера": "раунд" in final,
+        "no-op честно распознан": "не внёс изменений" in final or "no_changes" in final,
+        "НЕ ложная сходимость": '"converged": true' not in final,
+        "завершение": "завершил" in final,
     }
     print("=== CHECKS ===")
     ok = True

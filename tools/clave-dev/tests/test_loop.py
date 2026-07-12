@@ -3,7 +3,26 @@ import unittest
 from clave_dev.assertions import AssertionResult
 from clave_dev.checks import ChecksResult
 from clave_dev.context import build_context
-from clave_dev.loop import converged
+from clave_dev.loop import converged, outcome
+
+
+class OutcomeTest(unittest.TestCase):
+    """Регресс на реальный баг: no-op агента объявлялся сходимостью."""
+
+    def _green(self):
+        return ChecksResult(build_ok=True, test_failures=0, clippy_ok=True, fmt_ok=True, raw={})
+
+    def test_no_changes_is_not_convergence_even_when_checks_are_green(self):
+        # Репозиторий был зелёным и ДО агента — зелёные проверки при пустом дифе
+        # не доказывают ничего. Раньше это давало "converged: true" на любой задаче.
+        self.assertEqual(outcome([], self._green(), []), "no_changes")
+
+    def test_changes_plus_green_is_convergence(self):
+        self.assertEqual(outcome(["src/x.rs"], self._green(), []), "converged")
+
+    def test_changes_but_red_checks_continue(self):
+        red = self._green()._replace(test_failures=2)
+        self.assertEqual(outcome(["src/x.rs"], red, []), "continue")
 
 
 class ConvergedTest(unittest.TestCase):
