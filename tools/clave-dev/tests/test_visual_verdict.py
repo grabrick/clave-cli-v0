@@ -35,10 +35,16 @@ class PassTest(unittest.TestCase):
                            "issues": [{"description": "мелочь", "severity": "low"}]})
         self.assertFalse(verdict_passes(v))   # required-провал блокирует вопреки low
 
-    def test_optional_high_issue_blocks(self):
+    def test_high_issue_blocks_only_when_the_threshold_is_raised(self):
+        # Контракт изменился сознательно. Раньше high-находка блокировала ПО УМОЛЧАНИЮ — а issue
+        # это свободный текст судьи: его нельзя ни вычесть по базовой линии, ни набрать
+        # консенсусом, как пункты чеклиста. Значит гейт по нему абсолютный, а судья выдаёт такие
+        # мнения и на здоровой сборке. Одного хватало, чтобы петля не сошлась никогда.
         v = parse_verdict({"checklist_results": [{"check": "c", "required": False, "passed": True}],
                            "issues": [{"description": "big", "severity": "high", "source": "open"}]})
-        self.assertFalse(verdict_passes(v))
+
+        self.assertTrue(verdict_passes(v))  # по умолчанию — справочно
+        self.assertFalse(verdict_passes(v, blocking=("high",)))  # но порог можно поднять вручную
 
     def test_optional_low_issue_passes(self):
         v = parse_verdict({"issues": [{"description": "tiny", "severity": "low", "source": "open"}]})

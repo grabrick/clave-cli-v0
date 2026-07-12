@@ -180,5 +180,47 @@ class ProbeShapeTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(summary["pass"])
 
+
+class AdvisoryIssuesTest(unittest.TestCase):
+    """Мнения судьи не гейтят — и дефолт обязан это отражать.
+
+    Пункты чеклиста перечислимы: их вычитают по базовой линии и требуют совпадения в нескольких
+    выборках. С issue так нельзя — свободный текст, каждый раз новый. Значит гейт по ним остаётся
+    АБСОЛЮТНЫМ: тем самым, из-за которого петля не сходилась никогда. А судья выдаёт medium-мнения
+    и на ЗДОРОВОЙ сборке («логотип фрагментарный», «диакритик не отрисован» — оба замерены).
+    Дефолт `medium` означал бы, что прямой запуск CLI не сойдётся от одной нервной находки.
+    """
+
+    def _with_issue(self, severity):
+        return FakeVisionProvider(
+            {
+                "checklist_results": [{"check": EDGE, "required": True, "passed": True}],
+                "issues": [{"description": "логотип выглядит фрагментарным", "severity": severity}],
+            }
+        ).analyze_image(None)
+
+    def test_opinions_do_not_block_by_default(self):
+        for severity in ("low", "medium", "high"):
+            self.assertTrue(
+                verdict_passes(self._with_issue(severity)),
+                f"мнение severity={severity} не должно блокировать по умолчанию",
+            )
+
+    def test_a_failed_required_item_still_blocks_even_without_issues(self):
+        # Дыра, которую дефолт не должен открыть: чеклист блокирует независимо от мнений.
+        v = FakeVisionProvider(
+            {"checklist_results": [{"check": EDGE, "required": True, "passed": False}]}
+        ).analyze_image(None)
+        self.assertFalse(verdict_passes(v))
+
+    def test_threshold_can_still_be_raised_deliberately(self):
+        self.assertFalse(verdict_passes(self._with_issue("medium"), blocking=("medium", "high")))
+
+    def test_cli_default_is_the_safe_one(self):
+        from clave_dev.cli import build_parser
+
+        args = build_parser().parse_args(["задача"])
+        self.assertEqual(args.severity_threshold, "none")
+
 if __name__ == "__main__":
     unittest.main()
