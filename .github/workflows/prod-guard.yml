@@ -1,0 +1,57 @@
+# Инструменты саморазработки и самотестирования (self-dev) живут ТОЛЬКО в ветке develop
+# и в прод не едут.
+#
+# Страж держит этот инвариант на уровне CI, а не на уровне договорённости: любой MR в main,
+# который тащит их за собой, обязан упасть. Проверяется РЕЗУЛЬТИРУЮЩЕЕ дерево, а не дифф,
+# потому что инвариант звучит как «в main этого нет никогда» — независимо от того, каким
+# путём оно туда попало: merge, cherry-pick или прямой пуш. При pull_request checkout даёт
+# merge-коммит, то есть страж смотрит именно на то, каким main СТАНЕТ после слияния.
+#
+# ВАЖНО: падающая проверка сама по себе слияние не запрещает. Чтобы она реально блокировала
+# merge, в Settings → Branches для main включи «Require status checks to pass» и выбери
+# проверку "no self-dev tooling in prod".
+
+name: prod guard
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  no-self-dev-tooling:
+    name: no self-dev tooling in prod
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Инструментов саморазработки в prod быть не должно
+        run: |
+          set -u
+
+          # 1. Файлы и каталоги инструмента.
+          leaked_paths=$(git ls-tree -r --name-only HEAD \
+            | grep -E '^(tools/clave-dev/|scripts/selfdev/|src/headless\.rs$|src/app/dev\.rs$)|clave-dev' \
+            || true)
+
+          # 2. Проводка в коде — на случай, если файлы переименуют, а связи оставят.
+          leaked_wiring=$(grep -rlE '^[[:space:]]*mod (dev|headless);|clave_dev|CLAVE_DEV' src/ || true)
+
+          if [ -n "$leaked_paths$leaked_wiring" ]; then
+            echo "::error::Инструменты саморазработки просочились в prod-ветку — их место только в develop"
+            if [ -n "$leaked_paths" ]; then
+              echo "Файлы:"
+              echo "$leaked_paths" | sed 's/^/  · /'
+            fi
+            if [ -n "$leaked_wiring" ]; then
+              echo "Проводка в коде:"
+              echo "$leaked_wiring" | sed 's/^/  · /'
+            fi
+            echo
+            echo "Если это MR из develop — сливать его в main нельзя: develop существует ровно"
+            echo "затем, чтобы инструменты саморазработки не уезжали в продакшн."
+            exit 1
+          fi
+
+          echo "OK: инструментов саморазработки в prod-дереве нет."
