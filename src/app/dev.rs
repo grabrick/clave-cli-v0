@@ -84,6 +84,46 @@ fn spawn_dev_reader<R: std::io::Read + Send + 'static>(reader: R, tx: Sender<Wor
 }
 
 impl App {
+    /// Всё, что нужно `/dev`: git-корень репозитория и чем звать внешний clave_dev.
+    /// При неудаче пишет ВНЯТНУЮ причину (какой каталог, что делать) и возвращает None.
+    fn dev_target(&mut self) -> Option<(PathBuf, String, Vec<String>, Option<String>)> {
+        let repo = self.resolved_work_dir();
+        let Some(git_root) = dev_git_root(&repo) else {
+            // Называем КАТАЛОГ и путь исправления: без этого сообщение бесполезно — чаще
+            // всего clave просто запущен не из репозитория (например из домашней папки,
+            // как открывается свежее окно терминала).
+            self.push_system(format!(
+                "✗ {} {}",
+                self.lang.choose(
+                    "/dev работает над git-репозиторием, а рабочий каталог им не является:",
+                    "/dev needs a git repo, but the working directory is not one:",
+                ),
+                repo.display()
+            ));
+            self.push_system(self.lang.choose(
+                "  ⎿ запусти clave из репозитория — или укажи его прямо здесь: /add-dir <путь>",
+                "  ⎿ launch clave from the repo — or point at it right here: /add-dir <path>",
+            ));
+            return None;
+        };
+        let Some((program, args, pythonpath)) = resolve_clave_dev(&git_root) else {
+            self.push_system(format!(
+                "✗ {} {}",
+                self.lang.choose(
+                    "пакет clave_dev не найден для репозитория",
+                    "clave_dev package not found for repo",
+                ),
+                git_root.display()
+            ));
+            self.push_system(self.lang.choose(
+                "  ⎿ задай CLAVE_DEV_HOME, установи пакет, либо работай в репо с tools/clave-dev",
+                "  ⎿ set CLAVE_DEV_HOME, install the package, or work in a repo with tools/clave-dev",
+            ));
+            return None;
+        };
+        Some((git_root, program, args, pythonpath))
+    }
+
     /// Точка входа `/dev <задача>`: спрашивает про зрение и только потом стартует прогон.
     ///
     /// Зрение открывает окно Terminal.app прямо на экране, поэтому включать его скрытым
@@ -99,6 +139,13 @@ impl App {
             return;
         }
         self.push_system(format!("◆ /dev {task}"));
+
+        // Сначала убеждаемся, что прогон вообще возможен, и только ПОТОМ спрашиваем про
+        // зрение. Спросить, а следом сказать «так это и не запустится» — значит впустую
+        // потратить ответ пользователя.
+        if self.dev_target().is_none() {
+            return; // причина уже показана
+        }
 
         if !provider_binary_present("claude") {
             self.start_dev(task, false);
@@ -158,20 +205,8 @@ impl App {
             return;
         }
 
-        let repo = self.resolved_work_dir();
-        let Some(git_root) = dev_git_root(&repo) else {
-            self.push_system(self.lang.choose(
-                "Не git-репозиторий — /dev работает в git-проекте.",
-                "Not a git repo — /dev needs a git project.",
-            ));
-            return;
-        };
-        let Some((program, mut cmd_args, pythonpath)) = resolve_clave_dev(&git_root) else {
-            self.push_system(self.lang.choose(
-                "clave_dev не найден: задай CLAVE_DEV_HOME, установи пакет или запусти из репо с tools/clave-dev.",
-                "clave_dev not found: set CLAVE_DEV_HOME, install it, or run from a repo with tools/clave-dev.",
-            ));
-            return;
+        let Some((git_root, program, mut cmd_args, pythonpath)) = self.dev_target() else {
+            return; // причина уже показана
         };
         let Ok(known_good) = env::current_exe() else {
             self.push_system(self.lang.choose(
