@@ -235,11 +235,36 @@ pub(crate) fn footer_right_segments(app: &App) -> Vec<String> {
     segments
 }
 
-pub(crate) fn footer_right_target(app: &App) -> String {
-    let segments = footer_right_segments(app);
+/// Рендер без зависимости от стенных часов — для внешнего наблюдения (снимок экрана и сравнение
+/// с эталоном). Включается `CLAVE_STATIC_RENDER=1`, как и `CLAVE_SKIP_ONBOARDING`.
+fn static_render() -> bool {
+    std::env::var("CLAVE_STATIC_RENDER").ok().as_deref() == Some("1")
+}
+
+/// Что показать в правом слоте футера.
+///
+/// Слот вращается по стенным часам: `(unix_secs / 8) % N`. Значит два снимка ОДНОГО И ТОГО ЖЕ
+/// кода, сделанные в разные секунды, показывают разные сегменты разной ширины — и всякое
+/// сравнение рендеров превращается в подбрасывание монеты. На этом сорвался живой прогон:
+/// эталон поймал «чат: Claude», проверяемая сборка — «усилие: Claude max · Codex xhigh», и
+/// разница была объявлена регрессией, которой никто не вносил.
+///
+/// В статичном режиме берём самый ШИРОКИЙ сегмент, а не первый: так рендер и детерминирован, и
+/// показывает худший случай по ширине — тот самый, на котором обрезка у правой границы и ловится.
+pub(crate) fn pick_right_segment(segments: Vec<String>, static_mode: bool) -> String {
+    if static_mode {
+        return segments
+            .into_iter()
+            .max_by_key(|segment| display_width(segment))
+            .unwrap_or_default();
+    }
 
     let phase = rotating_phase(8, segments.len());
     segments.get(phase).cloned().unwrap_or_default()
+}
+
+pub(crate) fn footer_right_target(app: &App) -> String {
+    pick_right_segment(footer_right_segments(app), static_render())
 }
 
 pub(crate) fn footer_right_slot_width(app: &App) -> usize {
@@ -308,6 +333,50 @@ mod tests {
     const SWITCH: &str = "shift+tab";
     const HINTS: &str = "? подсказки · / команды";
     const RIGHT: &str = "роли: Codex → Claude";
+
+    fn segments() -> Vec<String> {
+        [
+            "чат: Claude",
+            "тема: Amber",
+            "усилие: Claude max · Codex xhigh",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    /// Правый слот вращается по стенным часам. Значит внешнее наблюдение (снимок экрана и
+    /// сравнение с эталоном) видит РАЗНЫЕ сегменты разной ширины у одного и того же кода — и
+    /// объявляет регрессией разницу, которой никто не вносил. Ровно так и случилось на живом
+    /// прогоне. Статичный режим убирает часы из рендера.
+    #[test]
+    fn static_render_pins_the_slot_and_shows_the_widest_segment() {
+        let picked = pick_right_segment(segments(), true);
+
+        assert_eq!(picked, "усилие: Claude max · Codex xhigh");
+        // Детерминированность — суть режима: повтор обязан дать то же самое.
+        assert_eq!(pick_right_segment(segments(), true), picked);
+    }
+
+    /// Широчайший сегмент выбран не из вкуса: он и есть худший случай по ширине, а обрезка у
+    /// правой границы ловится именно на нём.
+    #[test]
+    fn the_pinned_segment_is_the_widest_by_columns_not_by_chars() {
+        let widest = pick_right_segment(segments(), true);
+
+        let max_cols = segments().iter().map(|s| display_width(s)).max().unwrap();
+        assert_eq!(display_width(&widest), max_cols);
+    }
+
+    #[test]
+    fn without_static_render_the_slot_still_rotates() {
+        let picked = pick_right_segment(segments(), false);
+
+        assert!(
+            segments().contains(&picked),
+            "вращение должно давать один из сегментов"
+        );
+    }
 
     fn layout(width: usize, git: Option<&str>) -> FooterLayout {
         footer_layout(width, MODE, SWITCH, HINTS, git, RIGHT, display_width(RIGHT))
