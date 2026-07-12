@@ -231,7 +231,10 @@ def gui_capture_verdict(
         return subprocess.run(cmd, capture_output=True).returncode
 
     home = Path(tempfile.mkdtemp(prefix="clave-dev-guihome-"))
-    env_prefix = f"CLAVE_HOME={home} CLAVE_SKIP_ONBOARDING=1 "
+    # CLAVE_STATIC_RENDER — рендер без стенных часов. Правый слот футера вращается по
+    # времени, и два снимка одного и того же кода показывали разные сегменты разной ширины:
+    # регрессионный гейт объявлял регрессией то, чего агент не делал.
+    env_prefix = f"CLAVE_HOME={home} CLAVE_SKIP_ONBOARDING=1 CLAVE_STATIC_RENDER=1 "
     if config_path:
         env_prefix += f"CLAVE_CONFIG={config_path} "
     title = f"clave-dev {uuid.uuid4().hex[:8]}"

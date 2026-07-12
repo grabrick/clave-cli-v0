@@ -83,6 +83,7 @@ def main(argv=None) -> int:
     home.mkdir(parents=True, exist_ok=True)
     env["CLAVE_HOME"] = str(home)
     env["CLAVE_SKIP_ONBOARDING"] = "1"
+    env["CLAVE_STATIC_RENDER"] = "1"
 
     # …но изолируем СОСТОЯНИЕ, а не ПОВЕДЕНИЕ. Пустой home означал дефолтный конфиг, а дефолтный
     # режим — codex-only: исполнитель и критик становились одной моделью, и «тандем» тихо
