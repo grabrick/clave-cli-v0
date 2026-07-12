@@ -47,9 +47,28 @@ class VisionPreflightTest(unittest.TestCase):
         )
         self.assertIn("screencapture", reason)
 
+    def test_missing_terminal_profile_blocks(self):
+        # Без профиля с «при выходе из shell закрыть окно» окно визуального прохода некому
+        # убрать: снаружи Terminal-окно не закрывается (проверено), и за каждый раунд
+        # копилось бы окно-мусор. Значит стартовать нельзя.
+        from clave_dev.vision import vision_preflight
+
+        reason = vision_preflight(
+            FakeVisionProvider({}),
+            capture=lambda: None,
+            quartz=lambda: True,
+            settings=lambda name: False,
+        )
+        self.assertIn("профиля Terminal", reason)
+
     def test_all_good(self):
         from clave_dev.vision import vision_preflight
 
         self.assertIsNone(
-            vision_preflight(FakeVisionProvider({}), capture=lambda: None, quartz=lambda: True)
+            vision_preflight(
+                FakeVisionProvider({}),
+                capture=lambda: None,
+                quartz=lambda: True,
+                settings=lambda name: True,
+            )
         )

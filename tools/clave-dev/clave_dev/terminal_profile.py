@@ -22,6 +22,23 @@ def default_profile() -> TerminalProfile:
     )
 
 
+def settings_set_exists(name: str) -> bool:
+    """Есть ли у Terminal профиль с таким именем.
+
+    Он обязателен: только профиль с «при выходе из shell — закрыть окно» позволяет окну
+    визуального прохода убрать себя. Снаружи окно Terminal не закрывается (см.
+    terminal_driver.launch_applescript). Свежесозданный профиль работающий Terminal НЕ
+    видит — его нужно перезапустить; поэтому проверку делаем в preflight, до прогона."""
+    import subprocess
+
+    out = subprocess.run(
+        ["osascript", "-e", 'tell application "Terminal" to return name of every settings set'],
+        capture_output=True,
+        text=True,
+    ).stdout
+    return name in out
+
+
 def describe(p: TerminalProfile) -> dict:
     """Плоский dict для лога/отчёта — атрибуция любого визуального вывода к среде."""
     return dict(p._asdict())

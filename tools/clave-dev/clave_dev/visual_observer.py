@@ -68,11 +68,7 @@ def gui_capture_verdict(binary, cwd, profile, vision, steps=(), settle_s=0.4, pr
     import time
     import uuid
 
-    from .terminal_driver import (
-        close_window_applescript,
-        launch_applescript,
-        send_line_applescript,
-    )
+    from .terminal_driver import launch_applescript, send_line_applescript
     from .terminal_profile import apply_bounds_applescript
     from .window_resolve import list_windows, resolve_cgwindow_id
 
@@ -88,7 +84,11 @@ def gui_capture_verdict(binary, cwd, profile, vision, steps=(), settle_s=0.4, pr
     env_prefix = f"CLAVE_HOME={home} CLAVE_SKIP_ONBOARDING=1 "
     title = f"clave-dev {uuid.uuid4().hex[:8]}"
 
-    win_id = osa(launch_applescript(Path(binary), title, Path(cwd), env_prefix))
+    # profile.theme — имя профиля Terminal с «при выходе из shell закрыть окно».
+    # Только он позволяет окну убрать себя: снаружи Terminal-окно не закрывается.
+    win_id = osa(
+        launch_applescript(Path(binary), title, Path(cwd), env_prefix, profile.theme)
+    )
     osa(apply_bounds_applescript(profile, win_id or None))
     time.sleep(1.8)  # дать UI подняться
 
@@ -103,9 +103,10 @@ def gui_capture_verdict(binary, cwd, profile, vision, steps=(), settle_s=0.4, pr
     verdict = run_visual(cgid, vision, run_cmd, _decode_png_pixels, out, prompt)
 
     if win_id:
-        osa(send_line_applescript(win_id, "/quit"))  # выход через tty ЭТОГО окна
-        time.sleep(0.8)
-        osa(close_window_applescript(win_id))  # и само окно — иначе копятся окна-мусор
+        # /quit → clave выходит → шелл выходит (`; exit` в команде) → окно закрывается САМО
+        # (профиль с shellExitAction=0). Закрыть его снаружи нельзя — проверено.
+        osa(send_line_applescript(win_id, "/quit"))
+        time.sleep(1.2)
     return verdict
 
 

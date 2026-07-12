@@ -17,12 +17,13 @@ class CaptureTest(unittest.TestCase):
         self.assertTrue(is_blank_frame(b""))                       # пусто → пусто
         self.assertFalse(is_blank_frame(bytes([200]) * 1000))      # насыщено → не пусто
 
-    def test_launch_isolates_home_returns_window_id_and_does_not_steal_focus(self):
+    def test_launch_isolates_home_returns_window_id_and_self_closes(self):
         script = launch_applescript(
             Path("/wt/target/debug/clave"),
             "clave-dev xyz",
             Path("/wt"),
             "CLAVE_HOME=/tmp/h CLAVE_SKIP_ONBOARDING=1 ",
+            "clave-dev",
         )
         self.assertIn("clave-dev xyz", script)
         self.assertIn("do script", script)
@@ -32,6 +33,10 @@ class CaptureTest(unittest.TestCase):
         self.assertIn("return id of w", script)
         # Прогон фоновый — фокус у пользователя не воруем.
         self.assertNotIn("activate", script)
+        # Окно закрывает СЕБЯ САМО: шелл выходит, профиль закрывает окно. Снаружи
+        # Terminal-окно закрыть нельзя — проверено на живой системе.
+        self.assertIn("; exit", script)
+        self.assertIn('settings set "clave-dev"', script)
 
     def test_send_line_targets_the_window_and_never_injects_globally(self):
         script = send_line_applescript(42, 'say "hi"')

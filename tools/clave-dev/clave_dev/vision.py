@@ -48,17 +48,27 @@ class FakeVisionProvider(VisionProvider):
         return parse_verdict(self._verdict, raw="<fake>")
 
 
-def vision_preflight(vision, capture=None, quartz=None):
+def vision_preflight(vision, capture=None, quartz=None, settings=None, profile_name="clave-dev"):
     """Причина, по которой зрение работать НЕ сможет (None — всё в порядке).
 
     Проверяем ДО старта прогона: узнать о невозможности на третьем раунде дорого и обидно,
     а fail-safe вердикт превратил бы каждый раунд в гарантированную не-сходимость.
-    `capture`/`quartz` инъектируются в тестах; в проде — реальные проверки."""
+    `capture`/`quartz`/`settings` инъектируются в тестах; в проде — реальные проверки."""
     if vision is None or not vision.available():
         return "нет доступного vision-бэкенда (нужен claude CLI или ANTHROPIC_API_KEY)"
     if not (quartz or _quartz_ok)():
         return "нет pyobjc (Quartz): не разрешить окно и не декодировать кадр"
-    return (capture or _screen_probe)()
+    reason = (capture or _screen_probe)()
+    if reason:
+        return reason
+    if not (settings or _settings_ok)(profile_name):
+        return (
+            f"нет профиля Terminal «{profile_name}» с «при выходе из shell — закрыть окно». "
+            "Без него окно визуального прохода некому убрать: снаружи Terminal-окно не "
+            "закрывается (проверено), и за каждый раунд копилось бы окно-мусор. "
+            "Создай профиль и перезапусти Terminal"
+        )
+    return None
 
 
 def _quartz_ok() -> bool:
@@ -68,6 +78,12 @@ def _quartz_ok() -> bool:
         return True
     except Exception:
         return False
+
+
+def _settings_ok(name: str) -> bool:
+    from .terminal_profile import settings_set_exists
+
+    return settings_set_exists(name)
 
 
 def _screen_probe():

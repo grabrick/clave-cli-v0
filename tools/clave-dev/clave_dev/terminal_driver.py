@@ -12,8 +12,20 @@ from __future__ import annotations
 from pathlib import Path
 
 
-def launch_applescript(binary: Path, title: str, cwd: Path, env_prefix: str = "") -> str:
+def launch_applescript(
+    binary: Path, title: str, cwd: Path, env_prefix: str = "", settings_set: str = None
+) -> str:
     """Открыть окно Terminal, запустить бинарь, вернуть **id окна Terminal**.
+
+    Команда заканчивается `; exit`, а вкладке назначается профиль `settings_set`, у которого
+    «при выходе из shell — закрыть окно». Тогда после `/quit` clave выходит, следом выходит
+    шелл, и окно закрывается САМО.
+
+    Почему только так. Закрыть окно Terminal снаружи нельзя — проверено на живой системе:
+    AppleScript `close` молча не срабатывает (возвращает успех, окно живо), `close` вкладки
+    Terminal не понимает (-1708), а System Events на ВВОД (и keystroke, и клик по крестику)
+    из нашего контекста не действует вовсе. Из-за этого прежний teardown через
+    `keystroke "/quit"` не работал НИКОГДА, и окна копились после каждого прогона.
 
     Окно ищем по ВКЛАДКЕ, которую вернул `do script`, а не по «front window». Проверено
     вживую: без `activate`, когда у пользователя уже открыты окна Terminal (тем более на
@@ -23,32 +35,25 @@ def launch_applescript(binary: Path, title: str, cwd: Path, env_prefix: str = ""
     Без `activate`: прогон фоновый, воровать фокус у пользователя нельзя.
     `env_prefix` задаёт окружение прямо в команде — иначе наблюдаемый clave читал бы
     РЕАЛЬНЫЙ конфиг и чаты пользователя вместо изолированных."""
-    cmd = f"cd {cwd}; clear; {env_prefix}{binary}"
+    cmd = f"cd {cwd}; clear; {env_prefix}{binary}; exit"
     # Титул вешаем прямо на ВКЛАДКУ, которую вернул `do script`, а окно находим по её
     # уникальному `tty`. Два тупика, проверенных вживую: «front window» без `activate`
     # указывает на чужое окно, а `tabs of w contains t` падает с -1700 (AppleScript не
     # умеет сравнивать ссылки на вкладки). tty уникален и сравнивается как строка.
-    return (
-        'tell application "Terminal"\n'
-        f'  set t to do script "{cmd}"\n'
-        f'  set custom title of t to "{title}"\n'
-        "  set theTty to tty of t\n"
-        "  repeat with w in windows\n"
-        "    repeat with tb in tabs of w\n"
-        "      if tty of tb is theTty then return id of w\n"
-        "    end repeat\n"
-        "  end repeat\n"
-        "end tell"
-    )
-
-
-def close_window_applescript(window_id) -> str:
-    """Закрыть окно Terminal целиком.
-
-    Обязательно: после `/quit` сам clave выходит, но окно ОСТАЁТСЯ — в нём возвращается
-    shell. Без явного закрытия каждый визуальный проход оставлял бы висящее окно, и за три
-    раунда `/dev` пользователь получал бы три окна-мусора."""
-    return f'tell application "Terminal" to close (every window whose id is {window_id})'
+    lines = ['tell application "Terminal"', f'  set t to do script "{cmd}"']
+    if settings_set:
+        lines.append(f'  set current settings of t to settings set "{settings_set}"')
+    lines += [
+        f'  set custom title of t to "{title}"',
+        "  set theTty to tty of t",
+        "  repeat with w in windows",
+        "    repeat with tb in tabs of w",
+        "      if tty of tb is theTty then return id of w",
+        "    end repeat",
+        "  end repeat",
+        "end tell",
+    ]
+    return "\n".join(lines)
 
 
 def send_line_applescript(window_id, text: str) -> str:
