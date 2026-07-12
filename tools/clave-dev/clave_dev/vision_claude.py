@@ -6,6 +6,8 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shutil
+import subprocess
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -87,10 +89,57 @@ def _send_via_api(env, png_path: Path, prompt: str) -> str:
     return extract_vision_text(data)
 
 
+def build_cli_vision_prompt(png_path, prompt: str) -> str:
+    """Чистая сборка промпта для `claude` CLI: он читает файл по пути своим Read-инструментом
+    (способность проверена на реальном PNG — спека §3 закрыта положительно)."""
+    return (
+        f"Прочитай изображение по пути {png_path} — это скриншот TUI-приложения в терминале.\n\n"
+        f"{prompt}\n\n"
+        "Ответь ТОЛЬКО JSON-объектом, без пояснений и без markdown-обёртки."
+    )
+
+
+def _run_claude_cli(binary: str, prompt: str, timeout: int) -> str:
+    res = subprocess.run([binary, "-p", prompt], capture_output=True, text=True, timeout=timeout)
+    if res.returncode != 0:
+        raise VisionUnavailableError(
+            f"claude CLI код {res.returncode}: {res.stderr.strip()[:200]}"
+        )
+    return res.stdout
+
+
+class ClaudeCliVisionProvider(VisionProvider):
+    """Зрение через уже авторизованный `claude` CLI — БЕЗ ANTHROPIC_API_KEY.
+    CLI умеет открывать PNG по пути, поэтому канал доступен там, где живёт сам clave."""
+
+    def __init__(self, binary: str = "claude", runner=None, timeout: int = 180):
+        self._binary = binary
+        self._runner = runner  # инъекция для тестов: runner(prompt) -> str
+        self._timeout = timeout
+
+    def available(self) -> bool:
+        return self._runner is not None or shutil.which(self._binary) is not None
+
+    def analyze_image(self, png_path: Path, prompt: str = DEFAULT_VISION_PROMPT) -> VisionVerdict:
+        if not self.available():
+            raise VisionUnavailableError("claude CLI не найден в PATH")
+        cli_prompt = build_cli_vision_prompt(png_path, prompt)
+        raw = (
+            self._runner(cli_prompt)
+            if self._runner
+            else _run_claude_cli(self._binary, cli_prompt, self._timeout)
+        )
+        return parse_verdict(extract_verdict_json(raw), raw=raw)
+
+
 def select_vision(name, env=None):
-    """Фабрика по имени бэкенда из --vision (None → зрение выключено)."""
+    """Фабрика по имени бэкенда из --vision (None → зрение выключено).
+    'claude' — прямой image-API (нужен ANTHROPIC_API_KEY); 'claude-cli' — через
+    авторизованный CLI (ключ не нужен)."""
     if not name:
         return None
     if name == "claude":
         return ClaudeVisionProvider(env=env)
+    if name == "claude-cli":
+        return ClaudeCliVisionProvider()
     raise ValueError(f"неизвестный vision-бэкенд: {name}")

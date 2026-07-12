@@ -48,3 +48,27 @@ class VisionApiTest(unittest.TestCase):
         resp = {"content": [{"type": "text", "text": "часть1 "}, {"type": "text", "text": "часть2"}]}
         self.assertEqual(extract_vision_text(resp), "часть1 часть2")
         self.assertEqual(extract_vision_text({}), "")
+
+
+class ClaudeCliVisionTest(unittest.TestCase):
+    """Канал зрения через авторизованный claude CLI — без ANTHROPIC_API_KEY (спека §3)."""
+
+    def test_cli_prompt_carries_path_and_json_demand(self):
+        from clave_dev.vision_claude import build_cli_vision_prompt
+
+        p = build_cli_vision_prompt("/tmp/frame.png", "чеклист")
+        self.assertIn("/tmp/frame.png", p)
+        self.assertIn("JSON", p)
+
+    def test_cli_provider_parses_verdict_from_runner(self):
+        from clave_dev.vision_claude import ClaudeCliVisionProvider
+
+        raw = 'вот результат:\n{"checklist_results":[{"check":"c","required":true,"passed":true}]}'
+        p = ClaudeCliVisionProvider(runner=lambda prompt: raw)
+        self.assertTrue(p.available())
+        self.assertTrue(verdict_passes(p.analyze_image(Path("/x.png"))))
+
+    def test_select_vision_claude_cli(self):
+        from clave_dev.vision_claude import ClaudeCliVisionProvider
+
+        self.assertIsInstance(select_vision("claude-cli"), ClaudeCliVisionProvider)
