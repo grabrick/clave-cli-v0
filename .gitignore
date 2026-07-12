@@ -8,3 +8,6 @@ target/
 # venv супервайзера clave-dev (pyte/pyobjc)
 .venv/
 **/.venv/
+
+# worktree-каталог харнесса (не должен делать дерево грязным)
+.claude/worktrees/
