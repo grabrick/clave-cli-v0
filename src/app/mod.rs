@@ -120,7 +120,9 @@ pub(crate) struct App {
     /// Постоянный индикатор футера: ветка рабочего каталога (или короткий SHA в detached
     /// HEAD). `None` — каталог не репозиторий, индикатор не рисуется.
     pub(crate) git_ref: Option<String>,
-    pub(crate) git_ref_checked_at: Option<Instant>,
+    /// Чем читаем ref. Отдельным полем — чтобы тест мог подменить детектор и доказать, что
+    /// без событий git не дёргается вовсе. Обычный fn-указатель: детектор — чистая функция.
+    pub(crate) git_ref_detector: fn(&Path) -> Option<String>,
     pub(crate) should_quit: bool,
     pub(crate) history: Vec<String>,
     pub(crate) history_index: Option<usize>,
@@ -232,7 +234,7 @@ impl App {
             footer_right_previous_text: None,
             footer_right_changed_at: None,
             git_ref: None,
-            git_ref_checked_at: None,
+            git_ref_detector: footer::detect_git_ref,
             should_quit: false,
             history,
             history_index: None,

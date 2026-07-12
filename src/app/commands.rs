@@ -712,8 +712,7 @@ impl App {
         }
 
         self.work_dir = resolved.to_string_lossy().to_string();
-        // Индикатор футера — про НОВЫЙ каталог, и уже в этом кадре, а не через TTL.
-        self.git_ref_checked_at = None;
+        // Индикатор футера — про НОВЫЙ каталог, и уже в этом кадре.
         self.refresh_git_ref();
         self.status = self.lang.choose("cwd обновлён", "cwd updated").to_string();
         self.save_current_config(true);

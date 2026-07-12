@@ -59,6 +59,7 @@ pub(crate) fn run_tui() -> AnyResult<()> {
     install_panic_hook();
     let _guard = TerminalGuard::new()?;
     let mut app = App::new();
+    app.refresh_git_ref();
     // Welcome — при пустом старте ИЛИ когда в восстановленном чате нет реального
     // диалога (ни одной реплики «◆ …», напр. после /clear осталась лишь системная
     // строка): новое окно должно встречать приветствием, а не огрызком прошлого чата.
@@ -220,7 +221,6 @@ pub(crate) fn run_app(app: &mut App, renderer: &mut LiveRenderer) -> AnyResult<(
         app.expire_footer_notice();
         app.refresh_command_palette_state();
         app.refresh_footer_right_state();
-        app.refresh_git_ref();
 
         let (width, full_h) = crossterm::terminal::size().unwrap_or((80, 24));
         renderer.render(app, width, full_h)?;
