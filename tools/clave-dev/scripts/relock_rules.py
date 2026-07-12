@@ -53,6 +53,18 @@ def expected() -> dict:
     return {name: digest(ROOT / name) for name in PROTECTED}
 
 
+def drifted(locked: dict, actual: dict) -> list:
+    """Что изменилось против замка. Чистая функция — её и проверяет тест.
+
+    Отдельно от файлов нарочно: прежний тест доказывал работу замка тем, что ПОРТИЛ настоящий
+    файл правила и чинил его в `finally`. А мета-тесты гоняют набор в восьми параллельных
+    подпроцессах, и каждый из них тоже запускал этого сторожа — восемь потоков наперегонки
+    портили и чинили один файл. Локально везло, CI поймал. Общего изменяемого состояния в тестах
+    быть не должно.
+    """
+    return sorted(name for name, sha in actual.items() if locked.get(name) != sha)
+
+
 def load() -> dict:
     if not LOCK.is_file():
         return {}

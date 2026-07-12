@@ -35,7 +35,7 @@ sys.path.insert(0, str(ROOT))
 # Мета-тесты исключаем из мутационного прогона. Не только от рекурсии: они запускают набор в
 # ПОДПРОЦЕССЕ, а подпроцесс не видит подменённый гейт — то есть доказывают ноль, а стоят по
 # полному прогону каждый. Восемь гейтов × вложенный прогон и давали 22с на ровном месте.
-META_TESTS = ("test_gates_can_fail", "test_no_dead_modules")
+META_TESTS = ("test_gates_can_fail", "test_no_dead_modules", "test_rules_are_enforced")
 
 
 def _always_pass_verdict(samples, base=(), min_hits=2):

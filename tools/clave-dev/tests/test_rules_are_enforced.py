@@ -23,15 +23,22 @@
 Потолок честный: от редактора с правом записи защиты нет. Эти тесты не ЗАПРЕЩАЮТ обход — они
 делают его ГРОМКИМ. Последний рубеж — человек, читающий дифф.
 """
-import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from clave_dev.checks import RULE_TESTS  # noqa: E402
-from scripts.relock_rules import LOCK, PROTECTED, ROOT, expected, load  # noqa: E402
+from scripts.relock_rules import (  # noqa: E402
+    PROTECTED,
+    ROOT,
+    digest,
+    drifted,
+    expected,
+    load,
+)
 
 WORKFLOW = ROOT / ".." / ".." / ".github" / "workflows" / "dev-rules.yml"
 
@@ -82,15 +89,11 @@ class RulesAreLockedTest(unittest.TestCase):
         locked = load()
         self.assertTrue(locked, "RULES.lock пропал — правила больше ничем не заперты")
 
-        drifted = [
-            name
-            for name, sha in expected().items()
-            if locked.get(name) != sha
-        ]
+        moved = drifted(locked, expected())
         self.assertFalse(
-            drifted,
+            moved,
             "защищённые файлы изменены, а замок не перевыпущен:\n  · "
-            + "\n  · ".join(drifted)
+            + "\n  · ".join(moved)
             + "\n\nЭто не запрет. Это требование сделать правку ГРОМКОЙ: перевыпусти замок\n"
             "(python3 scripts/relock_rules.py) — и в диффе появится строка «я поменял правила».",
         )
@@ -105,21 +108,42 @@ class RulesAreLockedTest(unittest.TestCase):
 
 
 class ItselfCanFailTest(unittest.TestCase):
-    """Правило 1, применённое к этому сторожу: он обязан уметь провалиться."""
+    """Правило 1, применённое к этому сторожу: он обязан уметь провалиться.
 
-    def test_a_tampered_file_is_actually_caught(self):
-        target = ROOT / "tests" / "test_gates_can_fail.py"
-        original = target.read_bytes()
-        try:
-            target.write_bytes(original + "\n# выпотрошено\n".encode())
-            drifted = [n for n, sha in expected().items() if load().get(n) != sha]
-            self.assertIn(
-                "tests/test_gates_can_fail.py",
-                drifted,
+    Проверяем МЕХАНИЗМ замка, не трогая настоящие файлы. Прежняя версия доказывала работу замка
+    тем, что портила реальный `test_gates_can_fail.py` и чинила его в `finally`. Мета-тесты гоняют
+    набор в восьми параллельных подпроцессах, и каждый запускал этого сторожа — восемь потоков
+    наперегонки правили один файл. Локально везло; CI поймал. Общего изменяемого состояния в
+    тестах быть не должно, и «у меня же есть finally» — не аргумент.
+    """
+
+    def test_a_hollowed_out_rule_is_caught(self):
+        # Тот самый обход: файл на месте, имя на месте, а внутри `GATES = []`.
+        with tempfile.TemporaryDirectory() as tmp:
+            rule = Path(tmp) / "test_gates_can_fail.py"
+            rule.write_text("GATES = ['a', 'b', 'c']\n")
+            locked = {"rule": digest(rule)}
+
+            rule.write_text("GATES = []  # временно, оно флаки\n")
+
+            self.assertEqual(
+                drifted(locked, {"rule": digest(rule)}),
+                ["rule"],
                 "замок не заметил подмену правила — значит он декорация",
             )
-        finally:
-            target.write_bytes(original)
+
+    def test_an_untouched_rule_is_not_flagged(self):
+        # Замок, который ругается всегда, — тоже декорация: его отключат первым.
+        with tempfile.TemporaryDirectory() as tmp:
+            rule = Path(tmp) / "rule.py"
+            rule.write_text("GATES = ['a']\n")
+            locked = {"rule": digest(rule)}
+
+            self.assertEqual(drifted(locked, {"rule": digest(rule)}), [])
+
+    def test_a_missing_entry_in_the_lock_counts_as_drift(self):
+        # Добавил защищаемый файл, замок не перевыпустил — это тоже дрейф.
+        self.assertEqual(drifted({}, {"новый": "abc"}), ["новый"])
 
     def test_relock_script_is_still_there(self):
         self.assertTrue((ROOT / "scripts" / "relock_rules.py").is_file())

@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 # Мета-тесты сами гоняют набор в подпроцессах — трассировкой их не поймать, и они не про модули.
-SKIP_TESTS = ("test_gates_can_fail", "test_no_dead_modules")
+SKIP_TESTS = ("test_gates_can_fail", "test_no_dead_modules", "test_rules_are_enforced")
 
 # Точки входа: у них нет и не может быть юнит-теста, они лишь склеивают остальное.
 ENTRYPOINTS = {"__init__", "__main__"}
