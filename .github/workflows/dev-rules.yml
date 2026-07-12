@@ -41,7 +41,8 @@ jobs:
           python -m unittest -v \
             tests.test_gates_can_fail \
             tests.test_unverified \
-            tests.test_no_dead_modules
+            tests.test_no_dead_modules \
+            tests.test_rules_are_enforced
 
       - name: Весь набор clave-dev
         working-directory: tools/clave-dev

@@ -21,6 +21,7 @@ RULE_TESTS = (
     "tests.test_gates_can_fail",   # гейт обязан уметь провалиться
     "tests.test_unverified",       # «сошлось» не едет в одиночку
     "tests.test_no_dead_modules",  # ни один модуль не освобождён от тестов
+    "tests.test_rules_are_enforced",  # сторож правил: без имени его можно снести молча
 )
 
 
