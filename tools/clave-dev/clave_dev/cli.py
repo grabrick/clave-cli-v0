@@ -11,6 +11,9 @@ from .binaries import sanitized_env, snapshot_known_good
 from .loop import RunConfig, run_loop
 from .observer import Scenario
 from .report import render_report
+from .terminal_profile import default_profile, describe
+from .vision_claude import select_vision
+from .visual_verdict import severities_at_or_above
 from .worktree import DirtyTreeError, assert_clean, create_run_worktree
 
 _ASSERT_FACTORIES = {"visible": visible, "not_visible": not_visible, "line_matches": line_matches}
@@ -35,6 +38,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--effort", default=None)
     p.add_argument("--assert", dest="asserts", action="append", type=_parse_assert, default=[],
                    help="assertion над экраном, напр. 'visible:Отправка' (можно несколько)")
+    p.add_argument("--vision", default=None,
+                   help="бэкенд зрения (напр. claude); без него — текст-онли Фаза 1")
+    p.add_argument("--terminal-profile", default=None,
+                   help="имя профиля Terminal.app для среды прогона (§4)")
+    p.add_argument("--severity-threshold", default="medium", choices=["low", "medium", "high"],
+                   help="минимальный severity необязательной находки, который блокирует (§6)")
     return p
 
 
@@ -61,6 +70,25 @@ def main(argv=None) -> int:
     env["CLAVE_SKIP_ONBOARDING"] = "1"
 
     scenario = Scenario(name="default", steps=[], settle_s=0.4, assertions=list(args.asserts))
+
+    # Зрение (Фаза 2): выбирается явно; недоступно/не задано → текст-онли Фаза 1 (не тихо, §7).
+    vision = select_vision(args.vision, env)
+    if args.vision and (vision is None or not vision.available()):
+        print(
+            f"clave-dev: vision-бэкенд '{args.vision}' недоступен — прогон в текст-онли (Фаза 1); "
+            "подключение image-канала это отдельная задача",
+            file=sys.stderr,
+        )
+        vision = None
+    elif args.vision is None:
+        print("clave-dev: зрение выключено (--vision не задан) — текст-онли Фаза 1", file=sys.stderr)
+
+    profile = default_profile()
+    if args.terminal_profile:
+        profile = profile._replace(theme=args.terminal_profile)
+    print(f"clave-dev: терминальная среда: {describe(profile)}", file=sys.stderr)  # §4 лог среды
+    blocking = severities_at_or_above(args.severity_threshold)
+
     cfg = RunConfig(
         known_good=known.path,
         worktree=worktree,
@@ -72,6 +100,9 @@ def main(argv=None) -> int:
         rounds=args.rounds,
         max_rounds=args.max_rounds,
         scenarios=[scenario],
+        vision=vision,
+        blocking_severities=blocking,
+        terminal_profile=args.terminal_profile,
     )
     report = run_loop(cfg, known.version)
     print(render_report(report, repo, worktree))

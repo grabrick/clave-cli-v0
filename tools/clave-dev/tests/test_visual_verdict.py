@@ -43,3 +43,12 @@ class PassTest(unittest.TestCase):
     def test_optional_low_issue_passes(self):
         v = parse_verdict({"issues": [{"description": "tiny", "severity": "low", "source": "open"}]})
         self.assertTrue(verdict_passes(v))
+
+
+class ThresholdTest(unittest.TestCase):
+    def test_severities_at_or_above(self):
+        from clave_dev.visual_verdict import severities_at_or_above
+
+        self.assertEqual(severities_at_or_above("low"), ("low", "medium", "high"))
+        self.assertEqual(severities_at_or_above("medium"), ("medium", "high"))
+        self.assertEqual(severities_at_or_above("high"), ("high",))

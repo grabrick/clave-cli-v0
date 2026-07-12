@@ -1,6 +1,7 @@
 """Визуальный проход: снять окно Terminal и получить вердикт зрения (спека §7, §8).
-Ядро (`run_visual`) тестируется здесь через инъекцию `run_cmd`/`read_pixels` без GUI;
-любая беда захвата/парсинга → блокирующий вердикт, никогда тихий pass (§8)."""
+Ядро (`run_visual`) тестируется здесь через инъекцию `run_cmd`/`read_pixels` без GUI.
+GUI-оркестрация (`observe_visual_all`) — e2e-only (реальный Terminal.app), обёрнута в
+fail-safe: любая беда → блокирующий вердикт, никогда тихий pass (§8)."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -33,3 +34,74 @@ def run_visual(cgwindow_id, vision, run_cmd, read_pixels, out_path: Path, prompt
         return vision.analyze_image(out_path, prompt or DEFAULT_VISION_PROMPT)
     except Exception as e:  # непарсящийся вердикт / недоступность бэкенда → блок
         return blocking_verdict(f"vision-бэкенд: {e}")
+
+
+# --- ниже e2e-only: реальный Terminal.app. Не вызывается в headless-тестах/мок-смоуке ---
+# (run_loop гардирует вызов через cfg.vision). Каждый сценарий обёрнут в fail-safe.
+
+
+def observe_visual_all(cfg, fresh):
+    """Для каждого сценария поднять fresh в Terminal.app, снять окно, оценить зрением.
+    Любая беда сценария → блокирующий вердикт (§8), петля не падает."""
+    verdicts = []
+    for scenario in cfg.scenarios:
+        try:
+            verdicts.append(_observe_one(cfg, fresh, scenario))
+        except Exception as e:
+            verdicts.append(blocking_verdict(f"визуальный проход упал: {e}"))
+    return verdicts
+
+
+def _observe_one(cfg, fresh, scenario):
+    import subprocess
+    import tempfile
+    import time
+    import uuid
+
+    from .terminal_driver import keystroke_applescript, launch_applescript
+    from .terminal_profile import apply_bounds_applescript, default_profile
+    from .window_resolve import list_windows, resolve_cgwindow_id
+
+    profile = default_profile()
+    if getattr(cfg, "terminal_profile", None):
+        profile = profile._replace(theme=cfg.terminal_profile)
+
+    def osa(script):
+        subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+
+    def run_cmd(cmd):
+        return subprocess.run(cmd, capture_output=True).returncode
+
+    title = f"clave-dev {uuid.uuid4().hex[:8]}"
+    osa(launch_applescript(fresh, title, cfg.worktree))
+    osa(apply_bounds_applescript(profile))
+    time.sleep(1.5)  # дать UI подняться
+    for keys, wait_s in scenario.steps:
+        osa(keystroke_applescript(keys))
+        time.sleep(max(0.2, float(wait_s)))
+    time.sleep(float(getattr(scenario, "settle_s", 0.4)))
+
+    cgid = resolve_cgwindow_id(list_windows(), profile.app, title)
+    out = Path(tempfile.mkdtemp(prefix="clave-dev-shot-")) / "frame.png"
+    verdict = run_visual(cgid, cfg.vision, run_cmd, _decode_png_pixels, out)
+
+    osa(keystroke_applescript("/quit"))
+    osa('tell application "System Events" to key code 36')  # Enter
+    return verdict
+
+
+def _decode_png_pixels(path) -> bytes:
+    """PNG → сырые пиксели через Quartz (для is_blank_frame). Ленивый импорт pyobjc.
+    При любой беде декодирования — пустые байты (→ is_blank_frame=True → блок, не тихий pass)."""
+    try:
+        import Quartz
+
+        url = Quartz.CFURLCreateWithFileSystemPath(
+            None, str(path), Quartz.kCFURLPOSIXPathStyle, False
+        )
+        src = Quartz.CGImageSourceCreateWithURL(url, None)
+        img = Quartz.CGImageSourceCreateImageAtIndex(src, 0, None)
+        data = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(img))
+        return bytes(data)
+    except Exception:
+        return b""

@@ -60,3 +60,10 @@ def verdict_passes(v: VisionVerdict, blocking=("high", "medium")) -> bool:
     if any(issue.severity in blocking for issue in v.issues):
         return False
     return True
+
+
+def severities_at_or_above(threshold: str) -> tuple:
+    """Блокирующий набор severity из порога: 'medium' → ('medium','high'), 'high' → ('high',)."""
+    if threshold not in SEVERITIES:
+        raise ValueError(f"неизвестный severity-порог: {threshold}")
+    return SEVERITIES[SEVERITIES.index(threshold):]

@@ -7,13 +7,16 @@ from .agent import run_agent
 from .assertions import structural_assertions
 from .binaries import fresh_binary
 from .checks import run_checks
-from .context import build_context
+from .context import build_context, build_visual_context
 from .observer import run_scenario
+from .visual_observer import observe_visual_all
 from .visual_verdict import verdict_passes
 
 RunConfig = namedtuple(
     "RunConfig",
-    "known_good worktree repo env profile task effort rounds max_rounds scenarios",
+    "known_good worktree repo env profile task effort rounds max_rounds scenarios "
+    "vision blocking_severities terminal_profile",
+    defaults=(None, ("high", "medium"), None),
 )
 RunReport = namedtuple(
     "RunReport",
@@ -41,19 +44,25 @@ def run_loop(cfg: RunConfig, known_good_version: str) -> RunReport:
         run_agent(cfg.known_good, cfg.worktree, task, cfg.env, cfg.effort, cfg.rounds)
 
         checks = run_checks(cfg.worktree, cfg.env, cfg.profile)
-        grids, assertion_results = [], []
+        grids, assertion_results, vision_verdicts = [], [], []
         if checks.build_ok:
             fresh = fresh_binary(cfg.worktree, cfg.profile)
             for scenario in cfg.scenarios:
-                scenario = scenario._replace(
+                s = scenario._replace(
                     assertions=list(structural_assertions()) + list(scenario.assertions)
                 )
-                grid, results = run_scenario(fresh, cfg.env, scenario)
+                grid, results = run_scenario(fresh, cfg.env, s)
                 grids.append(grid)
                 assertion_results.extend(results)
+            # Зрение (Фаза 2): реальный терминал + скриншот. Включается только при заданном
+            # и доступном vision-бэкенде; иначе — поведение Фазы 1 (текст-онли).
+            if cfg.vision is not None and cfg.vision.available():
+                vision_verdicts = observe_visual_all(cfg, fresh)
 
-        if converged(checks, assertion_results):
+        if converged(checks, assertion_results, vision_verdicts, cfg.blocking_severities):
             return RunReport(True, round_i, cfg.max_rounds, assertion_results, known_good_version)
         context = build_context(checks, grids, assertion_results)
+        if vision_verdicts:
+            context = context + "\n" + build_visual_context(vision_verdicts)
 
     return RunReport(False, cfg.max_rounds, cfg.max_rounds, assertion_results, known_good_version)
