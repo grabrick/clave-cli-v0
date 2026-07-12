@@ -70,6 +70,7 @@ impl App {
             command,
             "/plan"
                 | "/clave"
+                | "/dev"
                 | "/advisor"
                 | "/btw"
                 | "/brainstorm"
@@ -234,6 +235,16 @@ impl App {
                     );
                 } else {
                     self.start_task(rest.trim().to_string());
+                }
+            }
+            "/dev" => {
+                if rest.trim().is_empty() {
+                    self.push_system(
+                        self.lang
+                            .choose("Использование: /dev <задача>", "Usage: /dev <task>"),
+                    );
+                } else {
+                    self.start_dev(rest.trim().to_string());
                 }
             }
             "/rounds" => match rest.parse::<usize>() {
@@ -544,6 +555,7 @@ impl App {
                 | "/branch"
                 | "/btw"
                 | "/plan"
+                | "/dev"
                 | "/clear"
                 | "/new"
                 | "/chats"

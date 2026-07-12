@@ -5,6 +5,7 @@ mod ask;
 mod chats;
 mod commands;
 mod config;
+mod dev;
 mod editor;
 mod effort;
 mod events;

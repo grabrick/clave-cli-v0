@@ -88,6 +88,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         description_ru: "Запустить multi-agent планирование Clave",
     },
     CommandSpec {
+        usage: "/dev <task>",
+        insert: "/dev ",
+        description_en: "Self-dev: run external clave-dev on the current repo",
+        description_ru: "Самопиление: внешний clave-dev на текущем репозитории",
+    },
+    CommandSpec {
         usage: "/clear",
         insert: "/clear",
         description_en: "Start fresh with empty context",
