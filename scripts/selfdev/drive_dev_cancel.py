@@ -24,27 +24,37 @@ REPO = sys.argv[2]
 COLS, ROWS = 120, 40
 
 
-def descendants() -> dict:
-    """PID → cmdline ТОЛЬКО для потомков прогона: супервайзер (`-m clave_dev`), агент и
-    cargo (живут во ВРЕМЕННОМ каталоге `/T/clave-dev-<nonce>/`).
+def descendant_pids(root_pid) -> dict:
+    """PID → cmdline для ВСЕХ потомков процесса — по дереву ppid, а не по подстроке.
 
-    Осторожно: наивная подстрока `clave-dev-` ловит и сам каталог worktree
-    (`clave-dev-headless`), то есть бинарь clave под тестом — он-то как раз обязан
-    выжить (Ctrl+C отменяет ПРОГОН, а не приложение). Из-за этого фильтр давал ложную
-    «сироту». Матчим только `clave_dev` (модуль, через подчёркивание) и временный путь."""
+    Почему не подстрока: `cargo`/`rustc` — самые опасные сироты (жгут ядра), но в их
+    командной строке нет ни `clave_dev`, ни временного пути, так что фильтр по имени их
+    просто не видит. А наивный `clave-dev-` наоборот ловил каталог worktree
+    (`clave-dev-headless`), то есть сам тестируемый clave, давая ложную «сироту»."""
     out = subprocess.run(
-        ["ps", "-Ao", "pid=,command="], capture_output=True, text=True
+        ["ps", "-Ao", "pid=,ppid=,command="], capture_output=True, text=True
     ).stdout
-    found = {}
+    kids, info = {}, {}
     for line in out.splitlines():
-        line = line.strip()
-        if not line:
+        parts = line.split(None, 2)
+        if len(parts) < 3:
             continue
-        pid, _, cmd = line.partition(" ")
-        is_child = "clave_dev" in cmd or "/T/clave-dev-" in cmd
-        if is_child and "drive_dev_cancel" not in cmd:
-            found[pid] = cmd[:150]
+        pid, ppid, cmd = parts
+        kids.setdefault(ppid, []).append(pid)
+        info[pid] = cmd
+    found, stack = {}, [str(root_pid)]
+    while stack:
+        parent = stack.pop()
+        for kid in kids.get(parent, []):
+            found[kid] = info[kid][:120]
+            stack.append(kid)
     return found
+
+
+def still_alive(pid) -> bool:
+    """Жив ли PID. Проверяем именно по PID: осиротевший процесс при reparent уходит под
+    launchd и из дерева clave исчезает — обход дерева ПОСЛЕ отмены его бы не заметил."""
+    return subprocess.run(["ps", "-p", str(pid)], capture_output=True).returncode == 0
 
 
 def main() -> int:
@@ -90,32 +100,34 @@ def main() -> int:
     pump(1.5)
     os.write(master, b"/dev cancel me mid-run\r")
 
-    # Ждём, пока дерево реально поднимется (супервайзер + сборка).
-    alive, deadline = {}, time.time() + 60
+    # Ждём именно ФАЗУ ПРОВЕРОК: отменять надо посреди cargo — осиротевший cargo/rustc
+    # и есть главный риск (молча жжёт ядра). Отмена на фазе агента этого не проверяет.
+    deadline = time.time() + 90
     while time.time() < deadline:
         pump(1.0)
-        alive = descendants()
-        if len(alive) >= 1 and "раунд" in grid():
+        if "проверки" in grid():
             break
+    pump(4.0)  # дать cargo реально раскрутиться
 
-    print(f"=== ДО ОТМЕНЫ: живых процессов супервайзера/сборки: {len(alive)} ===")
-    for pid, cmd in list(alive.items())[:6]:
+    before = descendant_pids(proc.pid)
+    print(f"=== ДО ОТМЕНЫ: потомков clave (всё дерево): {len(before)} ===")
+    for pid, cmd in list(before.items())[:8]:
         print(f"  {pid}  {cmd}")
-    if not alive:
+    if not before:
         print("НЕ УДАЛОСЬ поймать дерево процессов — тест бессмысленен")
         proc.kill()
         return 2
+    cargo_seen = any("cargo" in c or "rustc" in c for c in before.values())
 
     os.write(master, b"\x03")  # Ctrl+C
     pump(3.0)
     after = grid()
 
-    # Даём время на снятие группы и пожинание.
-    time.sleep(2.0)
-    orphans = descendants()
+    time.sleep(2.5)  # время на снятие группы и пожинание
+    orphans = {pid: cmd for pid, cmd in before.items() if still_alive(pid)}
 
-    print(f"=== ПОСЛЕ Ctrl+C: осталось: {len(orphans)} ===")
-    for pid, cmd in list(orphans.items())[:6]:
+    print(f"=== ПОСЛЕ Ctrl+C: выжило из тех же PID: {len(orphans)} ===")
+    for pid, cmd in list(orphans.items())[:8]:
         print(f"  СИРОТА {pid}  {cmd}")
 
     os.write(master, b"/quit\r")
@@ -128,8 +140,9 @@ def main() -> int:
 
     checks = {
         "прогон стартовал": "раунд" in after or "/dev cancel" in after,
+        "отменяли ПОСРЕДИ cargo (иначе тест слабый)": cargo_seen,
         "TUI показал остановку": "остановлен" in after or "stopped" in after,
-        "НЕТ осиротевших процессов": len(orphans) == 0,
+        "НЕТ осиротевших процессов (ни cargo, ни агента)": len(orphans) == 0,
     }
     print("=== CHECKS ===")
     ok = True
