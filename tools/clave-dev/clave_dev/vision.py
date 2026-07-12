@@ -46,3 +46,44 @@ class FakeVisionProvider(VisionProvider):
         if not self._available:
             raise VisionUnavailableError("fake: недоступен")
         return parse_verdict(self._verdict, raw="<fake>")
+
+
+def vision_preflight(vision, capture=None, quartz=None):
+    """Причина, по которой зрение работать НЕ сможет (None — всё в порядке).
+
+    Проверяем ДО старта прогона: узнать о невозможности на третьем раунде дорого и обидно,
+    а fail-safe вердикт превратил бы каждый раунд в гарантированную не-сходимость.
+    `capture`/`quartz` инъектируются в тестах; в проде — реальные проверки."""
+    if vision is None or not vision.available():
+        return "нет доступного vision-бэкенда (нужен claude CLI или ANTHROPIC_API_KEY)"
+    if not (quartz or _quartz_ok)():
+        return "нет pyobjc (Quartz): не разрешить окно и не декодировать кадр"
+    return (capture or _screen_probe)()
+
+
+def _quartz_ok() -> bool:
+    try:
+        import Quartz  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def _screen_probe():
+    """Пробный снимок. Без доступа к оконному серверу screencapture молча отвечает
+    «could not create image from display» ДАЖЕ при выданных правах (напр. из песочницы)."""
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        shot = Path(d) / "probe.png"
+        res = subprocess.run(
+            ["screencapture", "-x", str(shot)], capture_output=True, text=True
+        )
+        if res.returncode != 0 or not shot.is_file() or shot.stat().st_size < 1024:
+            return (
+                "screencapture не смог снять экран — нет доступа к оконному серверу "
+                "или не выдано Screen Recording"
+            )
+    return None

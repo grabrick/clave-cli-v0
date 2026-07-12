@@ -13,6 +13,7 @@ from .loop import RunConfig, run_loop
 from .observer import Scenario
 from .report import render_report
 from .terminal_profile import default_profile, describe
+from .vision import vision_preflight
 from .vision_claude import select_vision
 from .visual_verdict import severities_at_or_above
 from .worktree import DirtyTreeError, assert_clean, create_run_worktree
@@ -43,8 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="бэкенд зрения (напр. claude); без него — текст-онли Фаза 1")
     p.add_argument("--terminal-profile", default=None,
                    help="имя профиля Terminal.app для среды прогона (§4)")
-    p.add_argument("--severity-threshold", default="medium", choices=["low", "medium", "high"],
-                   help="минимальный severity необязательной находки, который блокирует (§6)")
+    p.add_argument("--severity-threshold", default="medium",
+                   choices=["none", "low", "medium", "high"],
+                   help="минимальный severity необязательной находки, который блокирует (§6). "
+                        "'none' — блокирует только провал required-чеклиста, мнения модели "
+                        "идут агенту справочно (безопасно для автономной петли)")
     p.add_argument("--protocol", default=None, choices=["clave-dev"],
                    help="типизированный вывод CLAVE-DEV для TUI (§5); без него — человеческий отчёт")
     return p
@@ -74,17 +78,24 @@ def main(argv=None) -> int:
 
     scenario = Scenario(name="default", steps=[], settle_s=0.4, assertions=list(args.asserts))
 
-    # Зрение (Фаза 2): выбирается явно; недоступно/не задано → текст-онли Фаза 1 (не тихо, §7).
+    # Зрение (Фаза 2): выбирается явно. Если запрошено, но работать НЕ сможет — не стартуем
+    # вовсе: молча уехать в текст-онли значит сделать не то, о чём попросили, а гнать прогон
+    # ради гарантированных fail-safe вердиктов — жечь время впустую. Прогон ещё не начат,
+    # так что отказ бесплатен.
     vision = select_vision(args.vision, env)
-    if args.vision and (vision is None or not vision.available()):
+    if args.vision:
+        reason = vision_preflight(vision)
+        if reason:
+            print(f"clave-dev: зрение запрошено, но работать не сможет — {reason}", file=sys.stderr)
+            print("clave-dev: прогон НЕ начат. Перезапусти без зрения.", file=sys.stderr)
+            return 2
         print(
-            f"clave-dev: vision-бэкенд '{args.vision}' недоступен — прогон в текст-онли (Фаза 1); "
-            "подключение image-канала это отдельная задача",
+            "clave-dev: зрение включено. На визуальном проходе откроется окно Terminal.app — "
+            "не трогай в этот момент клавиатуру и мышь.",
             file=sys.stderr,
         )
-        vision = None
-    elif args.vision is None:
-        print("clave-dev: зрение выключено (--vision не задан) — текст-онли Фаза 1", file=sys.stderr)
+    else:
+        print("clave-dev: зрение выключено — текстовое наблюдение", file=sys.stderr)
 
     profile = default_profile()
     if args.terminal_profile:

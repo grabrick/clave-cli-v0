@@ -52,42 +52,77 @@ def observe_visual_all(cfg, fresh):
     return verdicts
 
 
-def _observe_one(cfg, fresh, scenario):
+def gui_capture_verdict(binary, cwd, profile, vision, steps=(), settle_s=0.4, prompt=None):
+    """Единственный GUI-проход: поднять бинарь в окне Terminal.app, снять окно, оценить зрением.
+
+    Безопасность (то, ради чего это переписано):
+    * НИКАКИХ System Events — общение с окном только через `do script … in window id`,
+      то есть в tty конкретного окна. Глобальная инъекция клавиш в фоновом прогоне могла
+      прилететь в чужое приложение. Заодно Accessibility больше не нужен.
+    * Изолированный CLAVE_HOME — иначе наблюдаемый бинарь лез бы в реальные конфиг и чаты
+      пользователя. Плюс детерминизм: свежий home → всегда одинаковый стартовый экран.
+    * Без `activate` — фокус у пользователя не воруем.
+    """
     import subprocess
     import tempfile
     import time
     import uuid
 
-    from .terminal_driver import keystroke_applescript, launch_applescript
-    from .terminal_profile import apply_bounds_applescript, default_profile
+    from .terminal_driver import (
+        close_window_applescript,
+        launch_applescript,
+        send_line_applescript,
+    )
+    from .terminal_profile import apply_bounds_applescript
     from .window_resolve import list_windows, resolve_cgwindow_id
+
+    def osa(script) -> str:
+        return subprocess.run(
+            ["osascript", "-e", script], capture_output=True, text=True
+        ).stdout.strip()
+
+    def run_cmd(cmd) -> int:
+        return subprocess.run(cmd, capture_output=True).returncode
+
+    home = Path(tempfile.mkdtemp(prefix="clave-dev-guihome-"))
+    env_prefix = f"CLAVE_HOME={home} CLAVE_SKIP_ONBOARDING=1 "
+    title = f"clave-dev {uuid.uuid4().hex[:8]}"
+
+    win_id = osa(launch_applescript(Path(binary), title, Path(cwd), env_prefix))
+    osa(apply_bounds_applescript(profile, win_id or None))
+    time.sleep(1.8)  # дать UI подняться
+
+    for keys, wait_s in steps:  # только строки целиком (do script добавляет Return)
+        if win_id:
+            osa(send_line_applescript(win_id, keys))
+        time.sleep(max(0.2, float(wait_s)))
+    time.sleep(float(settle_s))
+
+    cgid = resolve_cgwindow_id(list_windows(), profile.app, title)
+    out = Path(tempfile.mkdtemp(prefix="clave-dev-shot-")) / "frame.png"
+    verdict = run_visual(cgid, vision, run_cmd, _decode_png_pixels, out, prompt)
+
+    if win_id:
+        osa(send_line_applescript(win_id, "/quit"))  # выход через tty ЭТОГО окна
+        time.sleep(0.8)
+        osa(close_window_applescript(win_id))  # и само окно — иначе копятся окна-мусор
+    return verdict
+
+
+def _observe_one(cfg, fresh, scenario):
+    from .terminal_profile import default_profile
 
     profile = default_profile()
     if getattr(cfg, "terminal_profile", None):
         profile = profile._replace(theme=cfg.terminal_profile)
-
-    def osa(script):
-        subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-
-    def run_cmd(cmd):
-        return subprocess.run(cmd, capture_output=True).returncode
-
-    title = f"clave-dev {uuid.uuid4().hex[:8]}"
-    osa(launch_applescript(fresh, title, cfg.worktree))
-    osa(apply_bounds_applescript(profile))
-    time.sleep(1.5)  # дать UI подняться
-    for keys, wait_s in scenario.steps:
-        osa(keystroke_applescript(keys))
-        time.sleep(max(0.2, float(wait_s)))
-    time.sleep(float(getattr(scenario, "settle_s", 0.4)))
-
-    cgid = resolve_cgwindow_id(list_windows(), profile.app, title)
-    out = Path(tempfile.mkdtemp(prefix="clave-dev-shot-")) / "frame.png"
-    verdict = run_visual(cgid, cfg.vision, run_cmd, _decode_png_pixels, out)
-
-    osa(keystroke_applescript("/quit"))
-    osa('tell application "System Events" to key code 36')  # Enter
-    return verdict
+    return gui_capture_verdict(
+        fresh,
+        cfg.worktree,
+        profile,
+        cfg.vision,
+        steps=scenario.steps,
+        settle_s=getattr(scenario, "settle_s", 0.4),
+    )
 
 
 def _decode_png_pixels(path) -> bytes:

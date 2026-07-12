@@ -63,7 +63,15 @@ def verdict_passes(v: VisionVerdict, blocking=("high", "medium")) -> bool:
 
 
 def severities_at_or_above(threshold: str) -> tuple:
-    """Блокирующий набор severity из порога: 'medium' → ('medium','high'), 'high' → ('high',)."""
+    """Блокирующий набор severity из порога: 'medium' → ('medium','high'), 'high' → ('high',).
+
+    Особый порог `none` → пустой набор: тогда блокирует ТОЛЬКО провал required-чеклиста
+    (объективные дефекты рендеринга), а находки и открытая критика модели идут агенту
+    СПРАВОЧНО. Это защита автономной петли: модель охотно выдаёт эстетические мнения
+    («логотип тусклый», «разделитель на колонку короче»), и если ими гейтить сходимость,
+    агент будет жечь раунды, «починяя» несломанное."""
+    if threshold == "none":
+        return ()
     if threshold not in SEVERITIES:
         raise ValueError(f"неизвестный severity-порог: {threshold}")
     return SEVERITIES[SEVERITIES.index(threshold):]

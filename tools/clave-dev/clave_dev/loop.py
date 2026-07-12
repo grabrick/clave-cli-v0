@@ -132,7 +132,12 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
                 grid, results = run_scenario(fresh, cfg.env, s)
                 grids.append(grid)
                 assertion_results.extend(results)
-            if cfg.vision is not None and cfg.vision.available():
+            # Зрение — ПОСЛЕДНИЙ гейт. Визуальный проход тяжёлый (окно Terminal.app, снимок,
+            # вызов зрячей модели), поэтому запускаем его только когда дешёвые проверки уже
+            # зелёные: смотреть глазами на сломанную сборку незачем и дорого.
+            cheap_green = converged(checks, assertion_results)
+            if cheap_green and cfg.vision is not None and cfg.vision.available():
+                emitter.progress("проверки зелёные — визуальный проход (откроется окно Terminal.app)")
                 vision_verdicts = observe_visual_all(cfg, fresh)
                 emitter.vision({
                     "pass": all(verdict_passes(v, cfg.blocking_severities) for v in vision_verdicts),

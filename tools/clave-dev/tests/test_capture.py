@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 
 from clave_dev.capture import is_blank_frame, screencapture_cmd
-from clave_dev.terminal_driver import keystroke_applescript, launch_applescript
+from clave_dev.terminal_driver import launch_applescript, send_line_applescript
 
 
 class CaptureTest(unittest.TestCase):
@@ -17,10 +17,26 @@ class CaptureTest(unittest.TestCase):
         self.assertTrue(is_blank_frame(b""))                       # пусто → пусто
         self.assertFalse(is_blank_frame(bytes([200]) * 1000))      # насыщено → не пусто
 
-    def test_launch_applescript_sets_unique_title(self):
-        script = launch_applescript(Path("/wt/target/debug/clave"), "clave-dev xyz", Path("/wt"))
+    def test_launch_isolates_home_returns_window_id_and_does_not_steal_focus(self):
+        script = launch_applescript(
+            Path("/wt/target/debug/clave"),
+            "clave-dev xyz",
+            Path("/wt"),
+            "CLAVE_HOME=/tmp/h CLAVE_SKIP_ONBOARDING=1 ",
+        )
         self.assertIn("clave-dev xyz", script)
         self.assertIn("do script", script)
+        # Без изоляции наблюдаемый clave лез бы в РЕАЛЬНЫЙ конфиг и чаты пользователя.
+        self.assertIn("CLAVE_HOME=/tmp/h", script)
+        # id окна нужен, чтобы писать адресно в его tty, а не «фронтовому».
+        self.assertIn("return id of w", script)
+        # Прогон фоновый — фокус у пользователя не воруем.
+        self.assertNotIn("activate", script)
 
-    def test_keystroke_applescript_escapes_quotes(self):
-        self.assertIn('\\"', keystroke_applescript('say "hi"'))
+    def test_send_line_targets_the_window_and_never_injects_globally(self):
+        script = send_line_applescript(42, 'say "hi"')
+        self.assertIn("window id 42", script)
+        self.assertIn('\\"', script)
+        # System Events keystroke — ГЛОБАЛЬНАЯ инъекция: в фоновом прогоне могла бы
+        # прилететь в чужое приложение. Этого пути больше нет.
+        self.assertNotIn("System Events", script)

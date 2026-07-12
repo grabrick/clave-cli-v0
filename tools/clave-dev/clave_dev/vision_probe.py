@@ -30,34 +30,12 @@ def probe_summary(verdict, blocking=("high", "medium")):
 
 def run_probe(binary, profile, vision, prompt=None):
     """E2e-only: поднять clave в Terminal.app с bounds профиля, снять окно, оценить зрением.
-    Любая беда → блокирующий вердикт (§8)."""
-    import subprocess
-    import tempfile
-    import time
-    import uuid
-
-    from .terminal_driver import launch_applescript
-    from .terminal_profile import apply_bounds_applescript
-    from .visual_observer import _decode_png_pixels, blocking_verdict, run_visual
-    from .window_resolve import list_windows, resolve_cgwindow_id
-
-    def osa(script):
-        subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-
-    def run_cmd(cmd):
-        return subprocess.run(cmd, capture_output=True).returncode
+    Делит ОДИН безопасный GUI-проход с петлёй (`gui_capture_verdict`): без System Events,
+    с изолированным CLAVE_HOME, без кражи фокуса. Любая беда → блокирующий вердикт (§8)."""
+    from .visual_observer import blocking_verdict, gui_capture_verdict
 
     try:
-        title = f"clave-dev-probe {uuid.uuid4().hex[:8]}"
-        osa(launch_applescript(Path(binary), title, Path.cwd()))
-        osa(apply_bounds_applescript(profile))
-        time.sleep(2.0)
-        cgid = resolve_cgwindow_id(list_windows(), profile.app, title)
-        out = Path(tempfile.mkdtemp(prefix="clave-dev-probe-")) / "frame.png"
-        verdict = run_visual(cgid, vision, run_cmd, _decode_png_pixels, out, prompt)
-        osa('tell application "System Events" to keystroke "/quit"')
-        osa('tell application "System Events" to key code 36')
-        return verdict
+        return gui_capture_verdict(binary, Path.cwd(), profile, vision, prompt=prompt)
     except Exception as e:
         return blocking_verdict(f"probe упал: {e}")
 

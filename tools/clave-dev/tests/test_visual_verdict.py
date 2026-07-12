@@ -52,3 +52,26 @@ class ThresholdTest(unittest.TestCase):
         self.assertEqual(severities_at_or_above("low"), ("low", "medium", "high"))
         self.assertEqual(severities_at_or_above("medium"), ("medium", "high"))
         self.assertEqual(severities_at_or_above("high"), ("high",))
+
+    def test_none_threshold_gates_on_required_checklist_only(self):
+        # Режим автономной петли: мнения модели НЕ блокируют (иначе агент погонится за
+        # эстетическими призраками вроде «логотип тусклый»), а объективный required —
+        # блокирует. Именно required и поймал реальный баг среза футера.
+        from clave_dev.visual_verdict import severities_at_or_above
+
+        blocking = severities_at_or_above("none")
+        self.assertEqual(blocking, ())
+
+        opinionated = parse_verdict({
+            "checklist_results": [{"check": "правая граница", "required": True, "passed": True}],
+            "issues": [
+                {"description": "логотип тусклый", "severity": "medium", "source": "open"},
+                {"description": "разделитель короче на колонку", "severity": "high", "source": "open"},
+            ],
+        })
+        self.assertTrue(verdict_passes(opinionated, blocking), "мнения модели не блокируют")
+
+        real_defect = parse_verdict({
+            "checklist_results": [{"check": "правая граница", "required": True, "passed": False}],
+        })
+        self.assertFalse(verdict_passes(real_defect, blocking), "required-провал блокирует всегда")

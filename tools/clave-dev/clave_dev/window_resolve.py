@@ -27,10 +27,17 @@ def resolve_cgwindow_id(window_infos: list, owner: str, title: str) -> int:
 
 
 def list_windows() -> list:
-    """Тонкая обёртка над Quartz (ленивый импорт: чистая логика тестируется без pyobjc)."""
+    """Тонкая обёртка над Quartz (ленивый импорт: чистая логика тестируется без pyobjc).
+
+    Берём `kCGWindowListOptionAll`, а НЕ `OnScreenOnly`. Причина проверена вживую: окно
+    Terminal, созданное без `activate`, живёт на СВОЁМ Space, а `OnScreenOnly` перечисляет
+    только окна текущего Space — окна там просто нет, и резолв падал. При этом
+    `screencapture -l<id>` окно с чужого Space снимает прекрасно (macOS держит backing
+    store) — значит переключать Space и воровать у пользователя фокус не нужно вовсе.
+    Титул-nonce уникален, так что расширение списка неоднозначности не создаёт."""
     import Quartz  # pyobjc-framework-Quartz
 
     infos = Quartz.CGWindowListCopyWindowInfo(
-        Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID
+        Quartz.kCGWindowListOptionAll, Quartz.kCGNullWindowID
     )
     return list(infos or [])

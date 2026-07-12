@@ -27,10 +27,13 @@ def describe(p: TerminalProfile) -> dict:
     return dict(p._asdict())
 
 
-def apply_bounds_applescript(p: TerminalProfile) -> str:
-    """AppleScript: выставить bounds фронтового окна Terminal (цель §4 — детерминизм среды)."""
+def apply_bounds_applescript(p: TerminalProfile, window_id=None) -> str:
+    """AppleScript: выставить bounds окна Terminal (цель §4 — детерминизм среды).
+    Если известен id окна — целимся в него, а не в «фронтовое» (надёжнее и не зависит
+    от того, что пользователь успел кликнуть)."""
     x, y, w, h = p.bounds
+    target = f"window id {window_id}" if window_id else "front window"
     return (
-        'tell application "Terminal" to set bounds of front window '
+        f'tell application "Terminal" to set bounds of {target} '
         f"to {{{x}, {y}, {x + w}, {y + h}}}"
     )
