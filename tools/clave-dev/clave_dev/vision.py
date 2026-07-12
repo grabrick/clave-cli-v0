@@ -7,10 +7,14 @@ from pathlib import Path
 from .visual_verdict import VisionVerdict, parse_verdict
 
 DEFAULT_VISION_PROMPT = (
-    "Ты ревьюишь скриншот TUI-приложения в терминале. Верни СТРОГО JSON с полями "
-    "issues[], checklist_results[], open_critique. Прогони required-чеклист: "
-    "текст не касается правой границы; нет обрезанных глифов; рамки замкнуты; "
-    "нет наложения текста. Затем открытая критика: что ещё выглядит не так."
+    "Ты ревьюишь скриншот TUI-приложения в терминале на визуальные дефекты. "
+    "Верни СТРОГО один JSON-объект без прозы вокруг, с полями:\n"
+    '- "checklist_results": массив {"check": str, "required": bool, "passed": bool, "note": str} — '
+    "прогони required-чеклист: текст не касается правой границы; нет обрезанных глифов; "
+    "рамки/бордеры замкнуты; нет наложения текста.\n"
+    '- "issues": массив {"description": str, "severity": "low|medium|high", "source": "checklist|open"}.\n'
+    '- "open_critique": str — что ещё выглядит не так.\n'
+    "Если дефектов нет — issues пустой и все passed=true."
 )
 
 

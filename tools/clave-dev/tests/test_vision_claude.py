@@ -24,3 +24,27 @@ class ClaudeVisionTest(unittest.TestCase):
         self.assertIsInstance(
             select_vision("claude", env={"ANTHROPIC_API_KEY": "k"}), ClaudeVisionProvider
         )
+
+
+class VisionApiTest(unittest.TestCase):
+    def test_build_request_has_image_and_text_blocks(self):
+        import json
+
+        from clave_dev.vision_claude import ANTHROPIC_URL, build_vision_request
+
+        url, headers, body = build_vision_request("QUJD", "оцени", "claude-sonnet-5", "sk-xxx")
+        self.assertEqual(url, ANTHROPIC_URL)
+        self.assertEqual(headers["x-api-key"], "sk-xxx")
+        self.assertIn("anthropic-version", headers)
+        payload = json.loads(body)
+        self.assertEqual(payload["model"], "claude-sonnet-5")
+        types = [b["type"] for b in payload["messages"][0]["content"]]
+        self.assertIn("image", types)
+        self.assertIn("text", types)
+
+    def test_extract_text_joins_and_handles_empty(self):
+        from clave_dev.vision_claude import extract_vision_text
+
+        resp = {"content": [{"type": "text", "text": "часть1 "}, {"type": "text", "text": "часть2"}]}
+        self.assertEqual(extract_vision_text(resp), "часть1 часть2")
+        self.assertEqual(extract_vision_text({}), "")

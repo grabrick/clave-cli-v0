@@ -18,12 +18,20 @@ System Settings → Privacy & Security:
 тема без прозрачности (opacity 1.0), размер под `default_profile()` (100×30). Профиль задаётся
 флагом `--terminal-profile clave-dev`; среда логируется в stderr в начале прогона.
 
-## 3. Канал зрения (§3)
+## 3. Канал зрения (§3) — ПОДКЛЮЧЁН
 
-`--vision claude` требует доступный image-канал. Если текущий `claude` CLI не принимает PNG —
-это **отдельная задача**: подключить прямой image-API (или передать `sender` в `ClaudeVisionProvider`).
-Без доступного канала clave-dev честно печатает, что зрение выключено, и идёт текст-онли (Фаза 1).
-Быстрая проверка доступности: задан ли `ANTHROPIC_API_KEY` (или инъекция `sender`).
+Image-backend реализован: прямой вызов Anthropic Messages API (stdlib `urllib`, без новых
+зависимостей) — см. `vision_claude.py::_send_via_api`. Нужно только:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."         # обязательно для --vision claude
+export CLAVE_VISION_MODEL="claude-sonnet-5"    # опц.; дефолт — vision-capable Sonnet 5
+```
+
+Без `ANTHROPIC_API_KEY` (и без инъекции `sender`) `available()` вернёт False → clave-dev честно
+печатает «зрение выключено» и идёт текст-онли (Фаза 1), не выдавая ложный pass. Промпт уже просит
+строго JSON `checklist_results/issues/open_critique`; ответ парсится `extract_verdict_json`+`parse_verdict`
+(fail-safe: непарсящийся ответ → блокирующий вердикт).
 
 ## 4. Прогон
 
@@ -37,6 +45,11 @@ python3 -m clave_dev "почини срез футера у правой сте�
 ```
 
 ## 5. Ожидаемый результат (критерии proof)
+
+**Как получить контролируемо «битый» кадр** (без правок кода): сузь окно Terminal.app до
+минимальной ширины (или уменьши размер/увеличь шрифт в профиле `clave-dev`) — футер и правый
+край контента налезут на стенку, ровно тот класс ambiguous-width среза. «Чистый» — нормальная
+ширина. Сравнение узкое/нормальное и даёт пару pass=false / pass=true.
 
 - **Битый UI** (заведомо срезанный футер): vision-вердикт `pass=false`, среди `checklist_results`
   провален required-пункт «текст не касается правой границы» и/или есть `high`-issue про правый край;
