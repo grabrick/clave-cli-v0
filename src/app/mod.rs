@@ -7,6 +7,16 @@ mod commands;
 mod config;
 mod dev;
 mod editor;
+
+/// Вопрос inline-селектора, на который отвечает САМО приложение, а не модель.
+///
+/// Зрение в `/dev` тяжёлое и заметное: оно открывает окно Terminal.app на экране. Скрытый
+/// тумблер тут опасен (забудешь, что включён — окна полезут неожиданно), поэтому спрашиваем
+/// на каждом запуске.
+pub(crate) enum AskIntent {
+    /// `/dev`: спросили про зрение — по ответу стартуем прогон с ним или без.
+    DevVision { task: String },
+}
 mod effort;
 mod events;
 mod external;
@@ -94,6 +104,9 @@ pub(crate) struct App {
     /// (0 сошлось, 1 не сошлось, 2 дерево не чистое), поэтому финал рендерится иначе:
     /// «не сошлось» — это исход, а не поломка, и ошибкой его звать нельзя.
     pub(crate) dev_run: bool,
+    /// Локальное намерение, ждущее ответа inline-селектора. Обычный ask отправляет выбор
+    /// МОДЕЛИ (`start_chat`); здесь ответ обрабатывается внутри приложения.
+    pub(crate) ask_intent: Option<AskIntent>,
     pub(crate) run_started_at: Option<Instant>,
     pub(crate) run_label: String,
     pub(crate) run_token_estimate: Option<usize>,
@@ -203,6 +216,7 @@ impl App {
             last_run_duration: None,
             running: false,
             dev_run: false,
+            ask_intent: None,
             run_started_at: None,
             run_label: String::new(),
             run_token_estimate: None,

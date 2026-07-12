@@ -124,6 +124,28 @@ impl App {
     pub(crate) fn reset_ask(&mut self) {
         self.ask = None;
         self.ask_prompt_pending = None;
+        self.ask_intent = None;
+    }
+
+    /// Ответ на ЛОКАЛЬНЫЙ вопрос (например «включить зрение?» перед `/dev`) обрабатываем
+    /// сами. Обычный путь `ask_submit` отправляет выбор модели через `start_chat` — здесь
+    /// это было бы бессмысленно: вопрос задало само приложение, ему и решать.
+    fn submit_ask_intent(&mut self) {
+        let Some(state) = &self.ask else {
+            return;
+        };
+        let question = &state.prompt.questions[0];
+        let answer = &state.answers[0];
+        if answer.cursor >= question.options.len() {
+            return; // строка «свой ответ» для локальных вопросов не поддерживается
+        }
+        let choice = answer.cursor;
+        self.ask = None;
+        match self.ask_intent.take() {
+            // Вариант 1 (индекс 1) — «Да, зрение».
+            Some(AskIntent::DevVision { task }) => self.start_dev(task, choice == 1),
+            None => {}
+        }
     }
 
     /// ↑↓: двигает курсор в текущем списке (варианты вопроса или строки подтверждения).
@@ -220,6 +242,12 @@ impl App {
     /// дальше; на подтверждении — отправить или вернуться к правке вопроса.
     /// Один вопрос — отправляем сразу (свой ответ или выбор).
     pub(crate) fn ask_submit(&mut self) {
+        // Локальный вопрос приложения (напр. зрение для /dev) — отвечаем сами, модели не шлём.
+        if self.ask_intent.is_some() {
+            self.submit_ask_intent();
+            return;
+        }
+
         let Some(state) = &self.ask else {
             return;
         };
@@ -299,8 +327,15 @@ impl App {
     }
 
     /// Esc: закрыть селектор и дать ответить текстом (вопрос остаётся в ленте).
+    /// Для локального вопроса приложения текстом отвечать некому — значит это отмена
+    /// самого действия (напр. `/dev` не стартует вовсе).
     pub(crate) fn ask_cancel(&mut self) {
         if self.ask.take().is_some() {
+            if self.ask_intent.take().is_some() {
+                self.push_system(self.lang.choose("⏹ /dev отменён.", "⏹ /dev cancelled."));
+                self.status = self.lang.choose("отменено", "cancelled").to_string();
+                return;
+            }
             self.status = self.lang.choose("закрыто", "closed").to_string();
         }
     }

@@ -244,7 +244,7 @@ impl App {
                             .choose("Использование: /dev <задача>", "Usage: /dev <task>"),
                     );
                 } else {
-                    self.start_dev(rest.trim().to_string());
+                    self.begin_dev(rest.trim().to_string());
                 }
             }
             "/rounds" => match rest.parse::<usize>() {

@@ -69,6 +69,8 @@ def main() -> int:
 
     pump(1.5)
     os.write(master, b"/dev prove the self-dev loop end to end\r")
+    pump(1.0)
+    os.write(master, b"\r")  # селектор зрения: Enter = дефолт «Нет, текстовое наблюдение»
 
     # Ждём терминального события (реальные cargo-сборки идут десятки секунд).
     seen, deadline = "", time.time() + BUDGET_S

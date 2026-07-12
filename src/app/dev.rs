@@ -84,11 +84,71 @@ fn spawn_dev_reader<R: std::io::Read + Send + 'static>(reader: R, tx: Sender<Wor
 }
 
 impl App {
-    /// `/dev <задача>`: запускает ВНЕШНИЙ clave-dev на текущем репозитории (инвариант —
-    /// петля вне процесса clave). Образец — `start_task` из `runs.rs`.
-    pub(crate) fn start_dev(&mut self, task: String) {
+    /// Точка входа `/dev <задача>`: спрашивает про зрение и только потом стартует прогон.
+    ///
+    /// Зрение открывает окно Terminal.app прямо на экране, поэтому включать его скрытым
+    /// тумблером нельзя — спрашиваем каждый раз. Если зрячего канала в системе нет вовсе
+    /// (`claude` не найден), вопрос бессмысленен — идём текстом молча.
+    pub(crate) fn begin_dev(&mut self, task: String) {
         if self.running {
             // busy-preflight (спека §6): второй прогон не стартуем.
+            self.push_system(
+                self.lang
+                    .choose("Clave уже выполняется.", "Clave is already running."),
+            );
+            return;
+        }
+        self.push_system(format!("◆ /dev {task}"));
+
+        if !provider_binary_present("claude") {
+            self.start_dev(task, false);
+            return;
+        }
+
+        self.ask_prompt_pending = Some(AskPrompt {
+            questions: vec![AskQuestion {
+                question: self
+                    .lang
+                    .choose(
+                        "Включить зрение для этого прогона?",
+                        "Enable vision for this run?",
+                    )
+                    .to_string(),
+                multi: false,
+                options: vec![
+                    AskOption {
+                        label: self
+                            .lang
+                            .choose("Нет — текстовое наблюдение", "No — text observation")
+                            .to_string(),
+                        note: Some(
+                            self.lang
+                                .choose("быстро, ничего не открывается", "fast, nothing pops up")
+                                .to_string(),
+                        ),
+                    },
+                    AskOption {
+                        label: self.lang.choose("Да — зрение", "Yes — vision").to_string(),
+                        note: Some(
+                            self.lang
+                                .choose(
+                                    "откроется окно Terminal.app; не трогай клавиатуру и мышь",
+                                    "a Terminal.app window will open; keep hands off",
+                                )
+                                .to_string(),
+                        ),
+                    },
+                ],
+            }],
+        });
+        self.ask_intent = Some(AskIntent::DevVision { task });
+        self.open_pending_ask();
+    }
+
+    /// Запускает ВНЕШНИЙ clave-dev на текущем репозитории (инвариант — петля вне процесса
+    /// clave). Образец — `start_task` из `runs.rs`.
+    pub(crate) fn start_dev(&mut self, task: String, vision: bool) {
+        if self.running {
             self.push_system(
                 self.lang
                     .choose("Clave уже выполняется.", "Clave is already running."),
@@ -132,7 +192,6 @@ impl App {
         self.cancel_tx = Some(cancel_tx);
         self.last_ctrl_c_at = None;
         self.status = self.lang.choose("самопиление", "self-dev").to_string();
-        self.push_system(format!("◆ /dev {task}"));
 
         let effort = effort_label(self.effort_index).to_string();
         let rounds = self.rounds.to_string();
@@ -149,6 +208,21 @@ impl App {
             "--rounds".to_string(),
             rounds,
         ]);
+        if vision {
+            self.push_system(self.lang.choose(
+                "◍ Зрение включено: на визуальном проходе откроется окно Terminal.app — не трогай в этот момент клавиатуру и мышь.",
+                "◍ Vision enabled: a Terminal.app window will open during the visual pass — keep hands off the keyboard and mouse.",
+            ));
+            cmd_args.extend([
+                "--vision".to_string(),
+                "claude-cli".to_string(),
+                // Гейтим ТОЛЬКО required-чеклист: эстетические мнения модели («логотип
+                // тусклый») не должны блокировать автономную петлю и гонять агента
+                // «чинить» несломанное.
+                "--severity-threshold".to_string(),
+                "none".to_string(),
+            ]);
+        }
 
         let tx = self.tx.clone();
         spawn_worker(self.tx.clone(), move || {
