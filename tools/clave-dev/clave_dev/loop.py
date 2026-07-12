@@ -15,6 +15,7 @@ from .visual_observer import observe_visual_all
 from .visual_verdict import (
     BaselineUnavailableError,
     baseline_keys,
+    blocking_verdict,
     consensus_verdict,
     is_infra_failure,
     verdict_passes,
@@ -24,7 +25,10 @@ RunConfig = namedtuple(
     "RunConfig",
     "known_good worktree repo env profile task effort rounds max_rounds scenarios "
     "vision blocking_severities terminal_profile baseline vision_samples vision_min_hits",
-    defaults=(None, ("high", "medium"), None, None, 3, 2),
+    # blocking_severities пуст по умолчанию: мнения судьи — свободный текст, их нельзя ни
+    # вычесть по базовой линии, ни набрать консенсусом, значит гейт по ним абсолютный —
+    # тот самый, из-за которого петля не сходилась никогда. См. verdict_passes.
+    defaults=(None, (), None, None, 3, 2),
 )
 RunReport = namedtuple(
     "RunReport",
@@ -33,10 +37,23 @@ RunReport = namedtuple(
 )
 
 
-def converged(checks, assertion_results, vision_verdicts=(), blocking=("high", "medium")) -> bool:
+def converged(
+    checks, assertion_results, vision_verdicts=(), blocking=(), vision_required=False
+) -> bool:
     """Здоровье продукта (спека §5+§6): проверки зелёные И текстовые assertions pass И все
-    visual-вердикты pass. ВНИМАНИЕ: это НЕ «задача выполнена» — см. `outcome`."""
+    visual-вердикты pass. ВНИМАНИЕ: это НЕ «задача выполнена» — см. `outcome`.
+
+    `vision_required` закрывает дыру, которую видно, только если спросить «а МОЖЕТ ли этот гейт
+    провалиться?». `all([])` — это `True`, поэтому ПУСТОЙ список вердиктов читался как «зрение не
+    возражает». Но пустым он бывает и когда зрение просто НЕ ОТРАБОТАЛО: бэкенд отвалился посреди
+    прогона, визуального прохода не случилось вовсе. Человек просил проверку глазами, её не было —
+    а ему рапортовали «сошлось». Гейт, который нельзя провалить, — не гейт, а декорация.
+
+    Для текст-онли прогона (Фаза 1) пустой список законен: зрения там не просили.
+    """
     if checks is None or not checks.build_ok:
+        return False
+    if vision_required and not vision_verdicts:
         return False
     # py_ok — юнит-набор самого clave-dev: без него правка в Python «сходилась» бы на
     # зелёном Rust, ничего про себя не доказав.
@@ -51,7 +68,9 @@ def converged(checks, assertion_results, vision_verdicts=(), blocking=("high", "
     return checks_ok and asserts_ok and vision_ok
 
 
-def outcome(changed, checks, assertion_results, vision_verdicts=(), blocking=("high", "medium")) -> str:
+def outcome(
+    changed, checks, assertion_results, vision_verdicts=(), blocking=(), vision_required=False
+) -> str:
     """Итог раунда: 'no_changes' | 'converged' | 'continue'.
 
     КЛЮЧЕВОЕ: если агент не тронул код, зелёные проверки НИЧЕГО не доказывают — репозиторий
@@ -60,7 +79,7 @@ def outcome(changed, checks, assertion_results, vision_verdicts=(), blocking=("h
     пустой набор изменений — отдельный честный исход `no_changes`, а не `converged`."""
     if not changed:
         return "no_changes"
-    if converged(checks, assertion_results, vision_verdicts, blocking):
+    if converged(checks, assertion_results, vision_verdicts, blocking, vision_required):
         return "converged"
     return "continue"
 
@@ -199,7 +218,13 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
             # вызов зрячей модели), поэтому запускаем его только когда дешёвые проверки уже
             # зелёные: смотреть глазами на сломанную сборку незачем и дорого.
             cheap_green = converged(checks, assertion_results)
-            if cheap_green and cfg.vision is not None and cfg.vision.available():
+            if cheap_green and cfg.vision is not None and not cfg.vision.available():
+                # Зрение просили, а бэкенд отвалился уже на ходу (preflight ловит только старт).
+                # Тихо уйти в «сошлось» нельзя: человек просил проверку глазами, её не было.
+                vision_verdicts = [
+                    blocking_verdict("бэкенд зрения стал недоступен посреди прогона")
+                ]
+            elif cheap_green and cfg.vision is not None:
                 base = _baseline_keys(cfg, emitter, baseline_cache)
                 emitter.progress("проверки зелёные — визуальный проход (откроется окно Terminal.app)")
                 fresh_samples = observe_visual_all(cfg, fresh, cfg.vision_samples)
@@ -212,7 +237,14 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
                 ]
                 emitter.vision(_vision_payload(vision_verdicts, cfg.blocking_severities))
 
-        if outcome(changed, checks, assertion_results, vision_verdicts, cfg.blocking_severities) == "converged":
+        vision_required = cfg.vision is not None
+        if (
+            outcome(
+                changed, checks, assertion_results, vision_verdicts,
+                cfg.blocking_severities, vision_required,
+            )
+            == "converged"
+        ):
             _emit_final(emitter, cfg, True, round_i, known_good_version, "converged")
             return RunReport(True, round_i, cfg.max_rounds, assertion_results, known_good_version, "converged")
 

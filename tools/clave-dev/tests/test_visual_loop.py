@@ -73,3 +73,43 @@ class RunVisualFailSafeTest(unittest.TestCase):
         )
         self.assertEqual(len(vs), 3)
         self.assertEqual(len(captures), 1)
+
+
+class VisionThatNeverRanTest(unittest.TestCase):
+    """Гейт обязан УМЕТЬ провалиться. Этот — не умел.
+
+    `all([])` — это `True`, поэтому пустой список вердиктов читался как «зрение не возражает».
+    Но пустым он бывает и когда зрение просто НЕ ОТРАБОТАЛО: бэкенд отвалился посреди прогона
+    (preflight ловит только старт). Человек просил проверку глазами, её не было — а ему
+    рапортовали «сошлось».
+    """
+
+    def test_requested_vision_that_produced_nothing_cannot_converge(self):
+        self.assertFalse(
+            converged(_green_checks(), [AssertionResult("a", True, "")], [], vision_required=True)
+        )
+
+    def test_text_only_run_still_converges_without_vision(self):
+        # Фаза 1: зрения не просили — пустой список законен.
+        self.assertTrue(
+            converged(_green_checks(), [AssertionResult("a", True, "")], [], vision_required=False)
+        )
+
+    def test_outcome_reports_continue_not_converged(self):
+        from clave_dev.loop import outcome
+
+        got = outcome(
+            ["src/x.rs"], _green_checks(), [AssertionResult("a", True, "")], [],
+            vision_required=True,
+        )
+        self.assertEqual(got, "continue")
+
+    def test_config_does_not_arm_the_opinion_gate_by_default(self):
+        # RunConfig без явного порога не должен возвращать абсолютный гейт по мнениям.
+        from clave_dev.loop import RunConfig
+
+        cfg = RunConfig(
+            known_good=None, worktree=None, repo=None, env={}, profile="debug",
+            task="t", effort=None, rounds=None, max_rounds=1, scenarios=[],
+        )
+        self.assertEqual(cfg.blocking_severities, ())
