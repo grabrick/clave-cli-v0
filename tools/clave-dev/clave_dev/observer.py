@@ -12,14 +12,14 @@ import time
 from collections import namedtuple
 from pathlib import Path
 
-import pyte
-
 from .assertions import evaluate
 
 Scenario = namedtuple("Scenario", "name steps settle_s assertions")
 
 
 def run_scenario(binary: Path, env: dict, scenario: Scenario, cols: int = 100, rows: int = 30):
+    import pyte  # ленивый импорт: чистая логика петли тестируется без pyte
+
     master, slave = pty.openpty()
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     run_env = dict(env)
