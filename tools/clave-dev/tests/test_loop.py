@@ -24,6 +24,13 @@ class OutcomeTest(unittest.TestCase):
         red = self._green()._replace(test_failures=2)
         self.assertEqual(outcome(["src/x.rs"], red, []), "continue")
 
+    def test_broken_python_suite_blocks_convergence(self):
+        # Реальная дыра: агент правил Python-файл, cargo был зелёным (Rust не тронут) —
+        # и прогон «сходился», ничего не сказав про саму правку.
+        py_red = self._green()._replace(py_ok=False)
+        self.assertEqual(outcome(["tools/clave-dev/clave_dev/checks.py"], py_red, []), "continue")
+        self.assertFalse(converged(py_red, []))
+
 
 class ConvergedTest(unittest.TestCase):
     def _checks(self, **kw):

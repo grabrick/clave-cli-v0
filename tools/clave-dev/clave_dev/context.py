@@ -11,7 +11,8 @@ def build_context(checks, grids, assertion_results) -> str:
         lines.append(f"- test failures: {checks.test_failures}")
         lines.append(f"- clippy: {'ok' if checks.clippy_ok else 'FAIL (-D warnings)'}")
         lines.append(f"- fmt: {'ok' if checks.fmt_ok else 'FAIL'}")
-        for name in ("build", "test", "clippy", "fmt"):
+        lines.append(f"- python (юнит-набор clave-dev): {'ok' if getattr(checks, 'py_ok', True) else 'FAIL'}")
+        for name in ("build", "test", "clippy", "fmt", "python"):
             chunk = (checks.raw or {}).get(name, "")
             tail = "\n".join(chunk.splitlines()[-20:])
             if tail.strip():

@@ -33,7 +33,14 @@ def converged(checks, assertion_results, vision_verdicts=(), blocking=("high", "
     visual-вердикты pass. ВНИМАНИЕ: это НЕ «задача выполнена» — см. `outcome`."""
     if checks is None or not checks.build_ok:
         return False
-    checks_ok = checks.test_failures == 0 and checks.clippy_ok and checks.fmt_ok
+    # py_ok — юнит-набор самого clave-dev: без него правка в Python «сходилась» бы на
+    # зелёном Rust, ничего про себя не доказав.
+    checks_ok = (
+        checks.test_failures == 0
+        and checks.clippy_ok
+        and checks.fmt_ok
+        and getattr(checks, "py_ok", True)
+    )
     asserts_ok = all(r.passed for r in assertion_results)
     vision_ok = all(verdict_passes(v, blocking) for v in vision_verdicts)
     return checks_ok and asserts_ok and vision_ok
@@ -68,6 +75,7 @@ def _emit_checks(emitter, checks) -> None:
         emitter.check({"name": "test", "ok": checks.test_failures == 0, "detail": f"{checks.test_failures} failed"})
         emitter.check({"name": "clippy", "ok": checks.clippy_ok})
         emitter.check({"name": "fmt", "ok": checks.fmt_ok})
+        emitter.check({"name": "python", "ok": getattr(checks, "py_ok", True), "detail": "юнит-набор clave-dev"})
 
 
 def _emit_final(emitter, cfg, converged_flag, rounds_used, known_good_version, status) -> None:
