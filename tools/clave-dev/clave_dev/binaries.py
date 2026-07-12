@@ -59,6 +59,32 @@ def snapshot_known_good(known_good: Path, tmp_dir: Path) -> KnownGood:
     return KnownGood(path=dest, version=identify_binary(dest), hash=sha256_file(dest))
 
 
+def snapshot_baseline(worktree: Path, profile: str, env: Mapping, tmp_dir: Path) -> Path:
+    """Собрать продукт ДО правок агента и отложить бинарь — это базовая линия рендера.
+
+    Зачем: зрение судит абсолютно, а у продукта есть дефекты, которых агент не вносил (и часть
+    из них не в его власти — полый курсор рисует сам Terminal в неактивном окне). Гейт обязан
+    сравнивать с «как было», иначе петля не сходится никогда.
+
+    Копия, а не путь в worktree: первая же сборка агента затрёт target/. Побочно это ранняя
+    проверка, что репозиторий собирается ДО того, как мы потратили вызов агента.
+    """
+    res = subprocess.run(
+        build_command(profile), cwd=str(worktree), env=dict(env), capture_output=True, text=True
+    )
+    if res.returncode != 0:
+        raise RuntimeError(
+            "базовая сборка не собралась — репозиторий не зелёный ещё ДО правок:\n"
+            + res.stderr.strip()[-2000:]
+        )
+    dest_dir = Path(tmp_dir) / "baseline"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / "clave"
+    shutil.copy2(fresh_binary(worktree, profile), dest)
+    dest.chmod(0o755)
+    return dest
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:

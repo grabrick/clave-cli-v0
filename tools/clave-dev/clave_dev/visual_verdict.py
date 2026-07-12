@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from collections import namedtuple
+from collections import Counter, namedtuple
 
 Issue = namedtuple("Issue", "description severity region_hint source")
 ChecklistItem = namedtuple("ChecklistItem", "check required passed note")
@@ -10,9 +10,19 @@ VisionVerdict = namedtuple("VisionVerdict", "issues checklist open_critique raw"
 
 SEVERITIES = ("low", "medium", "high")
 
+# Пункт чеклиста, которым помечается НЕ дефект рендера, а поломка самого визуального прохода
+# (нет Screen Recording, пустой кадр, недоступен бэкенд зрения). Отличать обязательно: такой
+# пункт нельзя вычитать по базовой линии — иначе сломанный одинаково и на базе, и на фреше
+# гейт зрения тихо превратился бы в pass.
+INFRA_FAILURE = "визуальный проход не состоялся"
+
 
 class VerdictParseError(ValueError):
     pass
+
+
+class BaselineUnavailableError(RuntimeError):
+    """Базовую линию рендера снять не удалось — гейтить зрением нечем."""
 
 
 def parse_verdict(data: dict, raw: str = "") -> VisionVerdict:
@@ -60,6 +70,95 @@ def verdict_passes(v: VisionVerdict, blocking=("high", "medium")) -> bool:
     if any(issue.severity in blocking for issue in v.issues):
         return False
     return True
+
+
+def is_infra_failure(v: VisionVerdict) -> bool:
+    """Вердикт говорит не о продукте, а о поломке самого визуального прохода."""
+    return any(c.check == INFRA_FAILURE and not c.passed for c in v.checklist)
+
+
+def _key(check: str) -> str:
+    """Ключ пункта чеклиста.
+
+    Нормализация обязательна: модель возвращает имя пункта то с заглавной, то со строчной
+    («Нет обрезанных глифов» / «нет обрезанных глифов») — замерено на живых прогонах. Сравнение
+    строк «как есть» их бы не схлопнуло, и дефект, который был и на базе, приехал бы к агенту
+    как «новая регрессия».
+    """
+    return check.strip().casefold()
+
+
+def failed_required_keys(v: VisionVerdict) -> set:
+    """Ключи проваленных required-пунктов (поломки самого прохода сюда не входят)."""
+    return {
+        _key(c.check)
+        for c in v.checklist
+        if c.required and not c.passed and c.check != INFRA_FAILURE
+    }
+
+
+def baseline_keys(samples) -> set:
+    """Всё, что судья хоть раз забраковал на сборке ДО правок — щедро, объединением.
+
+    Судья невоспроизводим: пять прогонов на одном и том же здоровом продукте дали ТРИ разных
+    вердикта. Поэтому база берётся объединением выборок: если модель СКЛОННА видеть этот дефект
+    на здоровом продукте, блокировать им агента нельзя — он его не вносил и починить не может
+    (полый курсор в неактивном окне рисует сам Terminal, а фокус наблюдатель не крадёт).
+    """
+    keys = set()
+    for v in samples:
+        keys |= failed_required_keys(v)
+    return keys
+
+
+def consensus_verdict(samples, base_keys=(), min_hits: int = 2) -> VisionVerdict:
+    """Свести N выборок одного и того же кадра в один вердикт.
+
+    Required-пункт считается РЕГРЕССИЕЙ, только если он упал не меньше чем в `min_hits` выборках
+    И не значится в базовой линии. Одна выборка гейтить не может — это подбрасывание монеты
+    (замерено). Порог по совпадениям гасит одиночный шум судьи, база — его системную склонность.
+
+    Поломку самого прохода (INFRA_FAILURE) не гасим ничем: сломанный гейт обязан блокировать,
+    а не совпасть сам с собой в ноль и тихо превратиться в pass.
+    """
+    samples = list(samples)
+    if not samples:
+        raise ValueError("нет ни одной выборки вердикта")
+    infra = next((v for v in samples if is_infra_failure(v)), None)
+    if infra is not None:
+        return infra
+
+    hits = Counter()
+    for v in samples:
+        hits.update(failed_required_keys(v))
+    base = set(base_keys)
+    regressed = {k for k, n in hits.items() if n >= min_hits and k not in base}
+
+    template = samples[0]
+    checklist = []
+    for c in template.checklist:
+        if not c.required:
+            checklist.append(c)
+            continue
+        key = _key(c.check)
+        passed = key not in regressed
+        note = c.note
+        if not c.passed and passed:
+            note = f"{c.note} [{hits[key]}/{len(samples)} выборок; не регрессия]".strip()
+        checklist.append(c._replace(passed=passed, note=note))
+
+    # Регрессия, которую первая выборка не назвала, всё равно обязана попасть в вердикт —
+    # иначе шум в выборке №1 прятал бы настоящую поломку.
+    present = {_key(c.check) for c in checklist}
+    for key in sorted(regressed - present):
+        checklist.append(
+            ChecklistItem(
+                check=key, required=True, passed=False, note=f"{hits[key]}/{len(samples)} выборок"
+            )
+        )
+
+    issues = [i for v in samples for i in v.issues]  # мнения — справочно, все
+    return template._replace(checklist=checklist, issues=issues)
 
 
 def severities_at_or_above(threshold: str) -> tuple:

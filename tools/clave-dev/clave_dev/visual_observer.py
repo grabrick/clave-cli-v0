@@ -7,52 +7,75 @@ from __future__ import annotations
 from pathlib import Path
 
 from .capture import is_blank_frame, screencapture_cmd
-from .visual_verdict import ChecklistItem, VisionVerdict
+from .visual_verdict import INFRA_FAILURE, ChecklistItem, VisionVerdict
 
 
 def blocking_verdict(reason: str) -> VisionVerdict:
-    """Вердикт-блокиратор: один проваленный required-пункт → verdict_passes=False."""
+    """Вердикт-блокиратор: один проваленный required-пункт → verdict_passes=False.
+
+    Пункт называется INFRA_FAILURE, а не текстом причины: так регрессионный гейт отличает
+    «сломался сам проход» от «сломан рендер» и не вычитает первое по базовой линии. Причина
+    едет в note — она же уходит агенту через build_visual_context.
+    """
     return VisionVerdict(
         issues=[],
-        checklist=[ChecklistItem(check=reason, required=True, passed=False, note=reason)],
+        checklist=[ChecklistItem(check=INFRA_FAILURE, required=True, passed=False, note=reason)],
         open_critique=reason,
         raw=reason,
     )
 
 
-def run_visual(cgwindow_id, vision, run_cmd, read_pixels, out_path: Path, prompt=None) -> VisionVerdict:
-    """Снять окно `cgwindow_id` и оценить зрением. `run_cmd(list)->int`, `read_pixels(path)->bytes`
-    инъектируются (в проде — subprocess/декод PNG; в тестах — фейки). Любая беда → блок (§8)."""
+def run_visual(
+    cgwindow_id, vision, run_cmd, read_pixels, out_path: Path, prompt=None, samples: int = 1
+) -> list:
+    """Снять окно `cgwindow_id` и оценить зрением `samples` раз. `run_cmd(list)->int`,
+    `read_pixels(path)->bytes` инъектируются (в проде — subprocess/декод PNG; в тестах — фейки).
+    Любая беда → блокирующий вердикт (§8), никогда тихий pass.
+
+    Кадр снимается ОДИН раз, а судится несколько: замеренный разброс даёт судья, а не скриншот
+    (пять прогонов на неизменном продукте — три разных вердикта). Пересъёмка окна ради выборок
+    была бы дороже и мешала бы шум судьи с дрожанием курсора.
+
+    Возвращает СПИСОК вердиктов (len == samples; при поломке прохода — один блокирующий).
+    """
     from .vision import DEFAULT_VISION_PROMPT
 
     code = run_cmd(screencapture_cmd(cgwindow_id, out_path))
     if code != 0:
-        return blocking_verdict(f"screencapture код {code} (нет Screen Recording?)")
+        return [blocking_verdict(f"screencapture код {code} (нет Screen Recording?)")]
     if is_blank_frame(read_pixels(out_path)):
-        return blocking_verdict("кадр пустой/чёрный — вероятно нет разрешения на запись экрана")
-    try:
-        return vision.analyze_image(out_path, prompt or DEFAULT_VISION_PROMPT)
-    except Exception as e:  # непарсящийся вердикт / недоступность бэкенда → блок
-        return blocking_verdict(f"vision-бэкенд: {e}")
+        return [blocking_verdict("кадр пустой/чёрный — вероятно нет разрешения на запись экрана")]
+    verdicts = []
+    for _ in range(max(1, samples)):
+        try:
+            verdicts.append(vision.analyze_image(out_path, prompt or DEFAULT_VISION_PROMPT))
+        except Exception as e:  # непарсящийся вердикт / недоступность бэкенда → блок
+            return [blocking_verdict(f"vision-бэкенд: {e}")]
+    return verdicts
 
 
 # --- ниже e2e-only: реальный Terminal.app. Не вызывается в headless-тестах/мок-смоуке ---
 # (run_loop гардирует вызов через cfg.vision). Каждый сценарий обёрнут в fail-safe.
 
 
-def observe_visual_all(cfg, fresh):
-    """Для каждого сценария поднять fresh в Terminal.app, снять окно, оценить зрением.
-    Любая беда сценария → блокирующий вердикт (§8), петля не падает."""
-    verdicts = []
+def observe_visual_all(cfg, fresh, samples: int = 1):
+    """Для каждого сценария поднять fresh в Terminal.app, снять окно, оценить зрением `samples`
+    раз. Любая беда сценария → блокирующий вердикт (§8), петля не падает.
+
+    Возвращает список ПО СЦЕНАРИЯМ, где каждый элемент — список выборок вердикта.
+    """
+    per_scenario = []
     for scenario in cfg.scenarios:
         try:
-            verdicts.append(_observe_one(cfg, fresh, scenario))
+            per_scenario.append(_observe_one(cfg, fresh, scenario, samples))
         except Exception as e:
-            verdicts.append(blocking_verdict(f"визуальный проход упал: {e}"))
-    return verdicts
+            per_scenario.append([blocking_verdict(f"визуальный проход упал: {e}")])
+    return per_scenario
 
 
-def gui_capture_verdict(binary, cwd, profile, vision, steps=(), settle_s=0.4, prompt=None):
+def gui_capture_verdict(
+    binary, cwd, profile, vision, steps=(), settle_s=0.4, prompt=None, samples: int = 1
+):
     """Единственный GUI-проход: поднять бинарь в окне Terminal.app, снять окно, оценить зрением.
 
     Безопасность (то, ради чего это переписано):
@@ -100,17 +123,17 @@ def gui_capture_verdict(binary, cwd, profile, vision, steps=(), settle_s=0.4, pr
 
     cgid = resolve_cgwindow_id(list_windows(), profile.app, title)
     out = Path(tempfile.mkdtemp(prefix="clave-dev-shot-")) / "frame.png"
-    verdict = run_visual(cgid, vision, run_cmd, _decode_png_pixels, out, prompt)
+    verdicts = run_visual(cgid, vision, run_cmd, _decode_png_pixels, out, prompt, samples)
 
     if win_id:
         # /quit → clave выходит → шелл выходит (`; exit` в команде) → окно закрывается САМО
         # (профиль с shellExitAction=0). Закрыть его снаружи нельзя — проверено.
         osa(send_line_applescript(win_id, "/quit"))
         time.sleep(1.2)
-    return verdict
+    return verdicts
 
 
-def _observe_one(cfg, fresh, scenario):
+def _observe_one(cfg, fresh, scenario, samples: int = 1):
     from .terminal_profile import default_profile
 
     profile = default_profile()
@@ -123,6 +146,7 @@ def _observe_one(cfg, fresh, scenario):
         cfg.vision,
         steps=scenario.steps,
         settle_s=getattr(scenario, "settle_s", 0.4),
+        samples=samples,
     )
 
 

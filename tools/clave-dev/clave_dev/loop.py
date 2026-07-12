@@ -13,13 +13,19 @@ from .diff import build_diff, changed_paths
 from .emit import no_op_emitter
 from .observer import run_scenario
 from .visual_observer import observe_visual_all
-from .visual_verdict import verdict_passes
+from .visual_verdict import (
+    BaselineUnavailableError,
+    baseline_keys,
+    consensus_verdict,
+    is_infra_failure,
+    verdict_passes,
+)
 
 RunConfig = namedtuple(
     "RunConfig",
     "known_good worktree repo env profile task effort rounds max_rounds scenarios "
-    "vision blocking_severities terminal_profile",
-    defaults=(None, ("high", "medium"), None),
+    "vision blocking_severities terminal_profile baseline vision_samples vision_min_hits",
+    defaults=(None, ("high", "medium"), None, None, 3, 2),
 )
 RunReport = namedtuple(
     "RunReport",
@@ -94,11 +100,43 @@ def _emit_final(emitter, cfg, converged_flag, rounds_used, known_good_version, s
     })
 
 
+def _baseline_keys(cfg, emitter, cache: list):
+    """Что судья бракует на сборке ДО правок агента — по одному набору ключей на сценарий.
+
+    Снимается ЛЕНИВО и один раз за прогон: визуальный проход дорогой, и платить за него в
+    прогонах, которые до гейта не доходят (агент ничего не изменил, сборка красная), незачем.
+
+    Базовой линии нет или она не снялась → BaselineUnavailableError. Тихо откатиться к
+    абсолютному гейту нельзя: он на этом продукте не сходится НИКОГДА, и прогон молча сгорел бы
+    в «не сошлось», гоняя агента чинить полый курсор неактивного окна.
+    """
+    if cache:
+        return cache[0]
+    if cfg.baseline is None:
+        raise BaselineUnavailableError(
+            "базовая линия рендера не задана — зрением гейтить нечем (нужен cfg.baseline)"
+        )
+    emitter.progress(
+        f"снимаю базовую линию рендера: сборка ДО правок, {cfg.vision_samples} выборок вердикта"
+    )
+    per_scenario = observe_visual_all(cfg, cfg.baseline, cfg.vision_samples)
+    broken = [v for samples in per_scenario for v in samples if is_infra_failure(v)]
+    if broken:
+        raise BaselineUnavailableError(
+            "базовая линия не снялась: "
+            + "; ".join(c.note for v in broken for c in v.checklist if not c.passed)
+        )
+    keys = [baseline_keys(samples) for samples in per_scenario]
+    cache.append(keys)
+    return keys
+
+
 def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport:
     emitter = emitter or no_op_emitter()
     grids = []
     assertion_results = []
     context = ""
+    baseline_cache = []
     for round_i in range(1, cfg.max_rounds + 1):
         emitter.progress(f"раунд {round_i}/{cfg.max_rounds}: агент правит код")
         task = cfg.task if not context else f"{cfg.task}\n\n{context}"
@@ -137,11 +175,22 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
             # зелёные: смотреть глазами на сломанную сборку незачем и дорого.
             cheap_green = converged(checks, assertion_results)
             if cheap_green and cfg.vision is not None and cfg.vision.available():
+                base = _baseline_keys(cfg, emitter, baseline_cache)
                 emitter.progress("проверки зелёные — визуальный проход (откроется окно Terminal.app)")
-                vision_verdicts = observe_visual_all(cfg, fresh)
+                fresh_samples = observe_visual_all(cfg, fresh, cfg.vision_samples)
+                # Гейт спрашивает «не сломал ли ТЫ рендер?», а не «идеален ли рендер?». Дефект,
+                # который был и до правок, блокировать не может; одиночная выборка судьи —
+                # подбрасывание монеты, поэтому нужен консенсус. См. consensus_verdict.
+                vision_verdicts = [
+                    consensus_verdict(samples, keys, cfg.vision_min_hits)
+                    for samples, keys in zip(fresh_samples, base)
+                ]
                 emitter.vision({
                     "pass": all(verdict_passes(v, cfg.blocking_severities) for v in vision_verdicts),
                     "issues": sum(len(v.issues) for v in vision_verdicts),
+                    "regressions": sum(
+                        1 for v in vision_verdicts for c in v.checklist if c.required and not c.passed
+                    ),
                 })
 
         if outcome(changed, checks, assertion_results, vision_verdicts, cfg.blocking_severities) == "converged":

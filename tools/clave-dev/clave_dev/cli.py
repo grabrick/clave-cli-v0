@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 
 from .assertions import line_matches, not_visible, visible
-from .binaries import sanitized_env, snapshot_known_good
+from .binaries import sanitized_env, snapshot_baseline, snapshot_known_good
 from .emit import Emitter
 from .loop import RunConfig, run_loop
 from .observer import Scenario
@@ -15,7 +15,7 @@ from .report import render_report
 from .terminal_profile import default_profile, describe, observer_profile_mismatch
 from .vision import vision_preflight
 from .vision_claude import select_vision
-from .visual_verdict import severities_at_or_above
+from .visual_verdict import BaselineUnavailableError, severities_at_or_above
 from .worktree import DirtyTreeError, assert_clean, create_run_worktree
 
 _ASSERT_FACTORIES = {"visible": visible, "not_visible": not_visible, "line_matches": line_matches}
@@ -49,6 +49,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="минимальный severity необязательной находки, который блокирует (§6). "
                         "'none' — блокирует только провал required-чеклиста, мнения модели "
                         "идут агенту справочно (безопасно для автономной петли)")
+    p.add_argument("--vision-samples", type=int, default=3,
+                   help="сколько раз судить ОДИН кадр. Судья невоспроизводим: замерено ТРИ разных "
+                        "вердикта из пяти прогонов на неизменном продукте, так что одиночная "
+                        "выборка гейтить не может — это подбрасывание монеты")
+    p.add_argument("--vision-min-hits", type=int, default=2,
+                   help="в скольких выборках дефект должен всплыть, чтобы счесть его регрессией")
     p.add_argument("--protocol", default=None, choices=["clave-dev"],
                    help="типизированный вывод CLAVE-DEV для TUI (§5); без него — человеческий отчёт")
     return p
@@ -107,6 +113,18 @@ def main(argv=None) -> int:
     print(f"clave-dev: терминальная среда: {describe(profile)}", file=sys.stderr)  # §4 лог среды
     blocking = severities_at_or_above(args.severity_threshold)
 
+    # Базовая линия рендера: собираем продукт ДО правок агента и откладываем бинарь. Без неё
+    # зрение судит абсолютно — «нет ли дефектов рендера?» — и петля не сходится НИКОГДА: часть
+    # дефектов агент не вносил, а полый курсор неактивного окна рисует сам Terminal, и починить
+    # его в продукте нельзя вовсе. Строим только при включённом зрении: иначе это лишняя сборка.
+    baseline = None
+    if vision is not None:
+        try:
+            baseline = snapshot_baseline(worktree, args.build_profile, env, tmp)
+        except RuntimeError as e:
+            print(f"clave-dev: {e}", file=sys.stderr)
+            return 2
+
     cfg = RunConfig(
         known_good=known.path,
         worktree=worktree,
@@ -121,9 +139,19 @@ def main(argv=None) -> int:
         vision=vision,
         blocking_severities=blocking,
         terminal_profile=args.terminal_profile,
+        baseline=baseline,
+        vision_samples=args.vision_samples,
+        vision_min_hits=args.vision_min_hits,
     )
     emitter = Emitter(enabled=(args.protocol == "clave-dev"))
-    report = run_loop(cfg, known.version, emitter=emitter)
+    try:
+        report = run_loop(cfg, known.version, emitter=emitter)
+    except BaselineUnavailableError as e:
+        # Гейтить нечем. Молча откатиться к абсолютному зрению нельзя: прогон сгорел бы в
+        # «не сошлось», гоняя агента чинить несломанное.
+        print(f"clave-dev: {e}", file=sys.stderr)
+        emitter.error(str(e))
+        return 2
     # В protocol-mode stdout только обрамлён (§5) — человеческий отчёт не печатаем.
     if args.protocol != "clave-dev":
         print(render_report(report, repo, worktree))

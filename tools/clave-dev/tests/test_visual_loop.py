@@ -39,22 +39,37 @@ class VisualConvergeTest(unittest.TestCase):
 
 
 class RunVisualFailSafeTest(unittest.TestCase):
-    """§8: любая беда захвата/зрения → блокирующий вердикт, никогда тихий pass."""
+    """§8: любая беда захвата/зрения → блокирующий вердикт, никогда тихий pass.
+
+    run_visual отдаёт СПИСОК выборок: один кадр судится несколько раз, потому что судья
+    невоспроизводим (замерено: три разных вердикта из пяти на неизменном продукте)."""
 
     def test_screencapture_error_blocks(self):
-        v = run_visual(42, FakeVisionProvider({}), lambda cmd: 1, lambda p: b"\xff" * 100, Path("/x.png"))
-        self.assertFalse(verdict_passes(v))
+        vs = run_visual(42, FakeVisionProvider({}), lambda cmd: 1, lambda p: b"\xff" * 100, Path("/x.png"))
+        self.assertFalse(verdict_passes(vs[0]))
 
     def test_blank_frame_blocks(self):
-        v = run_visual(42, FakeVisionProvider({}), lambda cmd: 0, lambda p: bytes(100), Path("/x.png"))
-        self.assertFalse(verdict_passes(v))
+        vs = run_visual(42, FakeVisionProvider({}), lambda cmd: 0, lambda p: bytes(100), Path("/x.png"))
+        self.assertFalse(verdict_passes(vs[0]))
 
     def test_good_frame_uses_vision_verdict(self):
         good = FakeVisionProvider({"checklist_results": [{"check": "ok", "required": True, "passed": True}]})
-        v = run_visual(42, good, lambda cmd: 0, lambda p: b"\xff" * 100, Path("/x.png"))
-        self.assertTrue(verdict_passes(v))
+        vs = run_visual(42, good, lambda cmd: 0, lambda p: b"\xff" * 100, Path("/x.png"))
+        self.assertTrue(verdict_passes(vs[0]))
 
     def test_vision_exception_blocks(self):
         unavailable = FakeVisionProvider({}, available=False)  # analyze_image бросает
-        v = run_visual(42, unavailable, lambda cmd: 0, lambda p: b"\xff" * 100, Path("/x.png"))
-        self.assertFalse(verdict_passes(v))
+        vs = run_visual(42, unavailable, lambda cmd: 0, lambda p: b"\xff" * 100, Path("/x.png"))
+        self.assertFalse(verdict_passes(vs[0]))
+
+    def test_one_capture_is_judged_as_many_times_as_asked(self):
+        # Кадр снимаем ОДИН раз, судим N: разброс даёт судья, а не скриншот. Пересъёмка окна
+        # ради выборок была бы дороже и мешала бы шум судьи с дрожанием курсора.
+        captures = []
+        good = FakeVisionProvider({"checklist_results": [{"check": "ok", "required": True, "passed": True}]})
+        vs = run_visual(
+            42, good, lambda cmd: captures.append(cmd) or 0, lambda p: b"\xff" * 100,
+            Path("/x.png"), samples=3,
+        )
+        self.assertEqual(len(vs), 3)
+        self.assertEqual(len(captures), 1)
