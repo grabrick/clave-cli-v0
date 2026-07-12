@@ -10,6 +10,7 @@ from .assertions import line_matches, not_visible, visible
 from .binaries import sanitized_env, snapshot_baseline, snapshot_known_good
 from .emit import Emitter
 from .loop import RunConfig, run_loop
+from .mutation import mutation_preflight
 from .observer import Scenario
 from .report import render_report
 from .terminal_profile import default_profile, describe, observer_profile_mismatch
@@ -59,6 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "выборка гейтить не может — это подбрасывание монеты")
     p.add_argument("--vision-min-hits", type=int, default=2,
                    help="в скольких выборках дефект должен всплыть, чтобы счесть его регрессией")
+    p.add_argument("--no-mutants", dest="mutants", action="store_false", default=True,
+                   help="ОТКАЗАТЬСЯ от мутационного гейта. По умолчанию он включён: `cargo test: N passed` не отличает тест, который кусается, от `assert!(true || false)` — замерено, "
+                        "декорация проходит все проверки и получает от отчёта похвалу. Гейт мутирует НОВЫЕ функции агента и требует, чтобы хоть один тест это заметил")
     p.add_argument("--protocol", default=None, choices=["clave-dev"],
                    help="типизированный вывод CLAVE-DEV для TUI (§5); без него — человеческий отчёт")
     return p
@@ -131,6 +135,19 @@ def main(argv=None) -> int:
     else:
         print("clave-dev: зрение выключено — текстовое наблюдение", file=sys.stderr)
 
+    # Мутационный гейт. Нет инструмента — НЕ стартуем: молча пропустить проверку значит выдать
+    # её отсутствие за прохождение, а это ровно та болезнь, от которой гейт и лечит.
+    if args.mutants:
+        reason = mutation_preflight()
+        if reason:
+            print(f"clave-dev: {reason}", file=sys.stderr)
+            return 2
+        print("clave-dev: мутационный гейт включён — тесты агента обязаны уметь падать",
+              file=sys.stderr)
+    else:
+        print("clave-dev: ⚠ мутационный гейт ВЫКЛЮЧЕН — тест агента может оказаться декорацией "
+              "(`assert!(true)`), и никто этого не заметит", file=sys.stderr)
+
     profile = default_profile()
     if args.terminal_profile:
         profile = profile._replace(theme=args.terminal_profile)
@@ -166,6 +183,7 @@ def main(argv=None) -> int:
         baseline=baseline,
         vision_samples=args.vision_samples,
         vision_min_hits=args.vision_min_hits,
+        mutants=args.mutants,
     )
     emitter = Emitter(enabled=(args.protocol == "clave-dev"))
     try:

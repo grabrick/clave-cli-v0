@@ -15,3 +15,6 @@ target/
 
 # worktree-каталог харнесса (не должен делать дерево грязным)
 .claude/worktrees/
+# Артефакты cargo-mutants: мутационный гейт пишет сюда, в дерево это не должно попадать.
+mutants.out/
+mutants.out.old/

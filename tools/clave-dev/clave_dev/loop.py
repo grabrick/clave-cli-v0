@@ -1,15 +1,18 @@
 """Оркестрация: implement → checks → observe → judge, до критерия или лимита раундов."""
 from __future__ import annotations
 
+import subprocess
 from collections import namedtuple
 
 from .agent import run_agent
 from .assertions import structural_assertions
 from .binaries import fresh_binary
 from .checks import run_checks
-from .context import build_context, build_visual_context
+from .context import build_context, build_mutation_context, build_visual_context
 from .diff import build_diff, changed_paths
 from .emit import no_op_emitter
+from .mutation import describe as describe_mutants
+from .mutation import mutants_cmd, unproven
 from .unverified import unverified
 from .observer import run_scenario
 from .visual_observer import observe_visual_all
@@ -25,11 +28,12 @@ from .visual_verdict import (
 RunConfig = namedtuple(
     "RunConfig",
     "known_good worktree repo env profile task effort rounds max_rounds scenarios "
-    "vision blocking_severities terminal_profile baseline vision_samples vision_min_hits",
+    "vision blocking_severities terminal_profile baseline vision_samples vision_min_hits "
+    "mutants",
     # blocking_severities пуст по умолчанию: мнения судьи — свободный текст, их нельзя ни
     # вычесть по базовой линии, ни набрать консенсусом, значит гейт по ним абсолютный —
     # тот самый, из-за которого петля не сходилась никогда. См. verdict_passes.
-    defaults=(None, (), None, None, 3, 2),
+    defaults=(None, (), None, None, 3, 2, True),
 )
 RunReport = namedtuple(
     "RunReport",
@@ -39,7 +43,8 @@ RunReport = namedtuple(
 
 
 def converged(
-    checks, assertion_results, vision_verdicts=(), blocking=(), vision_required=False
+    checks, assertion_results, vision_verdicts=(), blocking=(), vision_required=False,
+    unproven_mutants=(),
 ) -> bool:
     """Здоровье продукта (спека §5+§6): проверки зелёные И текстовые assertions pass И все
     visual-вердикты pass. ВНИМАНИЕ: это НЕ «задача выполнена» — см. `outcome`.
@@ -56,6 +61,10 @@ def converged(
         return False
     if vision_required and not vision_verdicts:
         return False
+    # Тест агента обязан уметь провалиться. Выживший мутант в функции, которую агент ДОБАВИЛ,
+    # означает, что его тест ничего не доказывает — «добавлено тестов: 1» тут враньё.
+    if unproven_mutants:
+        return False
     # py_ok — юнит-набор самого clave-dev: без него правка в Python «сходилась» бы на
     # зелёном Rust, ничего про себя не доказав.
     checks_ok = (
@@ -70,7 +79,8 @@ def converged(
 
 
 def outcome(
-    changed, checks, assertion_results, vision_verdicts=(), blocking=(), vision_required=False
+    changed, checks, assertion_results, vision_verdicts=(), blocking=(), vision_required=False,
+    unproven_mutants=(),
 ) -> str:
     """Итог раунда: 'no_changes' | 'converged' | 'continue'.
 
@@ -80,7 +90,9 @@ def outcome(
     пустой набор изменений — отдельный честный исход `no_changes`, а не `converged`."""
     if not changed:
         return "no_changes"
-    if converged(checks, assertion_results, vision_verdicts, blocking, vision_required):
+    if converged(
+        checks, assertion_results, vision_verdicts, blocking, vision_required, unproven_mutants
+    ):
         return "converged"
     return "continue"
 
@@ -210,7 +222,7 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
         emitter.progress(f"изменено файлов: {len(changed)} · проверки build/test/clippy/fmt")
         checks = run_checks(cfg.worktree, cfg.env, cfg.profile)
         _emit_checks(emitter, checks)
-        grids, assertion_results, vision_verdicts = [], [], []
+        grids, assertion_results, vision_verdicts, unproven_mutants = [], [], [], []
         if checks.build_ok:
             fresh = fresh_binary(cfg.worktree, cfg.profile)
             for scenario in cfg.scenarios:
@@ -220,10 +232,37 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
                 grid, results = run_scenario(fresh, cfg.env, s, cfg.worktree)
                 grids.append(grid)
                 assertion_results.extend(results)
-            # Зрение — ПОСЛЕДНИЙ гейт. Визуальный проход тяжёлый (окно Terminal.app, снимок,
-            # вызов зрячей модели), поэтому запускаем его только когда дешёвые проверки уже
-            # зелёные: смотреть глазами на сломанную сборку незачем и дорого.
+
             cheap_green = converged(checks, assertion_results)
+
+            # Мутационный гейт — ДО зрения. `cargo test: N passed` не отличает тест, который
+            # кусается, от `assert!(true || false)`: замерено, декорация проходит cargo, clippy и
+            # fmt, поднимает счётчик и получает от отчёта похвалу «добавлено тестов: 1». Незачем
+            # разглядывать пиксели, если доказательства фальшивые.
+            if cheap_green and cfg.mutants:
+                emitter.progress(
+                    "проверки зелёные — мутационный гейт: умеют ли тесты агента падать"
+                )
+                patch = cfg.worktree.parent / "clave-dev.patch"
+                diff_text = build_diff(cfg.worktree, patch)
+                res = subprocess.run(
+                    mutants_cmd(patch), cwd=str(cfg.worktree), env=cfg.env,
+                    capture_output=True, text=True, check=False,
+                )
+                unproven_mutants = unproven(diff_text, res.stdout + res.stderr)
+                emitter.check({
+                    "name": "мутации",
+                    "ok": not unproven_mutants,
+                    "detail": (
+                        f"{len(unproven_mutants)} выжило в НОВОМ коде — тесты его не доказывают"
+                        if unproven_mutants
+                        else "тесты агента кусаются"
+                    ),
+                })
+
+            # Зрение — ПОСЛЕДНИЙ гейт. Визуальный проход тяжёлый (окно Terminal.app, снимок,
+            # вызов зрячей модели), поэтому запускаем его только когда всё дешёвое уже зелёное.
+            cheap_green = cheap_green and not unproven_mutants
             if cheap_green and cfg.vision is not None and not cfg.vision.available():
                 # Зрение просили, а бэкенд отвалился уже на ходу (preflight ловит только старт).
                 # Тихо уйти в «сошлось» нельзя: человек просил проверку глазами, её не было.
@@ -247,7 +286,7 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
         if (
             outcome(
                 changed, checks, assertion_results, vision_verdicts,
-                cfg.blocking_severities, vision_required,
+                cfg.blocking_severities, vision_required, unproven_mutants,
             )
             == "converged"
         ):
@@ -257,6 +296,8 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
         context = build_context(checks, grids, assertion_results)
         if vision_verdicts:
             context = context + "\n" + build_visual_context(vision_verdicts)
+        if unproven_mutants:
+            context = context + "\n" + build_mutation_context(unproven_mutants)
 
     _emit_final(emitter, cfg, False, cfg.max_rounds, known_good_version, "exhausted")
     return RunReport(
