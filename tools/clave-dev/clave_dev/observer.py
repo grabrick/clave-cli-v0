@@ -1,0 +1,68 @@
+"""Гоняет fresh-бинарь в pty по сценарию, снимает символьную сетку и считает assertions."""
+from __future__ import annotations
+
+import fcntl
+import os
+import pty
+import select
+import struct
+import subprocess
+import termios
+import time
+from collections import namedtuple
+from pathlib import Path
+
+import pyte
+
+from .assertions import evaluate
+
+Scenario = namedtuple("Scenario", "name steps settle_s assertions")
+
+
+def run_scenario(binary: Path, env: dict, scenario: Scenario, cols: int = 100, rows: int = 30):
+    master, slave = pty.openpty()
+    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    run_env = dict(env)
+    run_env.setdefault("TERM", "xterm-256color")
+    run_env.setdefault("CLAVE_SKIP_ONBOARDING", "1")
+    proc = subprocess.Popen(
+        [str(binary)], stdin=slave, stdout=slave, stderr=slave, env=run_env, close_fds=True
+    )
+    os.close(slave)
+    screen = pyte.Screen(cols, rows)
+    stream = pyte.ByteStream(screen)
+
+    def pump(seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            r, _, _ = select.select([master], [], [], 0.05)
+            if r:
+                try:
+                    data = os.read(master, 65536)
+                except OSError:
+                    return
+                if not data:
+                    return
+                stream.feed(data)
+
+    pump(1.2)
+    for keys, wait_s in scenario.steps:
+        os.write(master, keys.encode())
+        pump(wait_s)
+    pump(scenario.settle_s)
+    grid = [row.rstrip() for row in screen.display]
+
+    os.write(master, b"/quit\r")
+    pump(0.6)
+    try:
+        exit_code = proc.wait(timeout=3)
+    except Exception:
+        proc.kill()
+        exit_code = -1
+    try:
+        os.close(master)
+    except OSError:
+        pass
+
+    results = evaluate(scenario.assertions, grid, exit_code)
+    return grid, results
