@@ -129,7 +129,7 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
                 s = scenario._replace(
                     assertions=list(structural_assertions()) + list(scenario.assertions)
                 )
-                grid, results = run_scenario(fresh, cfg.env, s)
+                grid, results = run_scenario(fresh, cfg.env, s, cfg.worktree)
                 grids.append(grid)
                 assertion_results.extend(results)
             # Зрение — ПОСЛЕДНИЙ гейт. Визуальный проход тяжёлый (окно Terminal.app, снимок,

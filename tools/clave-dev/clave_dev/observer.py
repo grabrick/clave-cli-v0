@@ -17,7 +17,9 @@ from .assertions import evaluate
 Scenario = namedtuple("Scenario", "name steps settle_s assertions")
 
 
-def run_scenario(binary: Path, env: dict, scenario: Scenario, cols: int = 100, rows: int = 30):
+def run_scenario(
+    binary: Path, env: dict, scenario: Scenario, cwd: Path, cols: int = 100, rows: int = 30
+):
     import pyte  # ленивый импорт: чистая логика петли тестируется без pyte
 
     master, slave = pty.openpty()
@@ -25,8 +27,18 @@ def run_scenario(binary: Path, env: dict, scenario: Scenario, cols: int = 100, r
     run_env = dict(env)
     run_env.setdefault("TERM", "xterm-256color")
     run_env.setdefault("CLAVE_SKIP_ONBOARDING", "1")
+    # cwd обязателен, а не с дефолтом: поведение clave зависит от каталога (git-root ищется от
+    # него), и наблюдаемый бинарь должен подниматься ВНУТРИ изолированного worktree — там же,
+    # где его поднимает визуальный наблюдатель. Унаследованный каталог супервайзера означал бы,
+    # что два гейта судят разные репозитории: assertions видят одно, зрение — другое.
     proc = subprocess.Popen(
-        [str(binary)], stdin=slave, stdout=slave, stderr=slave, env=run_env, close_fds=True
+        [str(binary)],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        env=run_env,
+        cwd=str(cwd),
+        close_fds=True,
     )
     os.close(slave)
     screen = pyte.Screen(cols, rows)
@@ -52,8 +64,15 @@ def run_scenario(binary: Path, env: dict, scenario: Scenario, cols: int = 100, r
     pump(scenario.settle_s)
     grid = [row.rstrip() for row in screen.display]
 
-    os.write(master, b"/quit\r")
-    pump(0.6)
+    # Бинарь мог уже умереть — например, свежая сборка паникует на старте. Для петли это
+    # НОРМАЛЬНЫЙ исход: assertions обязаны его увидеть и отдать агенту как обратную связь.
+    # Но писать в закрытый pty нельзя, и голый os.write ронял OSError'ом весь супервайзер —
+    # то есть наблюдатель разваливался ровно тогда, когда продукт сломан сильнее всего.
+    try:
+        os.write(master, b"/quit\r")
+        pump(0.6)
+    except OSError:
+        pass
     try:
         exit_code = proc.wait(timeout=3)
     except Exception:
