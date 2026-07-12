@@ -82,13 +82,43 @@ def describe(p: TerminalProfile) -> dict:
     return dict(p._asdict())
 
 
-def apply_bounds_applescript(p: TerminalProfile, window_id=None) -> str:
-    """AppleScript: выставить bounds окна Terminal (цель §4 — детерминизм среды).
-    Если известен id окна — целимся в него, а не в «фронтовое» (надёжнее и не зависит
-    от того, что пользователь успел кликнуть)."""
+def apply_geometry_applescript(p: TerminalProfile, window_id=None) -> str:
+    """AppleScript: задать положение окна в пикселях, а размер — В ЗНАКОМЕСТАХ.
+
+    Пиксельных bounds не хватает. Пересчёт пикселей в колонки делает сам Terminal, и результат
+    зависит от того, успело ли окно открыться: в одном прогоне замерено 123×39 на базовой
+    сборке и 120×30 на свежей. А чеклист зрения весь про ширину — «текст не касается правой
+    границы», «нет обрезанных глифов». Сравнивать рендеры разной ширины бессмысленно: фреш
+    поуже дал бы фантомную регрессию на ровном месте. Поэтому колонки и строки задаём прямо.
+
+    Если известен id окна — целимся в него, а не в «фронтовое»: так не зависим от того, что
+    пользователь успел кликнуть.
+    """
     x, y, w, h = p.bounds
     target = f"window id {window_id}" if window_id else "front window"
     return (
-        f'tell application "Terminal" to set bounds of {target} '
-        f"to {{{x}, {y}, {x + w}, {y + h}}}"
+        'tell application "Terminal"\n'
+        f"  set bounds of {target} to {{{x}, {y}, {x + w}, {y + h}}}\n"
+        f"  set number of columns of {target} to {p.cols}\n"
+        f"  set number of rows of {target} to {p.rows}\n"
+        "end tell"
     )
+
+
+def read_geometry_applescript(window_id) -> str:
+    """AppleScript: фактическая геометрия окна, «<колонок>x<строк>».
+
+    Задать мало — надо убедиться, что задалось: иначе зрение вынесет вердикт о рендере,
+    которого мы не заказывали, и сравнивать его будет не с чем.
+    """
+    return (
+        'tell application "Terminal"\n'
+        f"  set c to number of columns of window id {window_id}\n"
+        f"  set r to number of rows of window id {window_id}\n"
+        "  return (c as text) & \"x\" & (r as text)\n"
+        "end tell"
+    )
+
+
+def geometry_label(p: TerminalProfile) -> str:
+    return f"{p.cols}x{p.rows}"

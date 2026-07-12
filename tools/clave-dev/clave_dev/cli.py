@@ -13,6 +13,7 @@ from .loop import RunConfig, run_loop
 from .observer import Scenario
 from .report import render_report
 from .terminal_profile import default_profile, describe, observer_profile_mismatch
+from .user_config import config_mode, seed_config, single_model_warning, user_config_path
 from .vision import vision_preflight
 from .vision_claude import select_vision
 from .visual_verdict import BaselineUnavailableError, severities_at_or_above
@@ -74,6 +75,7 @@ def main(argv=None) -> int:
     worktree = create_run_worktree(repo, "HEAD", tmp)
 
     known = snapshot_known_good(args.known_good, tmp)
+    real_config = user_config_path()  # читаем ДО того, как подменим CLAVE_HOME
     env = sanitized_env(worktree)
     # Изолируем состояние инструмента: свой CLAVE_HOME и без онбординга,
     # чтобы прогон не трогал реальный конфиг пользователя.
@@ -81,6 +83,24 @@ def main(argv=None) -> int:
     home.mkdir(parents=True, exist_ok=True)
     env["CLAVE_HOME"] = str(home)
     env["CLAVE_SKIP_ONBOARDING"] = "1"
+
+    # …но изолируем СОСТОЯНИЕ, а не ПОВЕДЕНИЕ. Пустой home означал дефолтный конфиг, а дефолтный
+    # режим — codex-only: исполнитель и критик становились одной моделью, и «тандем» тихо
+    # вырождался в самокритику. CLAVE_CONFIG перекрывает путь к конфигу независимо от CLAVE_HOME.
+    seeded = seed_config(real_config, home)
+    if seeded:
+        env["CLAVE_CONFIG"] = str(seeded)
+        mode = config_mode(seeded)
+        print(f"clave-dev: конфиг продукта взят из твоего ({real_config}): mode={mode}", file=sys.stderr)
+        warn = single_model_warning(mode)
+        if warn:
+            print(f"clave-dev: ⚠ {warn}", file=sys.stderr)
+    else:
+        print(
+            f"clave-dev: ⚠ конфига продукта нет ({real_config}) — агент побежит на ДЕФОЛТАХ, "
+            "а это mode=codex-only: исполнитель и критик одна модель, тандема не будет",
+            file=sys.stderr,
+        )
 
     scenario = Scenario(name="default", steps=[], settle_s=0.4, assertions=list(args.asserts))
 

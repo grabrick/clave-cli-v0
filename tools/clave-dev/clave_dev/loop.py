@@ -1,7 +1,6 @@
 """Оркестрация: implement → checks → observe → judge, до критерия или лимита раундов."""
 from __future__ import annotations
 
-import sys
 from collections import namedtuple
 
 from .agent import run_agent
@@ -64,15 +63,6 @@ def outcome(changed, checks, assertion_results, vision_verdicts=(), blocking=("h
     if converged(checks, assertion_results, vision_verdicts, blocking):
         return "converged"
     return "continue"
-
-
-def _relay(emitter, line: str) -> None:
-    """Живой вывод агента наружу: в protocol-mode обрамлённым `log`, иначе — в stderr
-    (stdout в protocol-mode обязан оставаться только обрамлённым, спека §5)."""
-    if emitter.enabled:
-        emitter.log(line)
-    else:
-        print(line, file=sys.stderr)
 
 
 def _emit_checks(emitter, checks) -> None:
@@ -142,7 +132,7 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
         task = cfg.task if not context else f"{cfg.task}\n\n{context}"
         run_agent(
             cfg.known_good, cfg.worktree, task, cfg.env, cfg.effort, cfg.rounds,
-            on_line=lambda line: _relay(emitter, line),
+            on_line=emitter.log,  # живой вывод агента: эмиттер сам знает, куда писать
         )
 
         # Агент не тронул код → проверки гонять незачем (проверять нечего) и объявлять

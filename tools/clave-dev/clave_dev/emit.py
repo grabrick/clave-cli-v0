@@ -18,18 +18,56 @@ def format_line(type_: str, payload) -> str:
     return f"CLAVE-DEV {type_} {body}"
 
 
-class Emitter:
-    """enabled=False → no-op (standalone-CLI Фазы 1/2 не засоряется). enabled=True →
-    печатает обрамлённые строки в out (stdout по умолчанию)."""
+def human_line(type_: str, payload):
+    """Событие → строка для человека. None — показывать нечего.
 
-    def __init__(self, enabled: bool, out=None):
+    `report` и `diff` пропускаем сознательно: финальный отчёт человеку печатает render_report,
+    а дифф — это весь патч целиком, ему место в файле, а не в терминале.
+    """
+    if type_ == "log":
+        return payload  # собственный вывод агента — отдаём как есть, без украшений
+    if type_ == "progress":
+        return f"· {payload}"
+    if type_ == "error":
+        return f"✗ {payload}"
+    if type_ == "check":
+        mark = "✓" if payload.get("ok") else "✗"
+        detail = payload.get("detail")
+        return f"  {mark} {payload.get('name')}" + (f" — {detail}" if detail else "")
+    if type_ == "vision":
+        mark = "✓" if payload.get("pass") else "✗"
+        return (
+            f"  {mark} зрение — регрессий: {payload.get('regressions', 0)}, "
+            f"находок: {payload.get('issues', 0)}"
+        )
+    return None
+
+
+class Emitter:
+    """enabled=True → обрамлённые строки CLAVE-DEV в out (их читает TUI).
+    enabled=False → человек в терминале: те же события, но читаемым текстом в stderr.
+
+    Немым эмиттер быть не может, а раньше был: при enabled=False emit() просто возвращался, и
+    человек, запустивший супервайзер из терминала, не видел НИ ОДНОЙ стадии — ни раунда, ни
+    результатов проверок, ни визуального прохода. Только сырой поток агента, минутами подряд.
+    Понять, где прогон и жив ли он вообще, было неоткуда.
+
+    Почему stderr: в человеческом режиме stdout занят финальным отчётом, а в protocol-mode обязан
+    содержать ТОЛЬКО обрамлённые строки (§5).
+    """
+
+    def __init__(self, enabled: bool, out=None, human_out=None):
         self.enabled = enabled
         self._out = out if out is not None else sys.stdout
+        self._human = human_out if human_out is not None else sys.stderr
 
     def emit(self, type_: str, payload) -> None:
-        if not self.enabled:
+        if self.enabled:
+            print(format_line(type_, payload), file=self._out, flush=True)
             return
-        print(format_line(type_, payload), file=self._out, flush=True)
+        line = human_line(type_, payload)
+        if line is not None:
+            print(line, file=self._human, flush=True)
 
     def progress(self, text):
         self.emit("progress", text)
@@ -53,5 +91,20 @@ class Emitter:
         self.emit("error", text)
 
 
+class _Discard:
+    """Сток в никуда. io.StringIO не годится: log() зовётся на КАЖДУЮ строку агента, и весь его
+    вывод копился бы в памяти до конца прогона."""
+
+    def write(self, _text) -> int:
+        return 0
+
+    def flush(self) -> None:
+        pass
+
+
 def no_op_emitter() -> Emitter:
-    return Emitter(enabled=False)
+    """По-настоящему немой — для тестов и вызовов run_loop без эмиттера.
+
+    Просто Emitter(enabled=False) больше не годится: он теперь печатает человеку в stderr.
+    """
+    return Emitter(enabled=False, human_out=_Discard())

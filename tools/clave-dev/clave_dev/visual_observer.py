@@ -74,7 +74,8 @@ def observe_visual_all(cfg, fresh, samples: int = 1):
 
 
 def gui_capture_verdict(
-    binary, cwd, profile, vision, steps=(), settle_s=0.4, prompt=None, samples: int = 1
+    binary, cwd, profile, vision, steps=(), settle_s=0.4, prompt=None, samples: int = 1,
+    config_path=None,
 ):
     """Единственный GUI-проход: поднять бинарь в окне Terminal.app, снять окно, оценить зрением.
 
@@ -85,6 +86,10 @@ def gui_capture_verdict(
     * Изолированный CLAVE_HOME — иначе наблюдаемый бинарь лез бы в реальные конфиг и чаты
       пользователя. Плюс детерминизм: свежий home → всегда одинаковый стартовый экран.
     * Без `activate` — фокус у пользователя не воруем.
+
+    `config_path` (CLAVE_CONFIG) обязателен для честного вердикта: изолированный home означает
+    ДЕФОЛТНУЮ тему, и зрение судило бы рендер, которого пользователь никогда не видит. Состояние
+    остаётся изолированным — перекрывается только путь к конфигу.
     """
     import subprocess
     import tempfile
@@ -92,7 +97,11 @@ def gui_capture_verdict(
     import uuid
 
     from .terminal_driver import launch_applescript, send_line_applescript
-    from .terminal_profile import apply_bounds_applescript
+    from .terminal_profile import (
+        apply_geometry_applescript,
+        geometry_label,
+        read_geometry_applescript,
+    )
     from .window_resolve import list_windows, resolve_cgwindow_id
 
     def osa(script) -> str:
@@ -105,6 +114,8 @@ def gui_capture_verdict(
 
     home = Path(tempfile.mkdtemp(prefix="clave-dev-guihome-"))
     env_prefix = f"CLAVE_HOME={home} CLAVE_SKIP_ONBOARDING=1 "
+    if config_path:
+        env_prefix += f"CLAVE_CONFIG={config_path} "
     title = f"clave-dev {uuid.uuid4().hex[:8]}"
 
     # profile.theme — имя профиля Terminal с «при выходе из shell закрыть окно».
@@ -112,22 +123,39 @@ def gui_capture_verdict(
     win_id = osa(
         launch_applescript(Path(binary), title, Path(cwd), env_prefix, profile.theme)
     )
-    osa(apply_bounds_applescript(profile, win_id or None))
-    time.sleep(1.8)  # дать UI подняться
+    # Геометрию задаём ПОСЛЕ того, как окно открылось. Раньше она выставлялась сразу за launch,
+    # в гонке с открытием, и порой не применялась вовсе — в одном прогоне база вышла 123×39, а
+    # свежая сборка 120×30. Гейт сравнивал рендеры разной ширины, а вся его required-часть про
+    # ширину и есть.
+    time.sleep(1.2)  # дать окну открыться
+    osa(apply_geometry_applescript(profile, win_id or None))
+    time.sleep(0.8)  # ресайз + перерисовка TUI по SIGWINCH
 
-    for keys, wait_s in steps:  # только строки целиком (do script добавляет Return)
-        if win_id:
-            osa(send_line_applescript(win_id, keys))
-        time.sleep(max(0.2, float(wait_s)))
-    time.sleep(float(settle_s))
+    want = geometry_label(profile)
+    got = osa(read_geometry_applescript(win_id)) if win_id else ""
 
-    cgid = resolve_cgwindow_id(list_windows(), profile.app, title)
-    out = Path(tempfile.mkdtemp(prefix="clave-dev-shot-")) / "frame.png"
-    verdicts = run_visual(cgid, vision, run_cmd, _decode_png_pixels, out, prompt, samples)
+    if got == want:
+        for keys, wait_s in steps:  # только строки целиком (do script добавляет Return)
+            if win_id:
+                osa(send_line_applescript(win_id, keys))
+            time.sleep(max(0.2, float(wait_s)))
+        time.sleep(float(settle_s))
+
+        cgid = resolve_cgwindow_id(list_windows(), profile.app, title)
+        out = Path(tempfile.mkdtemp(prefix="clave-dev-shot-")) / "frame.png"
+        verdicts = run_visual(cgid, vision, run_cmd, _decode_png_pixels, out, prompt, samples)
+    else:
+        # Молча судить не тот рендер нельзя: вердикт был бы о другом окне, а сравнивать его
+        # с базовой линией — тем более. Честнее объявить проход несостоявшимся.
+        verdicts = [
+            blocking_verdict(
+                f"геометрия окна {got or '?'} вместо {want} — вердикт был бы о другом рендере"
+            )
+        ]
 
     if win_id:
         # /quit → clave выходит → шелл выходит (`; exit` в команде) → окно закрывается САМО
-        # (профиль с shellExitAction=0). Закрыть его снаружи нельзя — проверено.
+        # (профиль с shellExitAction=2). Закрыть его снаружи нельзя — проверено.
         osa(send_line_applescript(win_id, "/quit"))
         time.sleep(1.2)
     return verdicts
@@ -147,6 +175,7 @@ def _observe_one(cfg, fresh, scenario, samples: int = 1):
         steps=scenario.steps,
         settle_s=getattr(scenario, "settle_s", 0.4),
         samples=samples,
+        config_path=cfg.env.get("CLAVE_CONFIG"),
     )
 
 

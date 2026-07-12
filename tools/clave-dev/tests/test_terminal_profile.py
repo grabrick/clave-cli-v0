@@ -1,6 +1,12 @@
 import unittest
 
-from clave_dev.terminal_profile import apply_bounds_applescript, default_profile, describe
+from clave_dev.terminal_profile import (
+    apply_geometry_applescript,
+    default_profile,
+    describe,
+    geometry_label,
+    read_geometry_applescript,
+)
 
 
 class TerminalProfileTest(unittest.TestCase):
@@ -9,11 +15,25 @@ class TerminalProfileTest(unittest.TestCase):
         for key in ("app", "cols", "rows", "font", "font_size", "theme", "opacity", "locale", "bounds"):
             self.assertIn(key, d)
 
-    def test_apply_bounds_applescript_uses_x2_y2(self):
-        p = default_profile()._replace(bounds=(10, 20, 800, 600))
-        script = apply_bounds_applescript(p)
-        self.assertIn("Terminal", script)
+    def test_geometry_is_set_in_character_cells_not_only_pixels(self):
+        # Пиксельных bounds мало: пересчёт в колонки делает Terminal, и он зависел от того, успело
+        # ли окно открыться — в одном прогоне база вышла 123×39, а свежая сборка 120×30. А весь
+        # required-чеклист зрения про ШИРИНУ, так что рендеры разной ширины сравнивать нельзя.
+        p = default_profile()._replace(bounds=(10, 20, 800, 600), cols=100, rows=30)
+
+        script = apply_geometry_applescript(p, window_id=42)
+
         self.assertIn("{10, 20, 810, 620}", script)  # x2=x+w, y2=y+h
+        self.assertIn("set number of columns of window id 42 to 100", script)
+        self.assertIn("set number of rows of window id 42 to 30", script)
+
+    def test_geometry_can_be_read_back_for_verification(self):
+        # Задать мало — надо убедиться, что задалось: иначе вердикт будет о рендере, которого
+        # мы не заказывали.
+        script = read_geometry_applescript(42)
+        self.assertIn("number of columns of window id 42", script)
+        self.assertIn("number of rows of window id 42", script)
+        self.assertEqual(geometry_label(default_profile()._replace(cols=100, rows=30)), "100x30")
 
 
 class ObserverProfileTest(unittest.TestCase):
