@@ -29,13 +29,19 @@ def probe_summary(verdict, blocking=("high", "medium")):
 
 
 def run_probe(binary, profile, vision, prompt=None):
-    """E2e-only: поднять clave в Terminal.app с bounds профиля, снять окно, оценить зрением.
+    """E2e-only: поднять clave в Terminal.app с геометрией профиля, снять окно, оценить зрением.
     Делит ОДИН безопасный GUI-проход с петлёй (`gui_capture_verdict`): без System Events,
-    с изолированным CLAVE_HOME, без кражи фокуса. Любая беда → блокирующий вердикт (§8)."""
+    с изолированным CLAVE_HOME, без кражи фокуса. Любая беда → блокирующий вердикт (§8).
+
+    Зонд — одиночный снимок для диагностики, а не гейт, поэтому берём одну выборку и
+    разворачиваем её: gui_capture_verdict отдаёт СПИСОК (петле нужно несколько суждений одного
+    кадра — судья невоспроизводим), а probe_summary работает с одним вердиктом.
+    """
     from .visual_observer import blocking_verdict, gui_capture_verdict
 
     try:
-        return gui_capture_verdict(binary, Path.cwd(), profile, vision, prompt=prompt)
+        verdicts = gui_capture_verdict(binary, Path.cwd(), profile, vision, prompt=prompt, samples=1)
+        return verdicts[0]
     except Exception as e:
         return blocking_verdict(f"probe упал: {e}")
 

@@ -1,9 +1,11 @@
 import unittest
+from pathlib import Path
 
 from clave_dev.vision import FakeVisionProvider
-from clave_dev.visual_observer import blocking_verdict
+from clave_dev.visual_observer import blocking_verdict, run_visual
 from clave_dev.visual_verdict import (
     INFRA_FAILURE,
+    VerdictParseError,
     baseline_keys,
     consensus_verdict,
     is_infra_failure,
@@ -93,6 +95,90 @@ class RegressionGateTest(unittest.TestCase):
         self.assertEqual(item.check, INFRA_FAILURE)
         self.assertIn("кадр пустой", item.note)
 
+
+
+class JudgeHiccupTest(unittest.TestCase):
+    """Осечка судьи — не поломка прохода.
+
+    Живой прогон умер именно так: модель вернула синтаксически битый JSON на ОДНОЙ из трёх
+    выборок базовой линии, run_visual сразу отдал блокирующий вердикт, база «не снялась» — и
+    двадцать минут работы Claude и Codex ушли в мусор. Битый JSON от языковой модели — это та же
+    ненадёжность, ради которой мы вообще берём несколько выборок.
+    """
+
+    def _flaky_vision(self, script):
+        """script: список 'ok' | 'boom' — что вернёт очередной вызов analyze_image."""
+        calls = iter(script)
+        good = FakeVisionProvider(
+            {"checklist_results": [{"check": EDGE, "required": True, "passed": True}]}
+        )
+
+        class Flaky(FakeVisionProvider):
+            def analyze_image(self, png_path, prompt=None):
+                if next(calls, "ok") == "boom":
+                    raise VerdictParseError("битый JSON вердикта")
+                return good.analyze_image(png_path, prompt)
+
+        return Flaky({})
+
+    def _run(self, vision, samples):
+        return run_visual(
+            42, vision, lambda cmd: 0, lambda p: b"\xff" * 100, Path("/x.png"), samples=samples
+        )
+
+    def test_one_bad_sample_is_retried_not_fatal(self):
+        vs = self._run(self._flaky_vision(["boom", "ok", "ok", "ok"]), samples=3)
+
+        self.assertEqual(len(vs), 3, "осечку надо было повторить, а не хоронить прогон")
+        self.assertFalse(any(is_infra_failure(v) for v in vs))
+
+    def test_judge_that_never_parses_still_blocks(self):
+        vs = self._run(self._flaky_vision(["boom"] * 10), samples=3)
+
+        self.assertTrue(is_infra_failure(vs[0]), "зрение мертво — это обязано блокировать")
+
+    def test_capture_failure_is_fatal_at_once(self):
+        # Поломка ЗАХВАТА — другой природы: судить нечего, повторять бессмысленно.
+        vs = run_visual(
+            42, self._flaky_vision([]), lambda cmd: 1, lambda p: b"\xff" * 100, Path("/x.png"),
+            samples=3,
+        )
+        self.assertTrue(is_infra_failure(vs[0]))
+
+    def test_too_few_samples_blocks_instead_of_going_blind(self):
+        # Ловушка: выборок меньше порога совпадений → регрессия физически не наберёт min_hits,
+        # и гейт молча пропустит всё. Слепой гейт хуже отсутствующего — он создаёт видимость.
+        gated = consensus_verdict([_verdict((EDGE, False))], set(), min_hits=2)
+
+        self.assertTrue(is_infra_failure(gated))
+        self.assertFalse(verdict_passes(gated, blocking=()))
+
+
+class ProbeShapeTest(unittest.TestCase):
+    """Зонд отдаёт ОДИН вердикт, а не список.
+
+    gui_capture_verdict стал возвращать список выборок (петле нужно несколько суждений одного
+    кадра), и зонд молча сломался: probe_summary полез бы в .issues у списка. Ни один тест этого
+    не поймал — run_probe считался «e2e-only».
+    """
+
+    def test_run_probe_unwraps_the_single_sample(self):
+        import clave_dev.visual_observer as vo
+        from clave_dev.vision_probe import probe_summary, run_probe
+
+        good = FakeVisionProvider(
+            {"checklist_results": [{"check": EDGE, "required": True, "passed": True}]}
+        ).analyze_image(None)
+        original = vo.gui_capture_verdict
+        vo.gui_capture_verdict = lambda *a, **kw: [good]
+        try:
+            verdict = run_probe("/bin/true", None, None)
+            summary, code = probe_summary(verdict)  # упало бы на списке
+        finally:
+            vo.gui_capture_verdict = original
+
+        self.assertEqual(code, 0)
+        self.assertTrue(summary["pass"])
 
 if __name__ == "__main__":
     unittest.main()

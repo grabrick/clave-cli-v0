@@ -64,3 +64,26 @@ def send_line_applescript(window_id, text: str) -> str:
     визуальный проход снимает стартовый экран (именно он и вскрыл баг среза футера)."""
     escaped = text.replace("\\", "\\\\").replace('"', '\\"')
     return f'tell application "Terminal" to do script "{escaped}" in window id {window_id}'
+
+
+def tty_of_window_applescript(window_id) -> str:
+    """tty вкладки окна — по нему гасятся её процессы."""
+    return f'tell application "Terminal" to get tty of (first tab of window id {window_id})'
+
+
+def close_window_applescript(title: str) -> str:
+    """Закрыть наше окно по уникальному титулу.
+
+    Форма важна. Поштучный `close w` внутри `repeat` рапортует успех и НЕ ЗАКРЫВАЕТ НИЧЕГО —
+    проверено на живой системе, окна оставались висеть. А `close (every window whose …)`
+    работает. Прежний вывод «закрыть окно Terminal снаружи нельзя» был сделан по первой форме
+    и оказался неверным — а на нём стояла вся схема «окно закроет себя само», из-за которой
+    после прогонов натекло 24 окна, в каждом живой clave.
+
+    Титул уникален (nonce), так что чужие окна пользователя под условие не попадут.
+    """
+    safe = title.replace("\\", "\\\\").replace('"', '\\"')
+    return (
+        'tell application "Terminal" to close '
+        f'(every window whose name contains "{safe}") saving no'
+    )

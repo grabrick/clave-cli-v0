@@ -72,6 +72,21 @@ def verdict_passes(v: VisionVerdict, blocking=("high", "medium")) -> bool:
     return True
 
 
+def blocking_verdict(reason: str) -> VisionVerdict:
+    """Вердикт-блокиратор: один проваленный required-пункт → verdict_passes=False.
+
+    Пункт называется INFRA_FAILURE, а не текстом причины: так регрессионный гейт отличает
+    «сломался сам проход» от «сломан рендер» и не вычитает первое по базовой линии. Причина
+    едет в note — она же уходит агенту через build_visual_context.
+    """
+    return VisionVerdict(
+        issues=[],
+        checklist=[ChecklistItem(check=INFRA_FAILURE, required=True, passed=False, note=reason)],
+        open_critique=reason,
+        raw=reason,
+    )
+
+
 def is_infra_failure(v: VisionVerdict) -> bool:
     """Вердикт говорит не о продукте, а о поломке самого визуального прохода."""
     return any(c.check == INFRA_FAILURE and not c.passed for c in v.checklist)
@@ -127,6 +142,14 @@ def consensus_verdict(samples, base_keys=(), min_hits: int = 2) -> VisionVerdict
     infra = next((v for v in samples if is_infra_failure(v)), None)
     if infra is not None:
         return infra
+    if len(samples) < min_hits:
+        # Ловушка, которую легко не заметить: если выборок меньше порога совпадений, ни одна
+        # регрессия физически не наберёт min_hits — гейт стал бы слепым и молча пропускал всё.
+        # Слепой гейт хуже отсутствующего: он создаёт видимость проверки.
+        return blocking_verdict(
+            f"выборок вердикта {len(samples)}, а порог совпадений {min_hits} — "
+            "гейт не отличил бы шум судьи от регрессии"
+        )
 
     hits = Counter()
     for v in samples:

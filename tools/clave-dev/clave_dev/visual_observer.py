@@ -4,25 +4,111 @@ GUI-оркестрация (`observe_visual_all`) — e2e-only (реальный
 fail-safe: любая беда → блокирующий вердикт, никогда тихий pass (§8)."""
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 from .capture import is_blank_frame, screencapture_cmd
-from .visual_verdict import INFRA_FAILURE, ChecklistItem, VisionVerdict
+from .visual_verdict import blocking_verdict
 
 
-def blocking_verdict(reason: str) -> VisionVerdict:
-    """Вердикт-блокиратор: один проваленный required-пункт → verdict_passes=False.
+def kill_observed_process(tty: str) -> bool:
+    """Погасить наблюдаемый бинарь во вкладке — и ТОЛЬКО его. True — если было кого гасить.
 
-    Пункт называется INFRA_FAILURE, а не текстом причины: так регрессионный гейт отличает
-    «сломался сам проход» от «сломан рендер» и не вычитает первое по базовой линии. Причина
-    едет в note — она же уходит агенту через build_visual_context.
+    Почему жёстко, а не «попроси приложение выйти». Прежний teardown слал в окно `/quit` и
+    надеялся. Проверено на живой системе: clave от этого НЕ выходит — три процесса во вкладке до
+    и три после. Полагаться тут на продукт нельзя и по существу: агент мог сломать его ровно так,
+    что он не реагирует на ввод, — а это и есть тот случай, ради которого визуальный проход
+    существует.
+
+    Почему только бинарь, не весь tty. Логин-шелл трогать нельзя: команда запуска кончается на
+    `; exit`, так что стоит убить бинарь — и шелл сам доигрывает `exit` и выходит ЧИСТО, а
+    Terminal убирает вкладку и окно. Если же прибить и шелл, вкладка разрушается криво: остаётся
+    «зомби»-окно без вкладок, которое AppleScript уже не закрывает ничем. Так я и насорил
+    двумя десятками окон.
+
+    Не через `pkill -t`: на macOS он ТРЕБУЕТ pattern и без него молча падает с кодом 2.
     """
-    return VisionVerdict(
-        issues=[],
-        checklist=[ChecklistItem(check=INFRA_FAILURE, required=True, passed=False, note=reason)],
-        open_critique=reason,
-        raw=reason,
+    dev = str(tty).rsplit("/", 1)[-1]
+    if not dev.startswith("ttys"):
+        return False
+    listing = subprocess.run(
+        ["ps", "-t", dev, "-o", "pid=,command="], capture_output=True, text=True, check=False
     )
+    victims = []
+    for line in listing.stdout.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        command = command.strip()
+        # логин-шелл начинается с дефиса (`-zsh`), сам login — с `login`. Всё прочее — наше.
+        if command.startswith("-") or command.startswith("login"):
+            continue
+        if pid.isdigit():
+            victims.append(pid)
+    if not victims:
+        return False
+    subprocess.run(["kill", "-9", *victims], capture_output=True, check=False)
+    return True
+
+
+def tab_is_empty(tty: str) -> bool:
+    """В tty вкладки не осталось ни одного процесса (включая root-овый `login`)."""
+    dev = str(tty).rsplit("/", 1)[-1]
+    if not dev.startswith("ttys"):
+        return True
+    res = subprocess.run(["ps", "-t", dev, "-o", "pid="], capture_output=True, text=True, check=False)
+    return not res.stdout.strip()
+
+
+def window_still_open(osa, title: str) -> bool:
+    """Осталось ли НАШЕ окно висеть.
+
+    Ищем по имени окна, а не по `custom title` вкладки: Terminal стирает custom title, как только
+    процесс во вкладке убит, — по нему протечка была бы невидима. А имя окна сохраняет наш nonce.
+
+    Титул уникален (`clave-dev <nonce>`), и это принципиально: фильтровать по одному лишь
+    «clave-dev» нельзя — под такую подстроку попадёт и окно пользователя, открытое в каталоге
+    вроде `…/worktrees/clave-dev-headless`, и мы закроем ему рабочее окно.
+    """
+    safe = title.replace('"', '\\"')
+    script = (
+        'tell application "Terminal" to return count of '
+        f'(every window whose name contains "{safe}")'
+    )
+    try:
+        return int(osa(script) or "0") > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def teardown_window(osa, title: str, tty: str, close_script) -> bool:
+    """Убрать наше окно. True — убрано.
+
+    Закрывает окно САМ Terminal — по настройке профиля «при выходе из shell закрыть окно»
+    (`shellExitAction = 0`). Мы лишь гасим наблюдаемый бинарь: шелл доигрывает `; exit`, выходит
+    чисто, и окно уходит вместе со вкладкой.
+
+    Почему не закрываем через AppleScript. Проверено на живой системе: `close` на окне Terminal
+    возвращает успех и НЕ ЗАКРЫВАЕТ — ни по id, ни через `whose`, ни с `saving no`. Попытку всё
+    же делаем (вдруг повезёт), но рассчитывать на неё нельзя.
+
+    ВАЖНО: Terminal читает профиль из настроек ОДИН раз, при своём запуске. Если профиль правили
+    при живом Terminal, изменение подхватится только после его перезапуска — до тех пор окна
+    будут копиться, и про каждое такое мы честно предупредим.
+    """
+    kill_observed_process(tty)
+    for _ in range(20):  # до ~5 с: шелл доигрывает `exit`, Terminal убирает вкладку
+        if tab_is_empty(tty):
+            break
+        time.sleep(0.25)
+
+    for _ in range(3):
+        if not window_still_open(osa, title):
+            return True
+        osa(close_script)  # запасная попытка; на живой системе она обычно не срабатывает
+        time.sleep(0.5)
+    return not window_still_open(osa, title)
 
 
 def run_visual(
@@ -30,13 +116,21 @@ def run_visual(
 ) -> list:
     """Снять окно `cgwindow_id` и оценить зрением `samples` раз. `run_cmd(list)->int`,
     `read_pixels(path)->bytes` инъектируются (в проде — subprocess/декод PNG; в тестах — фейки).
-    Любая беда → блокирующий вердикт (§8), никогда тихий pass.
 
     Кадр снимается ОДИН раз, а судится несколько: замеренный разброс даёт судья, а не скриншот
     (пять прогонов на неизменном продукте — три разных вердикта). Пересъёмка окна ради выборок
     была бы дороже и мешала бы шум судьи с дрожанием курсора.
 
-    Возвращает СПИСОК вердиктов (len == samples; при поломке прохода — один блокирующий).
+    Две беды тут РАЗНОЙ природы, и путать их нельзя:
+
+    * Поломка ЗАХВАТА (нет Screen Recording, чёрный кадр) — фатальна: судить нечего, все выборки
+      обречены. Блокируем сразу.
+    * Осечка СУДЬИ (модель вернула битый JSON) — это та же самая ненадёжность, ради которой мы и
+      берём несколько выборок. Живой прогон споткнулся ровно об это: одна испорченная выборка из
+      трёх убила базовую линию, а с ней и двадцать минут работы агента. Осечку просто повторяем;
+      блокируем, только если не разобрана НИ ОДНА выборка — вот тогда зрение и правда мертво.
+
+    Возвращает список вердиктов (при поломке — один блокирующий).
     """
     from .vision import DEFAULT_VISION_PROMPT
 
@@ -45,12 +139,19 @@ def run_visual(
         return [blocking_verdict(f"screencapture код {code} (нет Screen Recording?)")]
     if is_blank_frame(read_pixels(out_path)):
         return [blocking_verdict("кадр пустой/чёрный — вероятно нет разрешения на запись экрана")]
-    verdicts = []
-    for _ in range(max(1, samples)):
+
+    wanted = max(1, samples)
+    verdicts, failures = [], []
+    for _ in range(wanted * 2):  # запас на осечки судьи
+        if len(verdicts) >= wanted:
+            break
         try:
             verdicts.append(vision.analyze_image(out_path, prompt or DEFAULT_VISION_PROMPT))
-        except Exception as e:  # непарсящийся вердикт / недоступность бэкенда → блок
-            return [blocking_verdict(f"vision-бэкенд: {e}")]
+        except Exception as e:
+            failures.append(str(e))
+
+    if not verdicts:
+        return [blocking_verdict(f"vision-бэкенд: {'; '.join(failures[:2])}")]
     return verdicts
 
 
@@ -96,7 +197,12 @@ def gui_capture_verdict(
     import time
     import uuid
 
-    from .terminal_driver import launch_applescript, send_line_applescript
+    from .terminal_driver import (
+        close_window_applescript,
+        launch_applescript,
+        send_line_applescript,
+        tty_of_window_applescript,
+    )
     from .terminal_profile import (
         apply_geometry_applescript,
         geometry_label,
@@ -118,8 +224,9 @@ def gui_capture_verdict(
         env_prefix += f"CLAVE_CONFIG={config_path} "
     title = f"clave-dev {uuid.uuid4().hex[:8]}"
 
-    # profile.theme — имя профиля Terminal с «при выходе из shell закрыть окно».
-    # Только он позволяет окну убрать себя: снаружи Terminal-окно не закрывается.
+    # profile.theme — имя профиля Terminal (шрифт и цвета как у пользователя).
+    # Закрывать окно на «сам выйдет по shellExitAction» больше НЕ рассчитываем: не закрывалось.
+    # Уборка — жёсткая, в конце функции.
     win_id = osa(
         launch_applescript(Path(binary), title, Path(cwd), env_prefix, profile.theme)
     )
@@ -153,11 +260,23 @@ def gui_capture_verdict(
             )
         ]
 
+    # Убираем за собой САМИ, не спрашивая продукт. Прежний teardown слал «/quit» и надеялся,
+    # что clave вежливо выйдет, шелл выйдет следом, а окно закроется само. Не работало: за
+    # прогоны натекло 24 окна Terminal, и в каждом остался живой clave. Полагаться тут на
+    # продукт нельзя и по существу — агент мог сломать его ровно так, что он не выходит по
+    # команде, а это и есть тот случай, ради которого наблюдатель существует.
     if win_id:
-        # /quit → clave выходит → шелл выходит (`; exit` в команде) → окно закрывается САМО
-        # (профиль с shellExitAction=2). Закрыть его снаружи нельзя — проверено.
-        osa(send_line_applescript(win_id, "/quit"))
-        time.sleep(1.2)
+        closed = False
+        try:
+            tty = osa(tty_of_window_applescript(win_id))
+            closed = teardown_window(osa, title, tty, close_window_applescript(title))
+        except Exception:
+            closed = False  # уборка не должна ронять вердикт — но и молчать о протечке нельзя
+        if not closed:
+            print(
+                f"clave-dev: ⚠ окно Terminal «{title}» не закрылось — закрой вручную (Cmd+W)",
+                file=sys.stderr,
+            )
     return verdicts
 
 
