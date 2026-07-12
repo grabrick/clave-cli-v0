@@ -3,4 +3,8 @@ target/
 .clave/
 .ai-runs/
 .DS_Store
+# Каталог worktree'ов харнесса — не должен делать рабочее дерево грязным.
+.claude/worktrees/
+.venv/
+**/.venv/
 

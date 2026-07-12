@@ -23,6 +23,28 @@ pub(crate) enum ChatRunResult {
     Cancelled,
 }
 
+/// Человеческий финал прогона вместо машинного «Clave завершился с кодом N»: сырой код
+/// выхода в ленте читается как падение, даже когда всё прошло хорошо. Показываем его
+/// только там, где сбой действительно есть — там он и нужен, для диагностики.
+///
+/// Возвращает (статус для футера, строку в ленту).
+pub(crate) fn run_finish_lines(code: i32, lang: Language) -> (String, String) {
+    if code == 0 {
+        (
+            lang.choose("готово", "completed").to_string(),
+            lang.choose("⏺ Готово.", "⏺ Done.").to_string(),
+        )
+    } else {
+        (
+            format!("{}:{code}", lang.choose("ошибка", "failed")),
+            format!(
+                "{} {code}.",
+                lang.choose("✗ Завершилось с ошибкой, код", "✗ Failed with exit code")
+            ),
+        )
+    }
+}
+
 /// Плавная «печатная машинка» для ответа: целиком готовый текст вскрывается
 /// по символам со временем, пока полностью не уйдёт в историю.
 pub(crate) struct Reveal {
@@ -173,17 +195,10 @@ impl App {
                     self.run_label.clear();
                     self.run_token_estimate = None;
                     self.cancel_tx = None;
-                    self.status = if code == 0 {
-                        self.lang.choose("готово", "completed").to_string()
-                    } else {
-                        format!("{}:{code}", self.lang.choose("ошибка", "failed"))
-                    };
+                    let (status, message) = run_finish_lines(code, self.lang);
+                    self.status = status;
                     self.flush_reveal_buffer();
-                    self.push_system(format!(
-                        "{} {code}.",
-                        self.lang
-                            .choose("Clave завершился с кодом", "Clave finished with exit code")
-                    ));
+                    self.push_system(message);
                     self.process_pending_messages();
                 }
                 WorkerEvent::ChatDone(provider, code, usage) => {
@@ -390,6 +405,17 @@ mod tests {
         assert_eq!(later, 150);
         // Дольше длины текста расти нельзя — переполнения нет.
         assert_eq!(reveal_chars_for(10_000, total), total);
+    }
+
+    #[test]
+    fn run_finish_is_human_and_keeps_the_code_only_on_failure() {
+        // «Clave завершился с кодом 0» читалось как падение, хотя всё прошло хорошо.
+        let (_, ok) = run_finish_lines(0, Language::Ru);
+        assert_eq!(ok, "⏺ Готово.");
+        // А при реальном сбое код по-прежнему нужен — для диагностики.
+        let (status, bad) = run_finish_lines(7, Language::Ru);
+        assert!(status.contains("ошибка"));
+        assert!(bad.contains('7'), "код сбоя показываем: {bad}");
     }
 
     #[test]
