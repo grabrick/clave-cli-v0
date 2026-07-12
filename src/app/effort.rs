@@ -34,12 +34,13 @@ impl App {
         }
     }
 
-    pub(crate) fn compact_effort_summary(&self) -> String {
+    /// Читаемое усилие для футера: «Claude max · Codex xhigh» при раздельном, иначе одно.
+    pub(crate) fn human_effort_summary(&self) -> String {
         match self.mode {
             Mode::CodexOnly => effort_label(self.codex_effort_index).to_string(),
             Mode::ClaudeOnly => effort_label(self.claude_effort_index).to_string(),
             Mode::ClaudeCodex | Mode::CodexClaude if self.linked_effort_split => format!(
-                "cl:{} cd:{}",
+                "Claude {} · Codex {}",
                 effort_label(self.claude_effort_index),
                 effort_label(self.codex_effort_index)
             ),

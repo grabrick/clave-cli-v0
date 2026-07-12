@@ -27,22 +27,33 @@ pub(crate) fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .choose("? подсказки · / команды", "? shortcuts · / commands");
     let (right, right_style) = footer_right_segment(app);
     let width = area.width as usize;
-    let right_slot_width = footer_right_slot_width(app).min(width);
-    let right = truncate_chars(&right, right_slot_width);
-    let right_width = display_width(&right);
+    // Держим запас у правой стены и НЕ дорисовываем до последней колонки. Рендер печатает
+    // строку по НАШЕЙ ширине (unicode-width считает `→`/`·` за 1 клетку), но терминал
+    // рисует такие «неоднозначные по ширине» символы в 2 клетки, плюс крайняя ячейка
+    // страдает от last-column-quirk — и хвост правого сегмента срезался у самой стены.
+    // Запас в 2 колонки это покрывает (в сегменте максимум 2 таких символа с подсказками).
+    let budget = width.saturating_sub(2);
 
     let mode_width = mode_label.chars().count();
     let switch_width = switch.chars().count() + 1; // пробел перед серым хоткеем
     let sep_width = 2;
     let min_gap = 2;
+
+    // Правый сегмент ограничиваем доступным местом; не влезает — усекаем с «…», а не
+    // молча теряем символ у края.
+    let right_available = budget.saturating_sub(mode_width + switch_width + sep_width + min_gap);
+    let right_slot_width = footer_right_slot_width(app).min(right_available);
+    let right = truncate_chars(&right, right_slot_width);
+    let right_width = display_width(&right);
+
     let used = mode_width + switch_width + sep_width + right_slot_width + min_gap;
-    let hints = if used + hints.chars().count() > width {
-        truncate_chars(hints, width.saturating_sub(used))
+    let hints = if used + hints.chars().count() > budget {
+        truncate_chars(hints, budget.saturating_sub(used))
     } else {
         hints.to_string()
     };
     let left_width = mode_width + switch_width + sep_width + hints.chars().count();
-    let gap = width.saturating_sub(left_width + right_slot_width);
+    let gap = budget.saturating_sub(left_width + right_slot_width);
     let right_padding = right_slot_width.saturating_sub(right_width);
     let line = Line::from(vec![
         Span::styled(
@@ -64,25 +75,47 @@ pub(crate) fn draw_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 pub(crate) fn footer_right_segments(app: &App) -> Vec<String> {
-    let ready = app.lang.choose("готов", "ready");
+    let lang = app.lang;
+    let ready = lang.choose("готов", "ready");
     let mut segments = Vec::new();
 
     if app.status != ready {
-        segments.push(format!("status {}", app.status));
+        segments.push(format!(
+            "{}: {}",
+            lang.choose("статус", "status"),
+            app.status
+        ));
     }
 
-    segments.push(format!("mode {}", app.mode.as_str()));
-    segments.push(format!("chat {}", app.direct_provider.as_str()));
+    // Роли планирования: архитектор → ревьюер (одна модель, если совпадают). Отдельный
+    // сегмент «mode» убран — он дублировал ровно эти же роли.
+    let architect = app.mode.architect_provider();
+    let reviewer = app.mode.reviewer_provider();
+    let roles = if architect == reviewer {
+        architect.title().to_string()
+    } else {
+        format!("{} → {}", architect.title(), reviewer.title())
+    };
+    segments.push(format!("{}: {}", lang.choose("роли", "roles"), roles));
     segments.push(format!(
-        "roles {}>{}",
-        app.mode.architect_provider().as_str(),
-        app.mode.reviewer_provider().as_str()
+        "{}: {}",
+        lang.choose("чат", "chat"),
+        app.direct_provider.title()
     ));
-    segments.push(format!("theme {}", app.theme.as_str()));
-    segments.push(format!("effort {}", app.compact_effort_summary()));
+    segments.push(format!(
+        "{}: {}",
+        lang.choose("тема", "theme"),
+        app.theme.title()
+    ));
+    segments.push(format!(
+        "{}: {}",
+        lang.choose("усилие", "effort"),
+        app.human_effort_summary()
+    ));
     if app.usage.total_tokens() > 0 {
         segments.push(format!(
-            "usage {} · ${:.3}",
+            "{}: {} · ${:.3}",
+            lang.choose("расход", "usage"),
             format_token_count(app.usage.total_tokens() as usize),
             app.usage.total_cost_usd()
         ));
