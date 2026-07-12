@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .assertions import line_matches, not_visible, visible
 from .binaries import sanitized_env, snapshot_known_good
+from .emit import Emitter
 from .loop import RunConfig, run_loop
 from .observer import Scenario
 from .report import render_report
@@ -44,6 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="имя профиля Terminal.app для среды прогона (§4)")
     p.add_argument("--severity-threshold", default="medium", choices=["low", "medium", "high"],
                    help="минимальный severity необязательной находки, который блокирует (§6)")
+    p.add_argument("--protocol", default=None, choices=["clave-dev"],
+                   help="типизированный вывод CLAVE-DEV для TUI (§5); без него — человеческий отчёт")
     return p
 
 
@@ -104,8 +107,11 @@ def main(argv=None) -> int:
         blocking_severities=blocking,
         terminal_profile=args.terminal_profile,
     )
-    report = run_loop(cfg, known.version)
-    print(render_report(report, repo, worktree))
+    emitter = Emitter(enabled=(args.protocol == "clave-dev"))
+    report = run_loop(cfg, known.version, emitter=emitter)
+    # В protocol-mode stdout только обрамлён (§5) — человеческий отчёт не печатаем.
+    if args.protocol != "clave-dev":
+        print(render_report(report, repo, worktree))
     # worktree с дифом сознательно НЕ удаляется — нужен человеку для ревью (спека §7).
     return 0 if report.converged else 1
 
