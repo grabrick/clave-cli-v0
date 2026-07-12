@@ -13,6 +13,10 @@ pub(crate) struct AskQuestion {
     pub(crate) question: String,
     pub(crate) multi: bool,
     pub(crate) options: Vec<AskOption>,
+    /// Показывать ли строку «Свой ответ». Для вопросов модели — да. Для локальных вопросов
+    /// самого приложения (например «включить зрение?») — нет: свободный текст там некому
+    /// обработать, и строка была бы мёртвой — Enter на ней не делал бы ничего.
+    pub(crate) allow_custom: bool,
 }
 
 /// Разобранный запрос выбора (блок ```clave-ask): один или несколько вопросов.
@@ -150,6 +154,7 @@ fn parse_question(value: &Value) -> Option<AskQuestion> {
         question,
         multi,
         options,
+        allow_custom: true, // вопрос от модели — свободный ответ ей и уйдёт
     })
 }
 

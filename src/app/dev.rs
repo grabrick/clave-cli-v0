@@ -115,6 +115,8 @@ impl App {
                     )
                     .to_string(),
                 multi: false,
+                // Свободный текст тут некому обработать — вопрос локальный, «да/нет».
+                allow_custom: false,
                 options: vec![
                     AskOption {
                         label: self

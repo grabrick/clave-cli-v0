@@ -159,7 +159,9 @@ impl App {
                 (state.confirm_cursor as isize + delta).rem_euclid(rows) as usize;
         } else {
             let step = state.step;
-            let rows = (state.prompt.questions[step].options.len() + 1) as isize;
+            let question = &state.prompt.questions[step];
+            // Курсор ходит по вариантам и, если он есть, по строке «Свой ответ».
+            let rows = (question.options.len() + usize::from(question.allow_custom)) as isize;
             if let Some(answer) = state.answers.get_mut(step) {
                 answer.cursor = (answer.cursor as isize + delta).rem_euclid(rows) as usize;
             }
