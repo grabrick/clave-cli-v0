@@ -25,7 +25,13 @@ COLS, ROWS = 120, 40
 
 
 def descendants() -> dict:
-    """PID → cmdline для процессов супервайзера/сборки (по характерным маркерам)."""
+    """PID → cmdline ТОЛЬКО для потомков прогона: супервайзер (`-m clave_dev`), агент и
+    cargo (живут во ВРЕМЕННОМ каталоге `/T/clave-dev-<nonce>/`).
+
+    Осторожно: наивная подстрока `clave-dev-` ловит и сам каталог worktree
+    (`clave-dev-headless`), то есть бинарь clave под тестом — он-то как раз обязан
+    выжить (Ctrl+C отменяет ПРОГОН, а не приложение). Из-за этого фильтр давал ложную
+    «сироту». Матчим только `clave_dev` (модуль, через подчёркивание) и временный путь."""
     out = subprocess.run(
         ["ps", "-Ao", "pid=,command="], capture_output=True, text=True
     ).stdout
@@ -35,8 +41,9 @@ def descendants() -> dict:
         if not line:
             continue
         pid, _, cmd = line.partition(" ")
-        if ("clave_dev" in cmd or "clave-dev-" in cmd) and "drive_dev_cancel" not in cmd:
-            found[pid] = cmd[:90]
+        is_child = "clave_dev" in cmd or "/T/clave-dev-" in cmd
+        if is_child and "drive_dev_cancel" not in cmd:
+            found[pid] = cmd[:150]
     return found
 
 
