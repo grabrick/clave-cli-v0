@@ -1,8 +1,17 @@
+import hashlib
 import os
+import stat
+import tempfile
 import unittest
 from pathlib import Path
 
-from clave_dev.binaries import build_command, fresh_binary, sanitized_env
+from clave_dev.binaries import (
+    build_command,
+    fresh_binary,
+    identify_binary,
+    sanitized_env,
+    sha256_file,
+)
 
 
 class BinariesTest(unittest.TestCase):
@@ -40,3 +49,26 @@ class BinariesTest(unittest.TestCase):
         self.assertNotIn(str(wt), parts)
         self.assertNotIn(str(wt / "target" / "debug"), parts)
         self.assertNotIn(str(wt / "target" / "release"), parts)
+
+
+class IdentityTest(unittest.TestCase):
+    def test_sha256_file(self):
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(b"clave-bin")
+            p = f.name
+        self.addCleanup(os.unlink, p)
+        self.assertEqual(sha256_file(Path(p)), hashlib.sha256(b"clave-bin").hexdigest())
+
+    def test_identify_prefers_version_over_help(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "clave"
+            fake.write_text('#!/bin/bash\n[ "$1" = "--version" ] && echo "clave 9.9.9" && exit 0\necho "help top"\n')
+            fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+            self.assertEqual(identify_binary(fake), "clave 9.9.9")
+
+    def test_identify_falls_back_to_help(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / "clave"
+            fake.write_text('#!/bin/bash\n[ "$1" = "--version" ] && exit 2\necho "help first line"\n')
+            fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+            self.assertEqual(identify_binary(fake), "help first line")

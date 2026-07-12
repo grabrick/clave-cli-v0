@@ -1,6 +1,7 @@
 """Разделение и изоляция бинарей: known-good (инструмент) vs fresh (объект)."""
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import subprocess
@@ -10,7 +11,7 @@ from typing import Mapping, Optional
 
 PROFILE_DIRS = {"debug": "debug", "release": "release"}
 
-KnownGood = namedtuple("KnownGood", "path version")
+KnownGood = namedtuple("KnownGood", "path version hash")
 
 
 def build_command(profile: str) -> list:
@@ -55,14 +56,24 @@ def snapshot_known_good(known_good: Path, tmp_dir: Path) -> KnownGood:
     dest = dest_dir / "clave"
     shutil.copy2(known_good, dest)
     dest.chmod(0o755)
-    try:
-        version = (
-            subprocess.run(
-                [str(dest), "--help"], capture_output=True, text=True, timeout=10
-            )
-            .stdout.splitlines()[0]
-            .strip()
-        )
-    except Exception:
-        version = "unknown"
-    return KnownGood(path=dest, version=version)
+    return KnownGood(path=dest, version=identify_binary(dest), hash=sha256_file(dest))
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def identify_binary(path: Path) -> str:
+    """Идентификация: `--version` (первая строка), фолбэк на первую строку `--help`."""
+    for flag in ("--version", "--help"):
+        try:
+            res = subprocess.run([str(path), flag], capture_output=True, text=True, timeout=10)
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.splitlines()[0].strip()
+        except Exception:
+            continue
+    return "unknown"
