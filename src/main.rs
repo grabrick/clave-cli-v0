@@ -1,5 +1,6 @@
 mod app;
 mod auth;
+mod headless;
 mod input;
 mod model;
 mod prelude;
