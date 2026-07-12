@@ -1,9 +1,5 @@
 use super::*;
 
-/// Как часто перепроверяем git-ref: ветка меняется прямо во время сессии (в том числе
-/// самим `/dev`), но спавнить `git` 10 раз в секунду вслед за тиком цикла незачем.
-const GIT_REF_TTL: Duration = Duration::from_secs(2);
-
 /// Текущий ref рабочего каталога: имя ветки, а в detached HEAD — короткий SHA.
 /// Не репозиторий (или ref не читается) — `None`.
 ///
@@ -28,19 +24,11 @@ pub(crate) fn detect_git_ref(dir: &Path) -> Option<String> {
 }
 
 impl App {
-    /// Обновляет индикатор git-ref (с TTL). Сбрось `git_ref_checked_at` в `None`, чтобы
-    /// перечитать немедленно — например, после смены рабочей директории.
+    /// Перечитывает индикатор git-ref. Зовём только на событиях, которые могли его
+    /// поменять: старт, смена рабочего каталога, завершение агентского рана. Периодического
+    /// опроса нет — спавнить `git` на простаивающем TUI незачем.
     pub(crate) fn refresh_git_ref(&mut self) {
-        let fresh = self
-            .git_ref_checked_at
-            .map(|checked_at| checked_at.elapsed() < GIT_REF_TTL)
-            .unwrap_or(false);
-        if fresh {
-            return;
-        }
-
-        self.git_ref_checked_at = Some(Instant::now());
-        self.git_ref = detect_git_ref(&self.resolved_work_dir());
+        self.git_ref = (self.git_ref_detector)(&self.resolved_work_dir());
     }
 
     pub(crate) fn push_command_invocation(&mut self, command: &str) {
@@ -150,6 +138,14 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DETECTOR_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn counting_detector(_dir: &Path) -> Option<String> {
+        DETECTOR_CALLS.fetch_add(1, Ordering::SeqCst);
+        Some("stub".to_string())
+    }
 
     /// Временный репозиторий: коммитим с per-command config, чтобы тест не зависел от
     /// глобального git-конфига (в CI обычно нет ни user.name, ни user.email).
@@ -204,6 +200,43 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         assert!(!expected.is_empty());
         assert_eq!(got, Some(expected));
+    }
+
+    /// Главное свойство правки: без событий (тики цикла) детектор не дёргается повторно,
+    /// а на каждое завершение рана — ровно одно чтение.
+    #[test]
+    fn git_ref_is_read_on_events_only() {
+        let dir = temp_repo("no-poll");
+        let mut app = App::new();
+        app.work_dir = dir.to_string_lossy().to_string();
+        app.git_ref_detector = counting_detector;
+        DETECTOR_CALLS.store(0, Ordering::SeqCst);
+
+        app.refresh_git_ref();
+        assert_eq!(DETECTOR_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(app.git_ref.as_deref(), Some("stub"));
+
+        for _ in 0..10 {
+            app.drain_worker_events();
+            app.refresh_footer_right_state();
+        }
+        assert_eq!(DETECTOR_CALLS.load(Ordering::SeqCst), 1);
+
+        let terminal = [
+            WorkerEvent::Done(0),
+            WorkerEvent::ChatDone(Provider::Claude, 0, None),
+            WorkerEvent::PlanReady(Provider::Claude, String::new(), 1, None),
+            WorkerEvent::Cancelled,
+            WorkerEvent::Failed("boom".to_string()),
+        ];
+        let expected = 1 + terminal.len();
+        for event in terminal {
+            app.tx.send(event).expect("send");
+        }
+        app.drain_worker_events();
+        assert_eq!(DETECTOR_CALLS.load(Ordering::SeqCst), expected);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

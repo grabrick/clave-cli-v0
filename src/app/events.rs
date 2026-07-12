@@ -169,6 +169,21 @@ impl App {
 
     pub(crate) fn drain_worker_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
+            // Ран кончился — агент мог закоммитить или переключить ветку. Читаем ref ДО
+            // разбора события: старый ран уже завершён, а следующий из очереди (его поднимет
+            // `process_pending_messages`) ещё не стартовал. `AuthMissing` не в счёт: агент
+            // не запускался.
+            if matches!(
+                event,
+                WorkerEvent::Done(_)
+                    | WorkerEvent::ChatDone(..)
+                    | WorkerEvent::PlanReady(..)
+                    | WorkerEvent::Cancelled
+                    | WorkerEvent::Failed(_)
+            ) {
+                self.refresh_git_ref();
+            }
+
             match event {
                 WorkerEvent::Line(line) => {
                     self.record_worker_activity(&line);
