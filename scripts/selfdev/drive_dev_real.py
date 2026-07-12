@@ -18,7 +18,9 @@ import pyte
 
 CLAVE = sys.argv[1]      # бинарь ветки (с /dev)
 REPO = sys.argv[2]       # git-корень (worktree), дерево должно быть чистым
-DEV_PY = sys.argv[3]     # python с pyte (venv) — для супервайзера
+# python супервайзера: явный путь ИЛИ "auto" — тогда CLAVE_DEV_PYTHON не задаём вовсе
+# и проверяем zero-config автопоиск venv (tools/clave-dev/.venv) самим clave.
+DEV_PY = sys.argv[3] if len(sys.argv) > 3 else "auto"
 COLS, ROWS = 120, 44
 BUDGET_S = 200
 
@@ -37,9 +39,11 @@ def main() -> int:
         CLAVE_HOME=str(home),
         CLAVE_CLAUDE=str(here / "mock-claude.sh"),
         CLAVE_CODEX=str(here / "mock-codex.sh"),
-        CLAVE_DEV_PYTHON=DEV_PY,
         PATH=os.path.expanduser("~/.cargo/bin") + ":" + env.get("PATH", ""),
     )
+    env.pop("CLAVE_DEV_PYTHON", None)
+    if DEV_PY != "auto":
+        env["CLAVE_DEV_PYTHON"] = DEV_PY
     proc = subprocess.Popen(
         [CLAVE], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=REPO, close_fds=True
     )

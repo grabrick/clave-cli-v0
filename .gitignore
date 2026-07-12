@@ -4,3 +4,7 @@ target/
 .ai-runs/
 .DS_Store
 
+
+# venv супервайзера clave-dev (pyte/pyobjc)
+.venv/
+**/.venv/
