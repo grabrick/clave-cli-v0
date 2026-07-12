@@ -17,6 +17,10 @@ case "$*" in
   *"auth status"*|*"login status"*) echo "logged in as mock-agent"; exit 0 ;;
 esac
 
+# Складываем ВСЁ, что реально получил провайдер, ВНЕ worktree (иначе лог сам стал бы
+# «изменением»). Так видно, доезжает ли до агента фидбэк супервайзера о поломке.
+{ echo "=== invocation ==="; echo "ARGS: $*"; } >> ../mock-prompts.log 2>/dev/null
+
 PROBE="tools/clave-dev/tests/test_zz_probe.py"
 
 if [ -d "target" ]; then
