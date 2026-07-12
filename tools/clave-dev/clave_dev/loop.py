@@ -104,7 +104,10 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
         # ушёл наружу стримом — для аналитических задач он и есть результат.
         changed = changed_paths(cfg.worktree)
         if not changed:
-            emitter.progress("агент не внёс изменений в код — это не сходимость, а no-op")
+            emitter.progress(
+                "агент не внёс изменений в код — это no-op, а не сходимость. "
+                "Ответ агента выше. /dev нужен для ПРАВОК; для анализа/диагностики — /advisor или /plan"
+            )
             _emit_final(emitter, cfg, False, round_i, known_good_version, "no_changes")
             return RunReport(False, round_i, cfg.max_rounds, [], known_good_version, "no_changes")
 
