@@ -39,7 +39,9 @@ fn dev_git_root(path: &Path) -> Option<PathBuf> {
 /// Резолв внешнего пакета clave_dev (спека §4): CLAVE_DEV_HOME → <git root>/tools/clave-dev
 /// → установленный модуль. Возвращает (программа, аргументы, опциональный PYTHONPATH).
 fn resolve_clave_dev(git_root: &Path) -> Option<(String, Vec<String>, Option<String>)> {
-    let py = "python3".to_string();
+    // Интерпретатор: CLAVE_DEV_PYTHON (venv с pyte/pyobjc) → иначе python3 из PATH.
+    // Системный python3 обычно без pyte, поэтому override — не роскошь (спека §4).
+    let py = env::var("CLAVE_DEV_PYTHON").unwrap_or_else(|_| "python3".to_string());
     let module = || vec!["-m".to_string(), "clave_dev".to_string()];
 
     if let Ok(home) = env::var("CLAVE_DEV_HOME") {
@@ -51,7 +53,7 @@ fn resolve_clave_dev(git_root: &Path) -> Option<(String, Vec<String>, Option<Str
     if repo_pkg.join("clave_dev").is_dir() {
         return Some((py, module(), Some(repo_pkg.to_string_lossy().to_string())));
     }
-    let importable = Command::new("python3")
+    let importable = Command::new(&py)
         .args(["-c", "import clave_dev"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
