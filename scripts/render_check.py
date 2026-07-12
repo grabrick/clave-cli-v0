@@ -91,11 +91,11 @@ def main() -> int:
         idles.append(snap())
     send("?")
     pump(0.35)
-    shortcuts_open = visible("Управление") or visible("Controls")
+    shortcuts_open = visible("Отправка") or visible("Compose")
     footer_hidden_on_shortcuts = not footer_shown()  # и под подсказками тоже
     send("\x1b")  # Esc
     pump(0.35)
-    shortcuts_closed = not (visible("Управление") or visible("Controls"))
+    shortcuts_closed = not (visible("Отправка") or visible("Compose"))
     footer_back = footer_shown()
     send("/quit\r")
     pump(0.8)

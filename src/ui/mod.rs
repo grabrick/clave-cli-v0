@@ -55,7 +55,7 @@ pub(crate) fn panel_height(app: &App, width: u16, cap: u16) -> u16 {
     } else if normalized_command_query(&app.input).is_some() {
         COMMAND_PALETTE_ROWS
     } else if app.overlay == Overlay::Shortcuts {
-        shortcuts_panel_height(app.lang, width)
+        shortcuts_panel_height(width)
     } else if app.overlay == Overlay::Search {
         search_panel_height()
     } else if app.plan_gate_active() {
