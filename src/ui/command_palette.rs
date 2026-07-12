@@ -82,10 +82,12 @@ pub(crate) fn draw_command_screen(frame: &mut Frame<'_>, area: Rect, app: &App) 
         .enumerate()
         .skip(offset)
         .take(visible)
-        .enumerate()
-        .map(|(visual_index, (command_index, command))| {
+        .map(|(command_index, command)| {
             let is_selected = command_index == selected;
-            let row_fade = fade_level.saturating_sub(visual_index / 3);
+            // Равномерное появление всей палитры: без позиционного затухания к низу
+            // (раньше `visual_index / 3` навсегда гасил нижние строки — читалось как
+            // «выключенные» команды).
+            let row_fade = fade_level;
             let command_style = if is_selected {
                 let mut style = Style::default()
                     .fg(if row_fade >= 5 {
