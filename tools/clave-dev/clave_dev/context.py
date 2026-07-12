@@ -23,3 +23,20 @@ def build_context(checks, grids, assertion_results) -> str:
     for r in assertion_results:
         lines.append(f"- {'PASS' if r.passed else 'FAIL'} {r.name} {r.message}")
     return "\n".join(lines)
+
+
+def build_visual_context(verdicts) -> str:
+    """Блок «Визуальные дефекты» для фидбэка агенту (спека §7)."""
+    lines = ["## Визуальные дефекты"]
+    if not verdicts:
+        lines.append("- (зрение выключено или нет вердиктов)")
+    for i, v in enumerate(verdicts):
+        for c in v.checklist:
+            if not c.passed:
+                req = "(required)" if c.required else "(optional)"
+                lines.append(f"- сценарий {i}: FAIL чеклист '{c.check}' {req} {c.note}")
+        for iss in v.issues:
+            lines.append(f"- сценарий {i}: [{iss.severity}] {iss.description} region={iss.region_hint}")
+        if v.open_critique:
+            lines.append(f"- сценарий {i}: критика: {v.open_critique}")
+    return "\n".join(lines)

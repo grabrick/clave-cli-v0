@@ -9,6 +9,7 @@ from .binaries import fresh_binary
 from .checks import run_checks
 from .context import build_context
 from .observer import run_scenario
+from .visual_verdict import verdict_passes
 
 RunConfig = namedtuple(
     "RunConfig",
@@ -20,13 +21,15 @@ RunReport = namedtuple(
 )
 
 
-def converged(checks, assertion_results) -> bool:
-    """Спека §5: build ок И test 0 И clippy ок И fmt ок И все assertions pass."""
+def converged(checks, assertion_results, vision_verdicts=(), blocking=("high", "medium")) -> bool:
+    """Спека §5+§6: проверки зелёные И текстовые assertions pass И все visual-вердикты pass.
+    `vision_verdicts` пустой по умолчанию — обратная совместимость с поведением Фазы 1."""
     if checks is None or not checks.build_ok:
         return False
     checks_ok = checks.test_failures == 0 and checks.clippy_ok and checks.fmt_ok
     asserts_ok = all(r.passed for r in assertion_results)
-    return checks_ok and asserts_ok
+    vision_ok = all(verdict_passes(v, blocking) for v in vision_verdicts)
+    return checks_ok and asserts_ok and vision_ok
 
 
 def run_loop(cfg: RunConfig, known_good_version: str) -> RunReport:
