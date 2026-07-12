@@ -62,10 +62,15 @@ def tab_is_empty(tty: str) -> bool:
 
 
 def window_still_open(osa, title: str) -> bool:
-    """Осталось ли НАШЕ окно висеть.
+    """Осталось ли НАШЕ окно висеть на экране.
+
+    Считаем окно живым, только если у него ЕСТЬ вкладка. Закрытое окно Terminal ещё какое-то
+    время числится в списке `windows` — но уже с нулём вкладок. Проверка по одному имени принимала
+    такой фантом за протечку и подняла три ложные тревоги подряд, пока я не сверился со списком
+    вкладок.
 
     Ищем по имени окна, а не по `custom title` вкладки: Terminal стирает custom title, как только
-    процесс во вкладке убит, — по нему протечка была бы невидима. А имя окна сохраняет наш nonce.
+    процесс во вкладке умирает, — по нему настоящая протечка была бы, наоборот, невидима.
 
     Титул уникален (`clave-dev <nonce>`), и это принципиально: фильтровать по одному лишь
     «clave-dev» нельзя — под такую подстроку попадёт и окно пользователя, открытое в каталоге
@@ -73,8 +78,15 @@ def window_still_open(osa, title: str) -> bool:
     """
     safe = title.replace('"', '\\"')
     script = (
-        'tell application "Terminal" to return count of '
-        f'(every window whose name contains "{safe}")'
+        'tell application "Terminal"\n'
+        "  set n to 0\n"
+        f'  repeat with w in (every window whose name contains "{safe}")\n'
+        "    try\n"
+        "      if (count of tabs of w) > 0 then set n to n + 1\n"
+        "    end try\n"
+        "  end repeat\n"
+        "  return n\n"
+        "end tell"
     )
     try:
         return int(osa(script) or "0") > 0
