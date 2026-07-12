@@ -1,8 +1,20 @@
 import contextlib
 import io
+import json
 import unittest
 
 from clave_dev.emit import Emitter, format_line, no_op_emitter
+
+VISION_WITH_DETAILS = {
+    "pass": False,
+    "issues": 2,
+    "regressions": 1,
+    "failed_required": ["сценарий 0: нет обрезанных глифов — правая рамка срезана"],
+    "findings": [
+        "сценарий 0: [high] полый курсор (region=footer)",
+        "сценарий 0: [low] логотип тусклый",
+    ],
+}
 
 
 class EmitTest(unittest.TestCase):
@@ -80,6 +92,46 @@ class HumanModeTest(unittest.TestCase):
 
         self.assertEqual(err.getvalue(), "")
         self.assertFalse(hasattr(e._human, "getvalue"), "сток обязан выбрасывать, а не копить")
+
+
+class VisionDetailsTest(unittest.TestCase):
+    """Зрение блокирует прогон — человек обязан видеть, ЧТО именно забраковано.
+
+    Раньше в терминал уходили только счётчики («регрессий: 1, находок: 9»), а перечень
+    проваленных required-пунктов и находки — только в промпт агента.
+    """
+
+    def test_vision_details_reach_the_human(self):
+        human = io.StringIO()
+        Emitter(enabled=False, human_out=human).vision(VISION_WITH_DETAILS)
+
+        out = human.getvalue()
+        self.assertIn("✗ зрение — регрессий: 1, находок: 2", out)
+        self.assertIn("правая рамка срезана", out)
+        self.assertIn("[high] полый курсор", out)
+        self.assertIn("[low] логотип тусклый", out)
+
+    def test_vision_without_details_prints_as_before(self):
+        # Старый payload из трёх ключей — ровно одна строка, без пустых подзаголовков.
+        human = io.StringIO()
+        Emitter(enabled=False, human_out=human).vision({"pass": True, "issues": 0, "regressions": 0})
+        self.assertEqual(human.getvalue(), "  ✓ зрение — регрессий: 0, находок: 0\n")
+
+    def test_vision_line_stays_one_valid_json_in_protocol_mode(self):
+        # Обрамлённая строка обязана остаться ОДНОЙ строкой валидного JSON: TUI читает построчно.
+        out = io.StringIO()
+        Emitter(enabled=True, out=out).vision(VISION_WITH_DETAILS)
+
+        printed = out.getvalue().splitlines()
+        self.assertEqual(len(printed), 1)
+        prefix = "CLAVE-DEV vision "
+        self.assertTrue(printed[0].startswith(prefix))
+        payload = json.loads(printed[0][len(prefix):])
+        self.assertEqual(payload["pass"], False)
+        self.assertIsInstance(payload["issues"], int)  # тип существующих ключей менять нельзя
+        self.assertEqual(payload["regressions"], 1)
+        self.assertEqual(payload["failed_required"], VISION_WITH_DETAILS["failed_required"])
+        self.assertEqual(payload["findings"], VISION_WITH_DETAILS["findings"])
 
 
 if __name__ == "__main__":

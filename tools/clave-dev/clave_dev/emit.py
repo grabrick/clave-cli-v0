@@ -36,10 +36,15 @@ def human_line(type_: str, payload):
         return f"  {mark} {payload.get('name')}" + (f" — {detail}" if detail else "")
     if type_ == "vision":
         mark = "✓" if payload.get("pass") else "✗"
-        return (
+        lines = [
             f"  {mark} зрение — регрессий: {payload.get('regressions', 0)}, "
             f"находок: {payload.get('issues', 0)}"
-        )
+        ]
+        # Одни счётчики не объясняют, ПОЧЕМУ зрение заблокировало прогон: перечень забракованного
+        # раньше уезжал только в промпт агента. Пустые списки → строка ровно как прежде.
+        lines += [f"      ✗ чеклист: {item}" for item in payload.get("failed_required") or ()]
+        lines += [f"      • {item}" for item in payload.get("findings") or ()]
+        return "\n".join(lines)
     return None
 
 

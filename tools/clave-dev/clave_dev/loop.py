@@ -74,6 +74,41 @@ def _emit_checks(emitter, checks) -> None:
         emitter.check({"name": "python", "ok": getattr(checks, "py_ok", True), "detail": "юнит-набор clave-dev"})
 
 
+def _short(text: str, limit: int = 120) -> str:
+    """Свободный текст судьи → одна короткая строка.
+
+    Судья пишет прозой и охотно многострочно; без схлопывания перевод строки разорвал бы и
+    человеческий вывод, и одну обрамлённую строку протокола.
+    """
+    one_line = " ".join((text or "").split())
+    return one_line if len(one_line) <= limit else one_line[: limit - 1] + "…"
+
+
+def _vision_payload(verdicts, blocking) -> dict:
+    """Событие vision: счётчики ПЛЮС то, ЧТО именно забраковано.
+
+    Без перечня человек в терминале видел только «регрессий: 1, находок: 9» и не мог понять
+    причину блокировки: детали уезжали лишь в промпт агента через build_visual_context.
+    Порядок — как в вердиктах: сценарий за сценарием.
+    """
+    failed_required, findings = [], []
+    for i, v in enumerate(verdicts):
+        for c in v.checklist:
+            if c.required and not c.passed:
+                note = _short(c.note)
+                failed_required.append(f"сценарий {i}: {_short(c.check)}" + (f" — {note}" if note else ""))
+        for iss in v.issues:
+            region = f" (region={_short(iss.region_hint, 40)})" if iss.region_hint else ""
+            findings.append(f"сценарий {i}: [{iss.severity}] {_short(iss.description)}{region}")
+    return {
+        "pass": all(verdict_passes(v, blocking) for v in verdicts),
+        "issues": sum(len(v.issues) for v in verdicts),
+        "regressions": len(failed_required),
+        "failed_required": failed_required,
+        "findings": findings,
+    }
+
+
 def _emit_final(emitter, cfg, converged_flag, rounds_used, known_good_version, status) -> None:
     # Диф считаем только когда есть кому его показать (protocol-mode); иначе — лишняя работа.
     # Патч пишем ВНЕ worktree: внутри он попал бы в собственный диф (build_diff делает
@@ -175,13 +210,7 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
                     consensus_verdict(samples, keys, cfg.vision_min_hits)
                     for samples, keys in zip(fresh_samples, base)
                 ]
-                emitter.vision({
-                    "pass": all(verdict_passes(v, cfg.blocking_severities) for v in vision_verdicts),
-                    "issues": sum(len(v.issues) for v in vision_verdicts),
-                    "regressions": sum(
-                        1 for v in vision_verdicts for c in v.checklist if c.required and not c.passed
-                    ),
-                })
+                emitter.vision(_vision_payload(vision_verdicts, cfg.blocking_severities))
 
         if outcome(changed, checks, assertion_results, vision_verdicts, cfg.blocking_severities) == "converged":
             _emit_final(emitter, cfg, True, round_i, known_good_version, "converged")
