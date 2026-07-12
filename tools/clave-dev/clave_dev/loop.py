@@ -10,6 +10,7 @@ from .checks import run_checks
 from .context import build_context, build_visual_context
 from .diff import build_diff, changed_paths
 from .emit import no_op_emitter
+from .unverified import unverified
 from .observer import run_scenario
 from .visual_observer import observe_visual_all
 from .visual_verdict import (
@@ -132,8 +133,10 @@ def _emit_final(emitter, cfg, converged_flag, rounds_used, known_good_version, s
     # Диф считаем только когда есть кому его показать (protocol-mode); иначе — лишняя работа.
     # Патч пишем ВНЕ worktree: внутри он попал бы в собственный диф (build_diff делает
     # `git add -N .`, чтобы видеть новые файлы) и в changed_paths.
+    diff_text = ""
     if emitter.enabled:
-        emitter.diff(build_diff(cfg.worktree, cfg.worktree.parent / "clave-dev.patch"))
+        diff_text = build_diff(cfg.worktree, cfg.worktree.parent / "clave-dev.patch")
+        emitter.diff(diff_text)
     emitter.report({
         "converged": converged_flag,
         "status": status,
@@ -141,6 +144,9 @@ def _emit_final(emitter, cfg, converged_flag, rounds_used, known_good_version, s
         "max_rounds": cfg.max_rounds,
         "worktree": str(cfg.worktree),
         "known_good": known_good_version,
+        # Исход не имеет права ехать один: «converged: true» без этого читается как
+        # «сделано верно», а гейты этого не проверяли и не умеют. См. unverified.
+        "unverified": unverified(changed_paths(cfg.worktree), diff_text, converged_flag),
     })
 
 

@@ -4,6 +4,9 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from .diff import changed_paths
+from .unverified import unverified
+
 
 def render_report(report, repo: Path, worktree: Path) -> str:
     diff = subprocess.run(
@@ -27,6 +30,10 @@ def render_report(report, repo: Path, worktree: Path) -> str:
     ]
     for r in report.last_assertions:
         lines.append(f"- {'PASS' if r.passed else 'FAIL'} {r.name} {r.message}")
+    # Исход никогда не едет один: «сошлось» без этого блока читается как «сделано верно».
+    lines += ["", "## Не проверено машиной"]
+    for line in unverified(changed_paths(worktree), diff, report.converged):
+        lines.append(f"- {line}")
     lines += ["", "## Diff", diff if diff.strip() else "(нет изменений)"]
     lines += ["", f"worktree: {worktree}", "Ни коммита, ни установки не сделано — ревьюь и решай."]
     return "\n".join(lines)
