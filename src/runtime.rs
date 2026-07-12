@@ -214,6 +214,7 @@ pub(crate) fn run_app(app: &mut App, renderer: &mut LiveRenderer) -> AnyResult<(
         app.expire_footer_notice();
         app.refresh_command_palette_state();
         app.refresh_footer_right_state();
+        app.refresh_git_ref();
 
         let (width, full_h) = crossterm::terminal::size().unwrap_or((80, 24));
         renderer.render(app, width, full_h)?;

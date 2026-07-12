@@ -99,6 +99,10 @@ pub(crate) struct App {
     pub(crate) footer_right_text: String,
     pub(crate) footer_right_previous_text: Option<String>,
     pub(crate) footer_right_changed_at: Option<Instant>,
+    /// Постоянный индикатор футера: ветка рабочего каталога (или короткий SHA в detached
+    /// HEAD). `None` — каталог не репозиторий, индикатор не рисуется.
+    pub(crate) git_ref: Option<String>,
+    pub(crate) git_ref_checked_at: Option<Instant>,
     pub(crate) should_quit: bool,
     pub(crate) history: Vec<String>,
     pub(crate) history_index: Option<usize>,
@@ -207,6 +211,8 @@ impl App {
             footer_right_text: String::new(),
             footer_right_previous_text: None,
             footer_right_changed_at: None,
+            git_ref: None,
+            git_ref_checked_at: None,
             should_quit: false,
             history,
             history_index: None,

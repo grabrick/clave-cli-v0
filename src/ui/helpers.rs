@@ -13,6 +13,32 @@ pub(crate) fn char_display_width(ch: char) -> usize {
     UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
+/// Усечение по КОЛОНКАМ (в отличие от `truncate_chars`, который режет по символам).
+/// Результат гарантированно занимает не больше `max_cols` колонок — иначе широкая
+/// (CJK/эмодзи) строка пробила бы бюджет раскладки и упёрлась в правую границу.
+pub(crate) fn truncate_display(text: &str, max_cols: usize) -> String {
+    if display_width(text) <= max_cols {
+        return text.to_string();
+    }
+    if max_cols == 0 {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    let mut cols = 0usize;
+    for ch in text.chars() {
+        let w = char_display_width(ch);
+        // Одну колонку держим под «…».
+        if cols + w + 1 > max_cols {
+            break;
+        }
+        out.push(ch);
+        cols += w;
+    }
+    out.push('…');
+    out
+}
+
 pub(crate) fn composer_height(app: &App, width: u16) -> u16 {
     let lines = input_lines_wrapped(&app.input, width).len() as u16;
     // +2 служебные строки: верхняя полоска (со встроенной плашкой) и нижняя полоска.
