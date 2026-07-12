@@ -1,15 +1,18 @@
 # Инструменты саморазработки и самотестирования (self-dev) живут ТОЛЬКО в ветке develop
 # и в прод не едут.
 #
-# Страж держит этот инвариант на уровне CI, а не на уровне договорённости: любой MR в main,
-# который тащит их за собой, обязан упасть. Проверяется РЕЗУЛЬТИРУЮЩЕЕ дерево, а не дифф,
-# потому что инвариант звучит как «в main этого нет никогда» — независимо от того, каким
-# путём оно туда попало: merge, cherry-pick или прямой пуш. При pull_request checkout даёт
-# merge-коммит, то есть страж смотрит именно на то, каким main СТАНЕТ после слияния.
+# Проверяется РЕЗУЛЬТИРУЮЩЕЕ дерево, а не дифф, потому что инвариант звучит как «в main этого
+# нет никогда» — независимо от того, каким путём оно туда попало: merge, cherry-pick или
+# прямой пуш. При pull_request checkout даёт merge-коммит, то есть страж смотрит именно на то,
+# каким main СТАНЕТ после слияния.
 #
-# ВАЖНО: падающая проверка сама по себе слияние не запрещает. Чтобы она реально блокировала
-# merge, в Settings → Branches для main включи «Require status checks to pass» и выбери
-# проверку "no self-dev tooling in prod".
+# ВАЖНО: падающая проверка сама по себе слияние не запрещает, а на free-private репозитории
+# GitHub не даёт сделать её обязательной (branch protection и rulesets отвечают 403 «Upgrade
+# to GitHub Pro»). Поэтому запрет держит локальный .git/hooks/pre-push с той же логикой, а этот
+# страж — бэкстоп: он ловит то, что пришло мимо хука (другой клон, push --no-verify), и красит
+# main. То есть здесь обнаружение, а не предотвращение. Если репозиторий станет публичным или
+# платным — включить для main «Require status checks to pass» с проверкой
+# "no self-dev tooling in prod", и бэкстоп превратится в настоящий гейт.
 
 name: prod guard
 
@@ -27,16 +30,25 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Инструментов саморазработки в prod быть не должно
+        env:
+          # Файлы и каталоги инструмента.
+          PATHS_RE: '^(tools/clave-dev/|scripts/selfdev/|src/headless\.rs$|src/app/dev\.rs$)|clave-dev'
+          # Проводка в коде — на случай, если файлы переименуют, а связи оставят.
+          WIRING_RE: '^[[:space:]]*mod (dev|headless);|clave_dev|CLAVE_DEV'
         run: |
           set -u
 
-          # 1. Файлы и каталоги инструмента.
-          leaked_paths=$(git ls-tree -r --name-only HEAD \
-            | grep -E '^(tools/clave-dev/|scripts/selfdev/|src/headless\.rs$|src/app/dev\.rs$)|clave-dev' \
-            || true)
+          # Страж, который способен ответить только «OK», бесполезен, а сломать его тихо легко:
+          # опечатка в шаблоне — и grep просто ничего не находит, «|| true» ниже проглатывает
+          # даже ошибку разбора регулярки, проверка навсегда зелёная. Поэтому сперва прогоняем
+          # шаблоны по эталонным образцам — тем самым проверяем сам инструмент, а не дерево.
+          printf 'tools/clave-dev/clave_dev/loop.py\n' | grep -qE "$PATHS_RE" \
+            || { echo "::error::шаблон путей не ловит эталонный образец — страж сломан"; exit 1; }
+          printf 'mod dev;\n' | grep -qE "$WIRING_RE" \
+            || { echo "::error::шаблон проводки не ловит эталонный образец — страж сломан"; exit 1; }
 
-          # 2. Проводка в коде — на случай, если файлы переименуют, а связи оставят.
-          leaked_wiring=$(grep -rlE '^[[:space:]]*mod (dev|headless);|clave_dev|CLAVE_DEV' src/ || true)
+          leaked_paths=$(git ls-tree -r --name-only HEAD | grep -E "$PATHS_RE" || true)
+          leaked_wiring=$(grep -rlE "$WIRING_RE" src/ || true)
 
           if [ -n "$leaked_paths$leaked_wiring" ]; then
             echo "::error::Инструменты саморазработки просочились в prod-ветку — их место только в develop"
@@ -54,4 +66,4 @@ jobs:
             exit 1
           fi
 
-          echo "OK: инструментов саморазработки в prod-дереве нет."
+          echo "OK: шаблоны стража рабочие, инструментов саморазработки в prod-дереве нет."
