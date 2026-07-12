@@ -1,0 +1,60 @@
+# Три правила самопроверки инструмента живут ЗДЕСЬ, а не только в наборе тестов.
+#
+# Зачем дублировать. Правила вкручены в `py_ok` и краснеют на каждом раунде петли — но я же их и
+# пишу, и могу их же удалить. Локально это тихая правка: набор просто найдёт на один тест меньше
+# и промолчит. Чем длиннее сессия, тем сильнее соблазн: контекст сжимается, причины правила
+# забываются, остаётся только его цена в секундах.
+#
+# Поэтому CI зовёт правила ПОИМЁННО, а не через discover. Удалил файл правила — получил
+# «нет такого модуля» и красный прогон. Отключить правило теперь можно только осознанно, правкой
+# вот этого файла, — то есть видимой строкой в диффе, который прочтёт человек.
+#
+# Это и есть ответ на вопрос «а не отключится ли проверка сама собой». Сама — нет. Молча — нет.
+
+name: dev rules
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop]
+
+jobs:
+  three-rules:
+    name: три правила
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # pyte — чистый Python и ставится где угодно. Без него тесты наблюдателя ПРОПУСКАЮТСЯ, а
+      # пропущенный тест не доказывает ничего: правило 3 честно объявит observer.py непроверенным.
+      # Ставим зависимость, чтобы ни один модуль не получил освобождение по недосмотру среды.
+      - run: pip install pyte
+
+      - name: Правила названы поимённо — удалить их молча нельзя
+        working-directory: tools/clave-dev
+        run: |
+          python -m unittest -v \
+            tests.test_gates_can_fail \
+            tests.test_unverified \
+            tests.test_no_dead_modules
+
+      - name: Весь набор clave-dev
+        working-directory: tools/clave-dev
+        run: python -m unittest discover -s tests -v
+
+  product:
+    name: продукт собирается и зелёный
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test

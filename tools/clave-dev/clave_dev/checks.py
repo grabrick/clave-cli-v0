@@ -15,6 +15,14 @@ ChecksResult = namedtuple(
 
 _TEST_RESULT = re.compile(r"test result:\s*\w+\.\s*\d+ passed;\s*(\d+) failed")
 
+# Правила самопроверки инструмента. Перечислены ПОИМЁННО, и это принципиально: удалить
+# правило через discover можно молча, а по имени — только с ModuleNotFoundError.
+RULE_TESTS = (
+    "tests.test_gates_can_fail",   # гейт обязан уметь провалиться
+    "tests.test_unverified",       # «сошлось» не едет в одиночку
+    "tests.test_no_dead_modules",  # ни один модуль не освобождён от тестов
+)
+
 
 def parse_test_failures(output: str) -> int:
     """Сумма 'N failed' по всем строкам 'test result:' (или 0, если ни одной нет)."""
@@ -62,8 +70,16 @@ def run_checks(worktree: Path, env: dict, profile: str) -> ChecksResult:
     py_ok = True
     pkg = python_suite_dir(worktree)
     if pkg is not None:
+        # Правила самопроверки зовём ПОИМЁННО, отдельно от discover. Иначе удалить правило можно
+        # тихо: discover просто найдёт на один тест меньше и промолчит — проверено, 135 вместо 137
+        # и зелёный результат. По имени удалённое правило даёт ModuleNotFoundError, то есть красный.
+        rules = _run(
+            worktree, env,
+            [sys.executable, "-m", "unittest", *RULE_TESTS],
+            cwd=pkg,
+        )
         py = _run(worktree, env, [sys.executable, "-m", "unittest", "discover", "-s", "tests"], cwd=pkg)
-        raw["python"] = py.stdout + py.stderr
-        py_ok = py.returncode == 0
+        raw["python"] = rules.stdout + rules.stderr + py.stdout + py.stderr
+        py_ok = rules.returncode == 0 and py.returncode == 0
 
     return ChecksResult(True, test_failures, clippy_ok, fmt_ok, raw, py_ok)
