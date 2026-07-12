@@ -75,7 +75,8 @@ def main() -> int:
     while time.time() < deadline:
         pump(2.0)
         seen = grid()
-        if "завершил" in seen or "finished with exit code" in seen or "остановлен" in seen:
+        # Терминальные сообщения теперь человеческие (сырой код выхода в ленту не льём).
+        if "Самопиление" in seen or "Self-dev" in seen or "остановлен" in seen:
             break
     pump(1.0)
     final = grid()
