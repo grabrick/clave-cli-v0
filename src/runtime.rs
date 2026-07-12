@@ -9,6 +9,12 @@ pub(crate) fn main_entry() -> AnyResult<()> {
         return Ok(());
     }
 
+    // Идентификация бинаря (clave-dev снимает её как known-good: первая строка `--version`).
+    if args.iter().any(|arg| arg == "-V" || arg == "--version") {
+        println!("{APP_COMMAND} v{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // Неинтерактивный запуск агента (для внешнего супервайзера clave-dev).
     if args.first().map(String::as_str) == Some("--run") {
         return crate::headless::run_headless(&args[1..]);
