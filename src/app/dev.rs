@@ -123,6 +123,7 @@ impl App {
 
         let (cancel_tx, cancel_rx) = mpsc::channel();
         self.running = true;
+        self.dev_run = true;
         self.run_started_at = Some(Instant::now());
         self.last_run_duration = None;
         self.run_label = "clave-dev".to_string();

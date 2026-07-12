@@ -23,6 +23,70 @@ pub(crate) enum ChatRunResult {
     Cancelled,
 }
 
+/// Человеческий финал прогона вместо машинного «Clave завершился с кодом N» — сырой код
+/// в ленте читается как падение, даже когда всё хорошо.
+///
+/// Для `/dev` код выхода — это ИСХОД, а не поломка: 0 — сошлось, 1 — не сошлось (агент не
+/// внёс правок либо не довели до зелёного), 2 — рабочее дерево не чистое. Единицу нельзя
+/// звать «ошибкой»: ошибки не было.
+///
+/// Возвращает (статус для футера, строку в ленту).
+pub(crate) fn run_finish_lines(dev: bool, code: i32, lang: Language) -> (String, String) {
+    if dev {
+        return match code {
+            0 => (
+                lang.choose("готово", "done").to_string(),
+                lang.choose(
+                    "⏺ Самопиление завершено: правки лежат в отдельном worktree и ждут ревью.",
+                    "⏺ Self-dev finished: changes are in a separate worktree, awaiting review.",
+                )
+                .to_string(),
+            ),
+            1 => (
+                lang.choose("не сошлось", "not converged").to_string(),
+                lang.choose(
+                    "⏺ Самопиление завершено: до зелёного не довели — смотри отчёт выше.",
+                    "⏺ Self-dev finished: did not converge — see the report above.",
+                )
+                .to_string(),
+            ),
+            2 => (
+                lang.choose("не запущено", "not started").to_string(),
+                lang.choose(
+                    "✗ Самопиление не запустилось: рабочее дерево не чистое — закоммить или спрячь правки.",
+                    "✗ Self-dev did not start: the working tree is dirty — commit or stash first.",
+                )
+                .to_string(),
+            ),
+            _ => (
+                lang.choose("сбой", "failed").to_string(),
+                format!(
+                    "{} {code}.",
+                    lang.choose(
+                        "✗ Самопиление: сбой супервайзера, код",
+                        "✗ Self-dev: supervisor failure, exit code"
+                    )
+                ),
+            ),
+        };
+    }
+
+    if code == 0 {
+        (
+            lang.choose("готово", "completed").to_string(),
+            lang.choose("⏺ Готово.", "⏺ Done.").to_string(),
+        )
+    } else {
+        (
+            format!("{}:{code}", lang.choose("ошибка", "failed")),
+            format!(
+                "{} {code}.",
+                lang.choose("✗ Завершилось с ошибкой, код", "✗ Failed with exit code")
+            ),
+        )
+    }
+}
+
 /// Плавная «печатная машинка» для ответа: целиком готовый текст вскрывается
 /// по символам со временем, пока полностью не уйдёт в историю.
 pub(crate) struct Reveal {
@@ -173,17 +237,11 @@ impl App {
                     self.run_label.clear();
                     self.run_token_estimate = None;
                     self.cancel_tx = None;
-                    self.status = if code == 0 {
-                        self.lang.choose("готово", "completed").to_string()
-                    } else {
-                        format!("{}:{code}", self.lang.choose("ошибка", "failed"))
-                    };
+                    let (status, message) = run_finish_lines(self.dev_run, code, self.lang);
+                    self.dev_run = false;
+                    self.status = status;
                     self.flush_reveal_buffer();
-                    self.push_system(format!(
-                        "{} {code}.",
-                        self.lang
-                            .choose("Clave завершился с кодом", "Clave finished with exit code")
-                    ));
+                    self.push_system(message);
                     self.process_pending_messages();
                 }
                 WorkerEvent::ChatDone(provider, code, usage) => {
@@ -390,6 +448,43 @@ mod tests {
         assert_eq!(later, 150);
         // Дольше длины текста расти нельзя — переполнения нет.
         assert_eq!(reveal_chars_for(10_000, total), total);
+    }
+
+    #[test]
+    fn dev_exit_code_is_an_outcome_not_an_error() {
+        // /dev: 1 = «не сошлось» (агент не внёс правок). Это ИСХОД. Раньше футер писал
+        // «ошибка:1», а в ленту падало «Clave завершился с кодом 1» — читалось как падение.
+        let (status, message) = run_finish_lines(true, 1, Language::Ru);
+        assert!(
+            !status.contains("ошибка"),
+            "не сошлось — это не ошибка: {status}"
+        );
+        assert!(
+            !message.contains("кодом"),
+            "в ленте не должно быть сырого кода: {message}"
+        );
+        assert!(message.contains("не сошлось") || message.contains("не довели"));
+
+        let (status, _) = run_finish_lines(true, 0, Language::Ru);
+        assert_eq!(status, "готово");
+
+        let (_, message) = run_finish_lines(true, 2, Language::Ru);
+        assert!(
+            message.contains("дерево"),
+            "код 2 — грязное дерево: {message}"
+        );
+    }
+
+    #[test]
+    fn plain_run_finish_is_human_and_keeps_the_code_only_on_failure() {
+        let (_, ok) = run_finish_lines(false, 0, Language::Ru);
+        assert_eq!(ok, "⏺ Готово.");
+        let (status, bad) = run_finish_lines(false, 7, Language::Ru);
+        assert!(status.contains("ошибка"));
+        assert!(
+            bad.contains('7'),
+            "код сбоя всё же показываем для диагностики: {bad}"
+        );
     }
 
     #[test]

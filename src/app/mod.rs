@@ -90,6 +90,10 @@ pub(crate) struct App {
     pub(crate) last_run: Option<String>,
     pub(crate) last_run_duration: Option<Duration>,
     pub(crate) running: bool,
+    /// Текущий прогон — самопиление (`/dev`). У него СВОЯ семантика кода выхода
+    /// (0 сошлось, 1 не сошлось, 2 дерево не чистое), поэтому финал рендерится иначе:
+    /// «не сошлось» — это исход, а не поломка, и ошибкой его звать нельзя.
+    pub(crate) dev_run: bool,
     pub(crate) run_started_at: Option<Instant>,
     pub(crate) run_label: String,
     pub(crate) run_token_estimate: Option<usize>,
@@ -198,6 +202,7 @@ impl App {
             last_run,
             last_run_duration: None,
             running: false,
+            dev_run: false,
             run_started_at: None,
             run_label: String::new(),
             run_token_estimate: None,

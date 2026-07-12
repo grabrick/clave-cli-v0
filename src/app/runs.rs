@@ -83,6 +83,7 @@ impl App {
         let (cancel_tx, cancel_rx) = mpsc::channel();
 
         self.running = true;
+        self.dev_run = false;
         self.run_started_at = Some(Instant::now());
         self.last_run_duration = None;
         self.run_label = provider_name.to_string();
@@ -199,6 +200,7 @@ impl App {
         self.set_chat_title_from_prompt_if_needed(&task);
 
         self.running = true;
+        self.dev_run = false;
         self.run_started_at = Some(Instant::now());
         self.last_run_duration = None;
         self.run_label = ENGINE_NAME.to_string();

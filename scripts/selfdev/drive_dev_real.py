@@ -97,7 +97,7 @@ def main() -> int:
         "progress-строки супервайзера": "раунд" in final,
         "no-op честно распознан": "не внёс изменений" in final or "no_changes" in final,
         "НЕ ложная сходимость": '"converged": true' not in final,
-        "завершение": "завершил" in final,
+        "человеческий финал (без сырого кода)": ("Самопиление завершено" in final and "кодом" not in final),
     }
     print("=== CHECKS ===")
     ok = True
