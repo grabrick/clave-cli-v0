@@ -39,6 +39,44 @@ def settings_set_exists(name: str) -> bool:
     return name in out
 
 
+def _term_prop(target: str, prop: str) -> str:
+    import subprocess
+
+    out = subprocess.run(
+        ["osascript", "-e", f'tell application "Terminal" to return ({prop} of {target}) as text'],
+        capture_output=True,
+        text=True,
+    )
+    return out.stdout.strip()
+
+
+def observer_profile_mismatch(name: str, get_prop=None):
+    """Расхождение профиля НАБЛЮДАТЕЛЯ с рабочим профилем пользователя (None — совпадают).
+
+    Это не косметика. Класс багов, ради которого построено зрение (срез у правой стенки,
+    обрезанные глифы), зависит от ШРИФТА и ширин глифов. Если окно наблюдателя выглядит
+    иначе, чем окно пользователя, зрение судит рендер, которого пользователь никогда не
+    видит — то есть молча подменяет предмет проверки. Профиль наблюдателя обязан быть
+    копией рабочего, отличаясь ровно одним: «при выходе из shell — закрыть окно»."""
+    prop = get_prop or _term_prop
+    default_name = prop("default settings", "name")
+    if not default_name or default_name == name:
+        return None
+    diffs = [
+        p
+        for p in ("background color", "font name")
+        if (a := prop("default settings", p)) and (b := prop(f'settings set "{name}"', p)) and a != b
+    ]
+    if not diffs:
+        return None
+    return (
+        f"профиль наблюдателя «{name}» не совпадает с твоим рабочим «{default_name}» "
+        f"({', '.join(diffs)}). Зрение будет судить рендер, которого ты не видишь, — "
+        f"а ловимые баги зависят от шрифта. Сделай «{name}» копией «{default_name}», "
+        "поменяв только «при выходе из shell — закрыть окно», и перезапусти Terminal"
+    )
+
+
 def describe(p: TerminalProfile) -> dict:
     """Плоский dict для лога/отчёта — атрибуция любого визуального вывода к среде."""
     return dict(p._asdict())

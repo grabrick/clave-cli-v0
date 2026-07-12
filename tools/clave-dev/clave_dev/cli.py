@@ -12,7 +12,7 @@ from .emit import Emitter
 from .loop import RunConfig, run_loop
 from .observer import Scenario
 from .report import render_report
-from .terminal_profile import default_profile, describe
+from .terminal_profile import default_profile, describe, observer_profile_mismatch
 from .vision import vision_preflight
 from .vision_claude import select_vision
 from .visual_verdict import severities_at_or_above
@@ -94,6 +94,10 @@ def main(argv=None) -> int:
             "не трогай в этот момент клавиатуру и мышь.",
             file=sys.stderr,
         )
+        # Предупреждение, а не блок: прогон осмысленный, но вердикт будет о ЧУЖОМ рендере.
+        mismatch = observer_profile_mismatch(args.terminal_profile or default_profile().theme)
+        if mismatch:
+            print(f"clave-dev: ⚠ {mismatch}", file=sys.stderr)
     else:
         print("clave-dev: зрение выключено — текстовое наблюдение", file=sys.stderr)
 
