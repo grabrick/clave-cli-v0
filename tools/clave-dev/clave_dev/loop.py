@@ -29,11 +29,11 @@ RunConfig = namedtuple(
     "RunConfig",
     "known_good worktree repo env profile task effort rounds max_rounds scenarios "
     "vision blocking_severities terminal_profile baseline vision_samples vision_min_hits "
-    "mutants",
+    "mutants base_sha",
     # blocking_severities пуст по умолчанию: мнения судьи — свободный текст, их нельзя ни
     # вычесть по базовой линии, ни набрать консенсусом, значит гейт по ним абсолютный —
     # тот самый, из-за которого петля не сходилась никогда. См. verdict_passes.
-    defaults=(None, (), None, None, 3, 2, True),
+    defaults=(None, (), None, None, 3, 2, True, None),
 )
 RunReport = namedtuple(
     "RunReport",
@@ -147,7 +147,9 @@ def _emit_final(emitter, cfg, converged_flag, rounds_used, known_good_version, s
     # `git add -N .`, чтобы видеть новые файлы) и в changed_paths.
     diff_text = ""
     if emitter.enabled:
-        diff_text = build_diff(cfg.worktree, cfg.worktree.parent / "clave-dev.patch")
+        diff_text = build_diff(
+            cfg.worktree, cfg.worktree.parent / "clave-dev.patch", base_sha=cfg.base_sha
+        )
         emitter.diff(diff_text)
     emitter.report({
         "converged": converged_flag,
@@ -158,7 +160,9 @@ def _emit_final(emitter, cfg, converged_flag, rounds_used, known_good_version, s
         "known_good": known_good_version,
         # Исход не имеет права ехать один: «converged: true» без этого читается как
         # «сделано верно», а гейты этого не проверяли и не умеют. См. unverified.
-        "unverified": unverified(changed_paths(cfg.worktree), diff_text, converged_flag),
+        "unverified": unverified(
+            changed_paths(cfg.worktree, cfg.base_sha), diff_text, converged_flag
+        ),
     })
 
 
@@ -210,7 +214,7 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
         # Агент не тронул код → проверки гонять незачем (проверять нечего) и объявлять
         # сходимость нельзя (см. `outcome`). Честно останавливаемся: ответ агента уже
         # ушёл наружу стримом — для аналитических задач он и есть результат.
-        changed = changed_paths(cfg.worktree)
+        changed = changed_paths(cfg.worktree, cfg.base_sha)
         if not changed:
             emitter.progress(
                 "агент не внёс изменений в код — это no-op, а не сходимость. "
@@ -244,7 +248,7 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
                     "проверки зелёные — мутационный гейт: умеют ли тесты агента падать"
                 )
                 patch = cfg.worktree.parent / "clave-dev.patch"
-                diff_text = build_diff(cfg.worktree, patch)
+                diff_text = build_diff(cfg.worktree, patch, base_sha=cfg.base_sha)
                 res = subprocess.run(
                     mutants_cmd(patch), cwd=str(cfg.worktree), env=cfg.env,
                     capture_output=True, text=True, check=False,

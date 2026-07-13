@@ -8,10 +8,11 @@ from .diff import changed_paths
 from .unverified import unverified
 
 
-def render_report(report, repo: Path, worktree: Path) -> str:
-    diff = subprocess.run(
-        ["git", "-C", str(worktree), "diff"], capture_output=True, text=True
-    ).stdout
+def render_report(report, repo: Path, worktree: Path, base_sha: str = None) -> str:
+    # Дифф ОТ БАЗЫ: агент имеет право коммитить, и тогда `git diff` без базы показал бы пустоту
+    # под отчётом о проделанной работе.
+    against = ["git", "-C", str(worktree), "diff"] + ([base_sha] if base_sha else [])
+    diff = subprocess.run(against, capture_output=True, text=True).stdout
     status_ru = {
         "converged": "сошлось (агент внёс правки, всё зелёное)",
         "no_changes": "АГЕНТ НЕ ВНЁС ИЗМЕНЕНИЙ — это не успех, а no-op "
@@ -32,7 +33,7 @@ def render_report(report, repo: Path, worktree: Path) -> str:
         lines.append(f"- {'PASS' if r.passed else 'FAIL'} {r.name} {r.message}")
     # Исход никогда не едет один: «сошлось» без этого блока читается как «сделано верно».
     lines += ["", "## Не проверено машиной"]
-    for line in unverified(changed_paths(worktree), diff, report.converged):
+    for line in unverified(changed_paths(worktree, base_sha), diff, report.converged):
         lines.append(f"- {line}")
     lines += ["", "## Diff", diff if diff.strip() else "(нет изменений)"]
     lines += ["", f"worktree: {worktree}", "Ни коммита, ни установки не сделано — ревьюь и решай."]

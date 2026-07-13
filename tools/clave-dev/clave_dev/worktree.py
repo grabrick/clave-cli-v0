@@ -33,6 +33,16 @@ def create_run_worktree(repo: Path, base_ref: str, tmp_dir: Path) -> Path:
     return path
 
 
+def base_sha(worktree: Path) -> str:
+    """Коммит, на котором worktree создан. От него и меряется работа агента.
+
+    Мерить от индекса нельзя: агент имеет право коммитить (и коммитит — критик тандема сам ему
+    это советует, чтобы дифф сошёлся с деревом для cargo mutants). После коммита рабочее дерево
+    чистое, и «изменений нет» прочиталось бы как «агент ничего не сделал».
+    """
+    return _git(worktree, "rev-parse", "HEAD").stdout.strip()
+
+
 def remove_run_worktree(repo: Path, worktree: Path) -> None:
     _git(repo, "worktree", "remove", "--force", str(worktree))
     _git(repo, "worktree", "prune")

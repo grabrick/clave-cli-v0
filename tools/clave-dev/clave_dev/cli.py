@@ -18,7 +18,7 @@ from .user_config import config_mode, seed_config, single_model_warning, user_co
 from .vision import vision_preflight
 from .vision_claude import select_vision
 from .visual_verdict import BaselineUnavailableError, severities_at_or_above
-from .worktree import DirtyTreeError, assert_clean, create_run_worktree
+from .worktree import DirtyTreeError, assert_clean, base_sha, create_run_worktree
 
 _ASSERT_FACTORIES = {"visible": visible, "not_visible": not_visible, "line_matches": line_matches}
 
@@ -80,6 +80,9 @@ def main(argv=None) -> int:
 
     tmp = Path(tempfile.mkdtemp(prefix="clave-dev-"))
     worktree = create_run_worktree(repo, "HEAD", tmp)
+    # От этого коммита и меряется работа агента: он имеет право коммитить, и тогда
+    # `git status` показал бы чистое дерево, а петля — «ничего не сделано».
+    run_base = base_sha(worktree)
 
     known = snapshot_known_good(args.known_good, tmp)
     real_config = user_config_path()  # читаем ДО того, как подменим CLAVE_HOME
@@ -184,6 +187,7 @@ def main(argv=None) -> int:
         vision_samples=args.vision_samples,
         vision_min_hits=args.vision_min_hits,
         mutants=args.mutants,
+        base_sha=run_base,
     )
     emitter = Emitter(enabled=(args.protocol == "clave-dev"))
     try:
@@ -196,7 +200,7 @@ def main(argv=None) -> int:
         return 2
     # В protocol-mode stdout только обрамлён (§5) — человеческий отчёт не печатаем.
     if args.protocol != "clave-dev":
-        print(render_report(report, repo, worktree))
+        print(render_report(report, repo, worktree, run_base))
     # worktree с дифом сознательно НЕ удаляется — нужен человеку для ревью (спека §7).
     return 0 if report.converged else 1
 

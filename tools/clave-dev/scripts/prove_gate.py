@@ -66,7 +66,7 @@ NEUTERED = {
     # «Падений тестов нет» — всегда.
     "clave_dev.checks:parse_test_failures": lambda output: 0,
     # «Агент что-то изменил» — всегда (тогда no-op снова читается как сходимость).
-    "clave_dev.diff:changed_paths": lambda worktree: ["src/подменено.rs"],
+    "clave_dev.diff:changed_paths": lambda worktree, base_sha=None: ["src/подменено.rs"],
     # «Тесты агента всё доказывают» — всегда. Обезвредь — и тест-декорация снова пройдёт.
     "clave_dev.mutation:unproven": lambda diff_text, mutants_output: [],
 }
