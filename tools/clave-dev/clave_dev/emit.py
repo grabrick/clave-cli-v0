@@ -33,7 +33,13 @@ def human_line(type_: str, payload):
     if type_ == "check":
         mark = "✓" if payload.get("ok") else "✗"
         detail = payload.get("detail")
-        return f"  {mark} {payload.get('name')}" + (f" — {detail}" if detail else "")
+        head = f"  {mark} {payload.get('name')}" + (f" — {detail}" if detail else "")
+        # Счётчик не объясняет провала. Раньше «✗ test — 1 failed» было всё, что видел человек.
+        lines = [head] + [f"      · {f}" for f in payload.get("failures") or ()]
+        hidden = payload.get("failures_truncated")
+        if hidden:
+            lines.append(f"      · … и ещё {hidden}")
+        return "\n".join(lines)
     if type_ == "vision":
         mark = "✓" if payload.get("pass") else "✗"
         lines = [

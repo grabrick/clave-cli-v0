@@ -11,6 +11,7 @@ from .checks import run_checks
 from .context import build_context, build_mutation_context, build_visual_context
 from .diff import build_diff, changed_paths, diff_text
 from .emit import no_op_emitter
+from .failures import failure_payload
 from .mutation import describe as describe_mutants
 from .mutation import mutants_cmd, unproven
 from .unverified import unverified
@@ -98,12 +99,26 @@ def outcome(
 
 
 def _emit_checks(emitter, checks) -> None:
-    emitter.check({"name": "build", "ok": checks.build_ok})
+    """Проваленная проверка обязана сказать, ЧТО упало.
+
+    Раньше наружу уходил только счётчик («✗ test — 1 failed»), а имена упавших тестов и текст
+    ошибок видел ТОЛЬКО агент, через build_context. Человек в терминале лез читать worktree руками
+    (я и лез). Гейт, который говорит «нет» без объяснения, рано или поздно отключают.
+    """
+    def emit(name, ok, detail=None):
+        payload = {"name": name, "ok": ok}
+        if detail:
+            payload["detail"] = detail
+        if not ok:
+            payload.update(failure_payload(name, (checks.raw or {}).get(name, "")))
+        emitter.check(payload)
+
+    emit("build", checks.build_ok)
     if checks.build_ok:
-        emitter.check({"name": "test", "ok": checks.test_failures == 0, "detail": f"{checks.test_failures} failed"})
-        emitter.check({"name": "clippy", "ok": checks.clippy_ok})
-        emitter.check({"name": "fmt", "ok": checks.fmt_ok})
-        emitter.check({"name": "python", "ok": getattr(checks, "py_ok", True), "detail": "юнит-набор clave-dev"})
+        emit("test", checks.test_failures == 0, f"{checks.test_failures} failed")
+        emit("clippy", checks.clippy_ok)
+        emit("fmt", checks.fmt_ok)
+        emit("python", getattr(checks, "py_ok", True), "юнит-набор clave-dev")
 
 
 def _short(text: str, limit: int = 120) -> str:
