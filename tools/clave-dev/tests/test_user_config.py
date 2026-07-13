@@ -67,3 +67,62 @@ class UserConfigTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CostWarningTest(unittest.TestCase):
+    """Инструмент обязан назвать свою цену ДО того, как человек начнёт ждать.
+
+    Дефект был не в том, что прогон долгий, а в том, что он МОЛЧАЛ о длительности: «раунд 1: агент
+    правит код» на неподвижном экране не говорит, отойти за кофе или на полдня. Замерено: тандем с
+    rounds=2 и effort=high спорил около двух часов над задачей в 50 строк.
+    """
+
+    def test_a_generous_tandem_says_so_up_front(self):
+        from clave_dev.user_config import cost_warning
+
+        warn = cost_warning("2", "high")
+
+        self.assertIsNotNone(warn)
+        self.assertIn("дебатов: 2", warn)
+        self.assertIn("--rounds 1", warn, "предупреждение обязано сказать, ЧТО делать, а не только пугать")
+
+    def test_a_cheap_run_stays_quiet(self):
+        # Предупреждение, которое горит всегда, перестают читать — и отключают.
+        from clave_dev.user_config import cost_warning
+
+        self.assertIsNone(cost_warning("1", "medium"))
+        self.assertIsNone(cost_warning(None, None))
+
+    def test_high_effort_alone_is_enough_to_warn(self):
+        from clave_dev.user_config import cost_warning
+
+        self.assertIsNotNone(cost_warning("1", "max"))
+
+    def test_a_broken_config_value_does_not_crash_the_run(self):
+        # Конфиг пишет человек. Мусор в нём — не повод ронять прогон ДО его начала.
+        from clave_dev.user_config import cost_warning
+
+        self.assertIsNone(cost_warning("не-число", None))
+
+
+class ConfigValueTest(unittest.TestCase):
+    def test_it_reads_any_key(self):
+        import tempfile
+        from pathlib import Path
+
+        from clave_dev.user_config import config_value
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config"
+            cfg.write_text('mode="claude-codex"\nrounds=2\neffort="high"\n')
+
+            self.assertEqual(config_value(cfg, "rounds"), "2")
+            self.assertEqual(config_value(cfg, "effort"), "high")
+            self.assertIsNone(config_value(cfg, "нет-такого"))
+
+    def test_a_missing_file_is_not_a_crash(self):
+        from pathlib import Path
+
+        from clave_dev.user_config import config_value
+
+        self.assertIsNone(config_value(Path("/нет/такого/конфига"), "rounds"))

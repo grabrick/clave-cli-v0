@@ -174,6 +174,43 @@ class DiffLineMatchesRealBuildDiffTest(unittest.TestCase):
         self.assertEqual(human_lines("diff", {"changed_files": [], "stat": ""}), ["  ± правок нет"])
 
 
+class StagesCarryTheClockTest(unittest.TestCase):
+    """Стадия без времени не говорит, ждать пять минут или два часа.
+
+    Тандем с rounds=2 и effort=high законно крутит два полных цикла «исполнитель → критик» —
+    замерено, около двух часов на задаче в 50 строк. Дефект не в длительности, а в молчании о ней:
+    человек смотрел на неподвижное «раунд 1: агент правит код» и не мог понять, жив ли прогон.
+
+    Часы инъекцией: тест не имеет права зависеть от настоящего времени — иначе он сам станет тем,
+    что я весь день чиню.
+    """
+
+    def _emitter(self, ticks):
+        human = io.StringIO()
+        clock = iter(ticks).__next__
+        return Emitter(enabled=False, human_out=human, clock=clock), human
+
+    def test_a_stage_says_how_long_the_run_has_been_going(self):
+        e, human = self._emitter([0.0, 125.0])  # старт, затем 2:05
+        e.progress("раунд 1/3: агент правит код")
+
+        self.assertEqual(human.getvalue().strip(), "[2:05] · раунд 1/3: агент правит код")
+
+    def test_gates_stay_clean(self):
+        # Гейты идут пачкой сразу за стадией — часы на каждой строке были бы шумом.
+        e, human = self._emitter([0.0, 7.0])
+        e.check({"name": "build", "ok": True})
+
+        self.assertEqual(human.getvalue().strip(), "✓ build")
+
+    def test_the_protocol_line_is_untouched(self):
+        # TUI ведёт свой таймер; в обрамлённую строку часы лезть не должны.
+        out = io.StringIO()
+        Emitter(enabled=True, out=out, clock=iter([0.0, 99.0]).__next__).progress("раунд 1")
+
+        self.assertEqual(out.getvalue().strip(), "CLAVE-DEV progress раунд 1")
+
+
 class VisionDetailsTest(unittest.TestCase):
     """Зрение блокирует прогон — человек обязан видеть, ЧТО именно забраковано.
 

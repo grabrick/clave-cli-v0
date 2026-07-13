@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 import sys
 
 EMIT_TYPES = ("progress", "log", "check", "vision", "diff", "report", "error")
@@ -113,10 +114,25 @@ class Emitter:
     содержать ТОЛЬКО обрамлённые строки (§5).
     """
 
-    def __init__(self, enabled: bool, out=None, human_out=None):
+    def __init__(self, enabled: bool, out=None, human_out=None, clock=None):
         self.enabled = enabled
         self._out = out if out is not None else sys.stdout
         self._human = human_out if human_out is not None else sys.stderr
+        # Часы инъекцией: тест не должен зависеть от настоящего времени, а прогон — печатать
+        # стенные часы, которые в логе ничего не значат.
+        self._clock = clock or time.monotonic
+        self._t0 = self._clock()
+
+    def _elapsed(self) -> str:
+        """Сколько идёт прогон. Стадия без времени не говорит, ждать пять минут или два часа.
+
+        Дефект был не в том, что прогон долгий, а в том, что он МОЛЧИТ о своей цене: человек видит
+        «раунд 1: агент правит код» и не знает, отойти ему за кофе или на два часа. Тандем с
+        `rounds=2` и `effort=high` крутит два полных цикла «исполнитель → критик», и это законно
+        занимает десятки минут — но узнавать об этом, глядя в неподвижный экран, нельзя.
+        """
+        total = int(self._clock() - self._t0)
+        return f"[{total // 60:d}:{total % 60:02d}]"
 
     # В терминале финальный отчёт печатает render_report (в stdout), а дифф — это патч целиком,
     # ему место в файле. Эмиттер их пропускает, иначе человек увидит отчёт дважды. В protocol-mode
@@ -129,9 +145,14 @@ class Emitter:
             return
         if type_ in self.HUMAN_PRINTS_ITSELF:
             return
-        line = human_line(type_, payload)
-        if line is not None:
-            print(line, file=self._human, flush=True)
+        lines = human_lines(type_, payload)
+        if not lines:
+            return
+        # Стадии помечаем временем от старта. Гейты (check/vision) — нет: они идут пачкой сразу
+        # после стадии, и часы на каждой строке превратились бы в шум.
+        if type_ == "progress":
+            lines[0] = f"{self._elapsed()} {lines[0]}"
+        print("\n".join(lines), file=self._human, flush=True)
 
     def progress(self, text):
         self.emit("progress", text)

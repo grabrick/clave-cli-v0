@@ -54,17 +54,45 @@ def seed_config(src: Path, dest_dir: Path) -> Optional[Path]:
     return dest
 
 
-def config_mode(path: Path) -> Optional[str]:
-    """Значение `mode` из конфига (None — ключа нет или файл не читается)."""
+def config_value(path: Path, name: str) -> Optional[str]:
+    """Значение ключа из конфига продукта (None — ключа нет или файл не читается)."""
     try:
         lines = Path(path).read_text().splitlines()
     except OSError:
         return None
     for line in lines:
         key, _, value = line.partition("=")
-        if key.strip() == "mode":
+        if key.strip() == name:
             return value.strip().strip('"') or None
     return None
+
+
+def config_mode(path: Path) -> Optional[str]:
+    """Значение `mode` из конфига (None — ключа нет или файл не читается)."""
+    return config_value(path, "mode")
+
+
+def cost_warning(rounds: Optional[str], effort: Optional[str]) -> Optional[str]:
+    """Во что человек ввязывается, ЕЩЁ ДО того как ждать.
+
+    Прогон тандема законно идёт десятками минут: `rounds=2` — это ДВА полных цикла
+    «исполнитель → критик», каждый на своём effort. Замерено: на задаче в 50 строк тандем спорил
+    около двух часов.
+
+    Дефект был не в длительности, а в молчании о ней. Человек видел «раунд 1: агент правит код» на
+    неподвижном экране и не мог понять, отойти ему за кофе или на полдня. Инструмент обязан назвать
+    свою цену заранее — как называет всё остальное, чего он не проверял.
+    """
+    debate = int(rounds) if rounds and rounds.isdigit() else 1
+    if debate <= 1 and effort in (None, "low", "medium"):
+        return None
+    parts = [f"дебатов: {debate}"]
+    if effort:
+        parts.append(f"effort: {effort}")
+    return (
+        f"тандем настроен щедро ({', '.join(parts)}) — прогон легко займёт десятки минут, а то и "
+        "часы. Дешевле: --rounds 1 --effort medium"
+    )
 
 
 def single_model_warning(mode: Optional[str]) -> Optional[str]:

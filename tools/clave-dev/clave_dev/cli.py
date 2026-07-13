@@ -14,7 +14,14 @@ from .mutation import mutation_preflight
 from .observer import Scenario
 from .report import render_report
 from .terminal_profile import default_profile, describe, observer_profile_mismatch
-from .user_config import config_mode, seed_config, single_model_warning, user_config_path
+from .user_config import (
+    config_mode,
+    config_value,
+    cost_warning,
+    seed_config,
+    single_model_warning,
+    user_config_path,
+)
 from .vision import vision_preflight
 from .vision_claude import select_vision
 from .visual_verdict import BaselineUnavailableError, severities_at_or_above
@@ -106,6 +113,16 @@ def main(argv=None) -> int:
         warn = single_model_warning(mode)
         if warn:
             print(f"clave-dev: ⚠ {warn}", file=sys.stderr)
+
+        # Цену прогона называем ДО старта, а не после двух часов молчаливого экрана. `rounds` и
+        # `effort` берутся из конфига продукта, если не заданы флагом, — человек может о них и не
+        # помнить, а платить временем будет он.
+        cost = cost_warning(
+            str(args.rounds) if args.rounds else config_value(seeded, "rounds"),
+            args.effort or config_value(seeded, "effort"),
+        )
+        if cost:
+            print(f"clave-dev: ⚠ {cost}", file=sys.stderr)
     else:
         print(
             f"clave-dev: ⚠ конфига продукта нет ({real_config}) — агент побежит на ДЕФОЛТАХ, "
