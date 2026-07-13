@@ -84,6 +84,49 @@ class WorkflowStillCallsTheRulesTest(unittest.TestCase):
         self.assertEqual(set(RULE_TESTS), set(RULE_MODULES))
 
 
+class ReleaseCannotShipSelfDevTest(unittest.TestCase):
+    """Тег — ВТОРОЙ путь в прод, и он обходил стража стороной.
+
+    `release.yml` (автоген cargo-dist) срабатывает на `push: tags: <версия>` с ЛЮБОЙ ветки, а
+    `prod-guard.yml` сторожит только main. Значит `git tag v0.2.0` на коммите develop собрал бы и
+    ОПУБЛИКОВАЛ релиз из дерева с инструментами: пользователи, ставящие clave через `curl | sh`,
+    получили бы бинарь со спрятанным входом `--run tandem` — весь пульт самопиления.
+
+    Три релиза уже опубликованы, так что путь не теоретический. (Проверено: в их деревьях
+    инструментов нет — утечки не было.)
+
+    release.yml АВТОГЕНЕРИРУЕТСЯ. Регенерация молча выбросит стража, если он не прописан в
+    dist-workspace.toml. Молчание тут — та же болезнь: отсутствие проверки читается как
+    пройденная проверка. Поэтому его наличие проверяется тестом.
+    """
+
+    GUARD = ROOT / ".." / ".." / ".github" / "workflows" / "self-dev-guard.yml"
+    RELEASE = ROOT / ".." / ".." / ".github" / "workflows" / "release.yml"
+    DIST = ROOT / ".." / ".." / "dist-workspace.toml"
+
+    def test_the_guard_workflow_exists(self):
+        self.assertTrue(self.GUARD.is_file(), "страж релиза пропал — тег с develop опубликует пульт")
+
+    def test_the_release_pipeline_depends_on_the_guard(self):
+        text = self.RELEASE.read_text()
+
+        self.assertIn("self-dev-guard", text, "release.yml перестал звать стража")
+        # Плана мало: от него зависит ВСЁ остальное, значит стража надо ставить перед ним.
+        self.assertRegex(
+            text,
+            r"plan:\s*\n\s*needs:\s*\n\s*- self-dev-guard",
+            "`plan` больше не зависит от стража — релиз соберётся мимо него",
+        )
+
+    def test_regeneration_would_keep_the_guard(self):
+        # cargo-dist перегенерирует release.yml. Без этой строки он выбросит стража молча.
+        self.assertIn('plan-jobs = ["./self-dev-guard"]', self.DIST.read_text())
+
+    def test_the_guard_checks_its_own_patterns(self):
+        # Страж, способный ответить только «OK», — декорация. Канарейка обязана быть на месте.
+        self.assertIn("эталонный образец", self.GUARD.read_text())
+
+
 class RulesAreLockedTest(unittest.TestCase):
     def test_every_protected_file_matches_the_lock(self):
         locked = load()

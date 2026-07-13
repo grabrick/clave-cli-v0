@@ -1,0 +1,61 @@
+# Релиз не собирается из дерева с инструментами саморазработки.
+#
+# Это ВТОРОЙ путь в прод, и он обходил стража стороной. `release.yml` (автоген cargo-dist)
+# срабатывает на `push: tags: <версия>` с ЛЮБОЙ ветки, а `prod-guard.yml` — только на push/PR в
+# main. Значит `git tag v0.2.0` на коммите develop собрал бы и ОПУБЛИКОВАЛ релиз из дерева с
+# инструментами: пользователи, ставящие clave через `curl | sh`, получили бы бинарь со спрятанным
+# входом `--run tandem` — то есть весь пульт самопиления.
+#
+# Три релиза уже опубликованы (v0.1.1–v0.1.3, macOS/Linux/Windows), так что путь не теоретический.
+# Проверено: в их деревьях инструментов нет — утечки не было. Риск впереди, не позади.
+#
+# Job подключён в release.yml так, что от него зависит `plan`, а от `plan` — всё остальное. Грязное
+# дерево → релиз не соберётся вовсе, а не «соберётся и покраснеет рядом».
+
+name: self-dev guard
+
+on:
+  workflow_call:
+
+jobs:
+  no-self-dev-in-release:
+    name: инструментов саморазработки в релизе быть не должно
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Дерево, из которого собирается релиз, обязано быть продуктовым
+        env:
+          PATHS_RE: '^(tools/clave-dev/|scripts/selfdev/|src/headless\.rs$|src/app/dev\.rs$)|clave-dev'
+          WIRING_RE: '^[[:space:]]*mod (dev|headless);|clave_dev|CLAVE_DEV'
+        run: |
+          set -u
+
+          # Страж, способный ответить только «OK», бесполезен, а опечатку в шаблоне не видно:
+          # grep просто ничего не находит, «|| true» глотает даже ошибку разбора регулярки.
+          # Сперва прогоняем шаблоны по эталонным образцам — проверяем инструмент, а не дерево.
+          printf 'tools/clave-dev/clave_dev/loop.py\n' | grep -qE "$PATHS_RE" \
+            || { echo "::error::шаблон путей не ловит эталонный образец — страж сломан"; exit 1; }
+          printf 'mod dev;\n' | grep -qE "$WIRING_RE" \
+            || { echo "::error::шаблон проводки не ловит эталонный образец — страж сломан"; exit 1; }
+
+          leaked_paths=$(git ls-tree -r --name-only HEAD | grep -E "$PATHS_RE" || true)
+          leaked_wiring=$(grep -rlE "$WIRING_RE" src/ || true)
+
+          if [ -n "$leaked_paths$leaked_wiring" ]; then
+            echo "::error::Релиз собирается из дерева с инструментами саморазработки"
+            if [ -n "$leaked_paths" ]; then
+              echo "Файлы:"
+              echo "$leaked_paths" | head -10 | sed 's/^/  · /'
+            fi
+            if [ -n "$leaked_wiring" ]; then
+              echo "Проводка в коде:"
+              echo "$leaked_wiring" | sed 's/^/  · /'
+            fi
+            echo
+            echo "Опубликованный бинарь унёс бы пользователям спрятанный вход '--run tandem'."
+            echo "Тегировать надо коммит main, а не develop."
+            exit 1
+          fi
+
+          echo "OK: шаблоны стража рабочие, релиз собирается из продуктового дерева."

@@ -32,6 +32,9 @@ PROTECTED = [
     "scripts/prove_no_dead_modules.py",
     "clave_dev/unverified.py",
     "../../.github/workflows/dev-rules.yml",
+    # Релиз — второй путь в прод: тег собирает бинарь с ЛЮБОЙ ветки, мимо стража main.
+    "../../.github/workflows/self-dev-guard.yml",
+    "../../dist-workspace.toml",
 ]
 
 HEADER = """\
