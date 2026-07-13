@@ -1,24 +1,45 @@
 use super::*;
 
-/// Превращает обрамлённую строку супервайзера (`CLAVE-DEV <type> <payload>`) в строку
-/// транскрипта с иконкой по типу (спека §5). Необрамлённые строки (аномалия protocol-mode
-/// или сырьё stderr) возвращаются как есть — парсер не падает.
-pub(crate) fn format_dev_line(raw: &str) -> String {
+/// Превращает обрамлённую строку супервайзера (`CLAVE-DEV <type> <payload>`) в строки
+/// транскрипта. Необрамлённые строки (аномалия protocol-mode или сырьё stderr) возвращаются
+/// как есть — парсер не падает.
+///
+/// Событие со структурой несёт готовое поле `human`: рендер живёт в супервайзере, одной
+/// реализацией на терминал и на TUI. Здесь его раньше не было, и TUI показывал СЫРОЙ JSON —
+/// `✓ {"name":"test","ok":false,…}`, — да ещё с иконкой по ТИПУ события, а не по результату:
+/// упавшая проверка получала зелёную галочку. А строки «не проверено машиной» из финального
+/// отчёта тонули в том же дампе, то есть правило «сошлось не едет в одиночку» в TUI не
+/// действовало вовсе.
+pub(crate) fn format_dev_lines(raw: &str) -> Vec<String> {
     let Some(rest) = raw.strip_prefix("CLAVE-DEV ") else {
-        return raw.to_string();
+        return vec![raw.to_string()];
     };
     let (type_, payload) = rest.split_once(' ').unwrap_or((rest, ""));
+
+    if let Some(human) = human_lines(payload) {
+        return human;
+    }
+
+    // Простые типы (и любое событие без `human` — например от старого супервайзера).
     let icon = match type_ {
         "progress" => "•",
         "log" => " ",
-        "check" => "✓",
-        "vision" => "◍",
-        "diff" => "±",
-        "report" => "⏺",
         "error" => "✗",
         _ => "·",
     };
-    format!("{icon} {payload}")
+    vec![format!("{icon} {payload}")]
+}
+
+/// Готовые человеческие строки из payload — если супервайзер их прислал.
+fn human_lines(payload: &str) -> Option<Vec<String>> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let lines: Vec<String> = value
+        .get("human")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    (!lines.is_empty()).then_some(lines)
 }
 
 /// git-корень для path (спека §4): AppleScript-независимый `git rev-parse --show-toplevel`.
@@ -72,13 +93,17 @@ fn resolve_clave_dev(git_root: &Path) -> Option<(String, Vec<String>, Option<Str
 }
 
 /// Читатель stdout супервайзера: каждую обрамлённую строку прогоняем через
-/// `format_dev_line` перед показом (спека §5). stderr читается обычным `spawn_reader`.
+/// `format_dev_lines` перед показом (спека §5). stderr читается обычным `spawn_reader`.
 fn spawn_dev_reader<R: std::io::Read + Send + 'static>(reader: R, tx: Sender<WorkerEvent>) {
     use std::io::BufRead;
     thread::spawn(move || {
         let reader = std::io::BufReader::new(reader);
         for line in reader.lines().map_while(Result::ok) {
-            let _ = tx.send(WorkerEvent::Line(format_dev_line(&line)));
+            // Одно событие может дать несколько строк: имена упавших тестов, находки зрения,
+            // «не проверено машиной» в отчёте. Раньше всё это приезжало одним JSON-дампом.
+            for shown in format_dev_lines(&line) {
+                let _ = tx.send(WorkerEvent::Line(shown));
+            }
         }
     });
 }
@@ -313,15 +338,94 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frames_are_formatted_by_type() {
-        assert_eq!(format_dev_line("CLAVE-DEV progress раунд 1"), "• раунд 1");
-        assert!(format_dev_line("CLAVE-DEV error боль").starts_with('✗'));
-        assert!(format_dev_line("CLAVE-DEV report {\"converged\":true}").starts_with('⏺'));
+    fn plain_frames_are_formatted_by_type() {
+        assert_eq!(
+            format_dev_lines("CLAVE-DEV progress раунд 1"),
+            ["• раунд 1"]
+        );
+        assert!(format_dev_lines("CLAVE-DEV error боль")[0].starts_with('✗'));
+        // Вывод самого агента — без украшений: только отступ, чтобы отличать от строк петли.
+        assert_eq!(format_dev_lines("CLAVE-DEV log сырьё"), ["  сырьё"]);
+    }
+
+    #[test]
+    fn the_reader_renders_every_line_of_the_stream() {
+        // Тест на МЕСТО ВЫЗОВА. Мутационный прогон показал, что `spawn_dev_reader` можно
+        // заменить пустышкой и ни один тест не заметит: `format_dev_lines` проверена, а то,
+        // что её зовут на каждую строку stdout, — нет. Ровно эта дыра (функция проверена,
+        // вызов не проверен) уже роняла /dev на TypeError в _emit_final.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stream = std::io::Cursor::new(
+            concat!(
+                "CLAVE-DEV progress раунд 1\n",
+                r#"CLAVE-DEV check {"ok":false,"human":["  ✗ test — 1 failed","      · render::footer"]}"#,
+                "\n",
+            )
+            .as_bytes()
+            .to_vec(),
+        );
+
+        spawn_dev_reader(stream, tx);
+
+        let mut shown = Vec::new();
+        while let Ok(event) = rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            if let WorkerEvent::Line(line) = event {
+                shown.push(line);
+            }
+        }
+
+        // Одно событие check дало ДВЕ строки транскрипта — счётчик и то, что за ним стоит.
+        assert_eq!(
+            shown,
+            ["• раунд 1", "  ✗ test — 1 failed", "      · render::footer"]
+        );
+    }
+
+    #[test]
+    fn a_failed_check_is_not_shown_as_a_green_tick() {
+        // Иконка по ТИПУ события ставила «✓» даже на упавшей проверке — и рядом сырой JSON.
+        // Показываем то, что прислал супервайзер: там отметка по результату, а под ней — что
+        // именно упало.
+        let raw = r#"CLAVE-DEV check {"name":"test","ok":false,"human":["  ✗ test — 1 failed","      · render::tests::footer"]}"#;
+
+        let shown = format_dev_lines(raw);
+
+        assert_eq!(
+            shown,
+            ["  ✗ test — 1 failed", "      · render::tests::footer"]
+        );
+        assert!(
+            !shown.iter().any(|l| l.contains('{')),
+            "в лицо человеку уехал JSON: {shown:?}"
+        );
+    }
+
+    #[test]
+    fn the_report_carries_what_the_machine_did_not_check() {
+        // Правило «сошлось не едет в одиночку» действует и в TUI: раньше эти строки были полем
+        // внутри JSON-дампа, то есть человек их не читал.
+        let raw = r#"CLAVE-DEV report {"converged":true,"human":["⏺ converged — раундов: 1/3","  ⚠ решена ли задача ВЕРНО — машина не проверяла"]}"#;
+
+        let shown = format_dev_lines(raw);
+
+        assert_eq!(shown.len(), 2);
+        assert!(shown[1].contains("машина не проверяла"));
+    }
+
+    #[test]
+    fn a_frame_without_human_still_shows_something() {
+        // Старый супервайзер (или новый тип события) — не падаем и не молчим.
+        let shown = format_dev_lines(r#"CLAVE-DEV check {"name":"test","ok":true}"#);
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].contains("\"name\""));
     }
 
     #[test]
     fn unframed_line_passes_through() {
-        assert_eq!(format_dev_line("plain cargo output"), "plain cargo output");
+        assert_eq!(
+            format_dev_lines("plain cargo output"),
+            ["plain cargo output"]
+        );
     }
 
     #[test]
