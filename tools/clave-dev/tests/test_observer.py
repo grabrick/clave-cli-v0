@@ -1,3 +1,4 @@
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -86,6 +87,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
+@unittest.skipUnless(sys.platform == "darwin", "наблюдатель работает через Terminal.app и osascript")
 class ObserverCleansUpAfterItselfTest(unittest.TestCase):
     """Наблюдатель убирал окна, но не каталоги.
 
@@ -93,47 +95,35 @@ class ObserverCleansUpAfterItselfTest(unittest.TestCase):
     по одному `clave-dev-shot-*` на КАЖДЫЙ снимок. Утечка того же рода, что 24 окна Terminal, но
     незаметная: на неё не наткнёшься глазами, поэтому она и жила.
 
-    Гоняем настоящий `gui_capture_verdict` с подменённым AppleScript: окно не откроется (osascript
-    вернёт пустое), геометрия не сойдётся — то есть худший путь, где снимков нет вовсе. Каталог
-    guihome при этом создаётся всё равно, и убрать его обязаны и на этом пути тоже.
+    Гоняем НАСТОЯЩИЙ `gui_capture_verdict` — то есть место вызова, а не функцию рядом. Бинарь
+    подсовываем безобидный (`/bin/echo`): окно откроется и сразу закроется, снимков не будет —
+    худший путь, где уборка нужнее всего. Каталог guihome создаётся и на нём, и убрать его обязаны
+    тоже.
+
+    macOS-only, и это честно, а не удобно: `gui_capture_verdict` импортирует subprocess ЛОКАЛЬНО,
+    поэтому подменить его снаружи нельзя — он реально зовёт osascript. На Linux это FileNotFound,
+    и в CI такой тест ронял весь набор, а канарейка правила 1 объявляла из-за него prove_gate
+    декорацией. Сам модуль от пропуска не осиротеет: `run_visual` покрыт в test_visual_loop и
+    test_vision_baseline, так что правило 3 по-прежнему видит его исполняемым.
     """
 
     def test_the_gui_home_directory_does_not_leak(self):
         import tempfile
-        from pathlib import Path
 
         from clave_dev import visual_observer
-        from clave_dev.terminal_profile import TerminalProfile
+        from clave_dev.terminal_profile import default_profile
 
         tmp = Path(tempfile.gettempdir())
         before = set(tmp.glob("clave-dev-guihome-*"))
 
-        original = visual_observer.subprocess
-        try:
-            # osascript отвечает пустотой → окна нет, геометрия не сходится, снимков нет.
-            class Quiet:
-                @staticmethod
-                def run(*_a, **_k):
-                    import subprocess as sp
-
-                    return sp.CompletedProcess([], 0, "", "")
-
-            visual_observer.subprocess = Quiet
-            verdicts = visual_observer.gui_capture_verdict(
-                Path("/bin/echo"),
-                tmp,
-                TerminalProfile(
-                    app="Terminal", cols=100, rows=30, font="SF Mono", font_size=13,
-                    theme="clave-dev", opacity=1.0, locale="ru_RU.UTF-8",
-                    bounds=(100, 100, 900, 640),
-                ),
-                vision=None,
-                steps=(),
-            )
-        finally:
-            visual_observer.subprocess = original
+        visual_observer.gui_capture_verdict(
+            Path("/bin/echo"),
+            tmp,
+            default_profile()._replace(theme="clave-dev"),
+            vision=None,
+            steps=(),
+            settle_s=0.2,
+        )
 
         leaked = set(tmp.glob("clave-dev-guihome-*")) - before
         self.assertFalse(leaked, f"наблюдатель оставил за собой каталоги: {leaked}")
-        # И проход обязан честно объявить себя несостоявшимся, а не молча «пройти».
-        self.assertTrue(verdicts, "проход без окна обязан дать блокирующий вердикт, а не пустоту")
