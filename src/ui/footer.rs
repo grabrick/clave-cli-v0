@@ -426,6 +426,102 @@ mod tests {
         );
     }
 
+    /// Приложение с ФИКСИРОВАННЫМИ полями, которые читает `footer_right_segments`: `App::new()`
+    /// берёт язык, тему и усилия из конфига на диске, и без этого тест зависел бы от машины.
+    /// Переменные окружения не трогаем — соседние тесты в этом же процессе рендерят футер.
+    fn segments_app() -> App {
+        let mut app = App::new();
+        app.lang = Language::Ru;
+        app.status = "готов".to_string();
+        app.mode = Mode::CodexClaude;
+        app.direct_provider = Provider::Claude;
+        app.theme = Theme::Amber;
+        app.linked_effort_split = true;
+        app.claude_effort_index = 4; // max
+        app.codex_effort_index = 3; // xhigh
+        app.usage = SessionUsage::new();
+        app
+    }
+
+    /// Покой: статус равен «готов», токенов не потрачено. Сегментов ровно четыре — сравниваем
+    /// СПИСОК ЦЕЛИКОМ, поэтому лишний сегмент здесь так же виден, как пропавший.
+    #[test]
+    fn idle_footer_hides_status_and_usage_and_shows_the_two_role_models() {
+        let app = segments_app();
+
+        assert_eq!(
+            footer_right_segments(&app),
+            [
+                "роли: Codex → Claude",
+                "чат: Claude",
+                "тема: Amber",
+                "усилие: Claude max · Codex xhigh",
+            ]
+        );
+    }
+
+    /// Работа: статус сменился, роли схлопнулись в одну модель, расход появился. Это вторые
+    /// ветки всех трёх решений функции — без них половина подмен в условиях остаётся незаметной.
+    #[test]
+    fn busy_footer_adds_status_and_usage_and_folds_equal_roles() {
+        let mut app = segments_app();
+        app.status = "думает…".to_string();
+        app.mode = Mode::ClaudeOnly; // архитектор и ревьюер — одна модель
+        app.usage.record(
+            Provider::Claude,
+            RunUsage {
+                input: 1200,
+                cost_usd: 0.045,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            footer_right_segments(&app),
+            [
+                "статус: думает…",
+                "роли: Claude",
+                "чат: Claude",
+                "тема: Amber",
+                "усилие: max",
+                "расход: 1.2k · $0.045",
+            ]
+        );
+    }
+
+    /// Подписи сегментов — переводимые: у английского пользователя футер обязан быть английским.
+    #[test]
+    fn english_footer_uses_english_keys() {
+        let mut app = segments_app();
+        app.lang = Language::En;
+        app.status = "thinking…".to_string();
+
+        assert_eq!(
+            footer_right_segments(&app),
+            [
+                "status: thinking…",
+                "roles: Codex → Claude",
+                "chat: Claude",
+                "theme: Amber",
+                "effort: Claude max · Codex xhigh",
+            ]
+        );
+    }
+
+    /// Английское «готов» — это `ready`, и статус-сегмент прячется именно по нему, а не по
+    /// русскому слову: иначе у английского пользователя футер вечно кричал бы «status: ready».
+    #[test]
+    fn english_idle_status_is_hidden_by_the_english_word() {
+        let mut app = segments_app();
+        app.lang = Language::En;
+        app.status = "ready".to_string();
+
+        assert_eq!(
+            footer_right_segments(&app).first().map(String::as_str),
+            Some("roles: Codex → Claude")
+        );
+    }
+
     #[test]
     fn git_segment_is_prefixed_and_capped_by_columns() {
         let mut app = App::new();
