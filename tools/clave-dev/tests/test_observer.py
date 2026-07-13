@@ -84,3 +84,56 @@ class ObserverTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ObserverCleansUpAfterItselfTest(unittest.TestCase):
+    """Наблюдатель убирал окна, но не каталоги.
+
+    За прогоны в $TMPDIR натекло 97 штук: по одному `clave-dev-guihome-*` на визуальный проход и
+    по одному `clave-dev-shot-*` на КАЖДЫЙ снимок. Утечка того же рода, что 24 окна Terminal, но
+    незаметная: на неё не наткнёшься глазами, поэтому она и жила.
+
+    Гоняем настоящий `gui_capture_verdict` с подменённым AppleScript: окно не откроется (osascript
+    вернёт пустое), геометрия не сойдётся — то есть худший путь, где снимков нет вовсе. Каталог
+    guihome при этом создаётся всё равно, и убрать его обязаны и на этом пути тоже.
+    """
+
+    def test_the_gui_home_directory_does_not_leak(self):
+        import tempfile
+        from pathlib import Path
+
+        from clave_dev import visual_observer
+        from clave_dev.terminal_profile import TerminalProfile
+
+        tmp = Path(tempfile.gettempdir())
+        before = set(tmp.glob("clave-dev-guihome-*"))
+
+        original = visual_observer.subprocess
+        try:
+            # osascript отвечает пустотой → окна нет, геометрия не сходится, снимков нет.
+            class Quiet:
+                @staticmethod
+                def run(*_a, **_k):
+                    import subprocess as sp
+
+                    return sp.CompletedProcess([], 0, "", "")
+
+            visual_observer.subprocess = Quiet
+            verdicts = visual_observer.gui_capture_verdict(
+                Path("/bin/echo"),
+                tmp,
+                TerminalProfile(
+                    app="Terminal", cols=100, rows=30, font="SF Mono", font_size=13,
+                    theme="clave-dev", opacity=1.0, locale="ru_RU.UTF-8",
+                    bounds=(100, 100, 900, 640),
+                ),
+                vision=None,
+                steps=(),
+            )
+        finally:
+            visual_observer.subprocess = original
+
+        leaked = set(tmp.glob("clave-dev-guihome-*")) - before
+        self.assertFalse(leaked, f"наблюдатель оставил за собой каталоги: {leaked}")
+        # И проход обязан честно объявить себя несостоявшимся, а не молча «пройти».
+        self.assertTrue(verdicts, "проход без окна обязан дать блокирующий вердикт, а не пустоту")

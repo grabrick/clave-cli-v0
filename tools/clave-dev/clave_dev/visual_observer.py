@@ -204,6 +204,7 @@ def gui_capture_verdict(
     ДЕФОЛТНУЮ тему, и зрение судило бы рендер, которого пользователь никогда не видит. Состояние
     остаётся изолированным — перекрывается только путь к конфигу.
     """
+    import shutil
     import subprocess
     import tempfile
     import time
@@ -256,6 +257,11 @@ def gui_capture_verdict(
     want = geometry_label(profile)
     got = osa(read_geometry_applescript(win_id)) if win_id else ""
 
+    # Объявляем ДО ветвления: на пути «геометрия не сошлась» снимков нет, а убирать за собой в
+    # конце всё равно надо — иначе уборка падала бы на NameError ровно в том прогоне, который и
+    # так пошёл не так.
+    shot_dir = None
+
     if got == want:
         for keys, wait_s in steps:  # только строки целиком (do script добавляет Return)
             if win_id:
@@ -264,7 +270,8 @@ def gui_capture_verdict(
         time.sleep(float(settle_s))
 
         cgid = resolve_cgwindow_id(list_windows(), profile.app, title)
-        out = Path(tempfile.mkdtemp(prefix="clave-dev-shot-")) / "frame.png"
+        shot_dir = Path(tempfile.mkdtemp(prefix="clave-dev-shot-"))
+        out = shot_dir / "frame.png"
         verdicts = run_visual(cgid, vision, run_cmd, _decode_png_pixels, out, prompt, samples)
     else:
         # Молча судить не тот рендер нельзя: вердикт был бы о другом окне, а сравнивать его
@@ -292,6 +299,16 @@ def gui_capture_verdict(
                 f"clave-dev: ⚠ окно Terminal «{title}» не закрылось — закрой вручную (Cmd+W)",
                 file=sys.stderr,
             )
+
+    # ...и за каталогами тоже. Окна мы убирали, а `mkdtemp` — нет: за прогоны в $TMPDIR натекло
+    # 97 каталогов (по одному guihome на проход плюс по одному shot на КАЖДЫЙ снимок). Утечка
+    # ровно того же рода, что 24 окна Terminal, только незаметная — на неё не наткнёшься глазами.
+    #
+    # guihome убираем ТОЛЬКО после того, как наблюдаемый процесс убит: это его CLAVE_HOME, и
+    # выдернуть его из-под живого clave значит получить мусор в вердикте вместо рендера.
+    for leftover in (home, shot_dir):
+        if leftover:
+            shutil.rmtree(leftover, ignore_errors=True)
     return verdicts
 
 
