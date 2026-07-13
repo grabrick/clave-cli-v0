@@ -24,6 +24,7 @@ from .user_config import (
 )
 from .vision import vision_preflight
 from .vision_claude import select_vision
+from .visual_observer import sweep_dead_windows, sweep_stale_dirs
 from .visual_verdict import BaselineUnavailableError, severities_at_or_above
 from .worktree import DirtyTreeError, assert_clean, base_sha, create_run_worktree
 
@@ -84,6 +85,32 @@ def main(argv=None) -> int:
     except DirtyTreeError as e:
         print(f"clave-dev: {e}", file=sys.stderr)
         return 2
+
+    # Прибираем за прогонами, которые умерли аварийно. Штатно наблюдатель убирает за собой сам, но
+    # `kill -9` (а снимать прогон приходится) рвёт его на середине: за месяц в $TMPDIR натекло 97
+    # каталогов, а на экране оставались окна Terminal без вкладок, которые уже нечем закрыть.
+    #
+    # Уборка ЗДЕСЬ, а не в конце: конец может не наступить — в том и беда. И трогаем только
+    # ЗАВЕДОМО МЁРТВОЕ: каталоги старше шести часов (дольше самого долгого прогона) и окна, где не
+    # осталось процессов. Рядом может идти другой прогон, и снести его guihome значит выдернуть
+    # CLAVE_HOME из-под живого clave.
+    swept_dirs = sweep_stale_dirs()
+    closed_windows, stuck_windows = sweep_dead_windows()
+    if swept_dirs or closed_windows:
+        print(
+            f"clave-dev: прибрано за прошлыми прогонами — каталогов: {swept_dirs}, "
+            f"окон Terminal: {closed_windows}",
+            file=sys.stderr,
+        )
+    if stuck_windows:
+        # Потолок честный и измеренный: окно, потерявшее ВКЛАДКУ, не закрывается ничем — обе формы
+        # AppleScript рапортуют успех и оставляют его на экране. Молчать об этом нельзя: человек
+        # решит, что инструмент прибрал, а окна будут копиться у него на глазах.
+        print(
+            f"clave-dev: ⚠ окон Terminal без вкладок: {stuck_windows} — закрыть их программно "
+            "нечем (ограничение Terminal.app), закрой вручную: Cmd+W",
+            file=sys.stderr,
+        )
 
     tmp = Path(tempfile.mkdtemp(prefix="clave-dev-"))
     worktree = create_run_worktree(repo, "HEAD", tmp)

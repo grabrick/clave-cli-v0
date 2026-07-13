@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import importlib
 import io
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -32,7 +33,20 @@ sys.path.insert(0, str(ROOT))
 META_TESTS = ("test_gates_can_fail", "test_no_dead_modules", "test_rules_are_enforced")
 
 
+# Вложенный прогон: набор гоняется ради ПРОВЕРКИ ГЕЙТОВ. Тесты, которые поднимают GUI, тут
+# ничего не доказывают (гейтов они не касаются), а стоят настоящее окно Terminal и секунды
+# ожидания — на 12 гейтах × 31 атаке red-team это сотни окон впустую.
+#
+# Флаг ставится ПЕРЕД ПРОГОНОМ, а не при импорте модуля. Первая версия ставила его на уровне
+# модуля — и `test_gates_can_fail`, который импортирует отсюда CANARY, загрязнял окружение
+# ВСЕГО обычного прогона: GUI-тест молча пропускался и там, где обязан работать. Побочный
+# эффект при импорте — то же самое, что тихо выключенная проверка.
+def _mark_nested_run() -> None:
+    os.environ["CLAVE_DEV_NESTED_RUN"] = "1"
+
+
 def run_suite() -> unittest.TestResult:
+    _mark_nested_run()
     loader = unittest.TestLoader()
     suite = unittest.TestSuite(
         s

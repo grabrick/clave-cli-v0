@@ -61,6 +61,95 @@ def tab_is_empty(tty: str) -> bool:
     return not res.stdout.strip()
 
 
+def stale_dirs(tmp: Path, now: float, older_than_s: float = 6 * 3600) -> list:
+    """Каталоги наблюдателя, оставшиеся от прогонов, которые умерли аварийно.
+
+    Штатно за собой убирает `gui_capture_verdict`. Но `kill -9` (а прогон приходится снимать)
+    рвёт его на середине, и каталог остаётся навсегда: за месяц в $TMPDIR натекло 97 штук — по
+    одному `guihome` на визуальный проход и по одному `shot` на КАЖДЫЙ снимок.
+
+    Фильтр по ВОЗРАСТУ обязателен, а не для красоты: рядом может идти другой прогон, и снести его
+    guihome — это выдернуть CLAVE_HOME из-под живого clave, то есть получить мусор в вердикте
+    вместо рендера. Шесть часов — заведомо больше самого долгого прогона (замеряно два).
+    """
+    found = []
+    for prefix in ("clave-dev-guihome-", "clave-dev-shot-"):
+        for path in Path(tmp).glob(prefix + "*"):
+            try:
+                if now - path.stat().st_mtime > older_than_s:
+                    found.append(path)
+            except OSError:
+                continue  # исчез между glob и stat — и хорошо
+    return sorted(found)
+
+
+def sweep_stale_dirs(tmp: Path = None, now: float = None, older_than_s: float = 6 * 3600) -> int:
+    """Прибрать за мёртвыми прогонами. Возвращает, сколько каталогов снесено."""
+    import shutil
+    import tempfile as _tempfile
+    import time as _time
+
+    tmp = Path(tmp) if tmp is not None else Path(_tempfile.gettempdir())
+    now = _time.time() if now is None else now
+
+    swept = 0
+    for path in stale_dirs(tmp, now, older_than_s):
+        shutil.rmtree(path, ignore_errors=True)
+        swept += 1
+    return swept
+
+
+def dead_windows(osa) -> list:
+    """Окна прошлых прогонов, в которых уже НЕТ процессов, — их можно закрыть.
+
+    Окно без вкладки («tabless zombie») остаётся, если супервайзер убили жёстко: мы гасим clave,
+    шелл доигрывает `exit`, Terminal убирает вкладку — а окно закрыть уже нечем. Живой прогон при
+    этом трогать НЕЛЬЗЯ: у него в окне работает наблюдаемый clave, и закрыть окно — значит сорвать
+    чужой визуальный проход. Поэтому мёртвым считаем только то, где процессов не осталось.
+    """
+    from .terminal_driver import tty_of_window_applescript
+
+    ids = osa(
+        'tell application "Terminal" to get id of every window '
+        'whose name contains "clave-dev"'
+    )
+    dead = []
+    for wid in [w.strip() for w in (ids or "").split(",") if w.strip()]:
+        tty = osa(tty_of_window_applescript(wid))
+        if not tty or tab_is_empty(tty):
+            dead.append(wid)
+    return dead
+
+
+def sweep_dead_windows(osa=None):
+    """Закрыть окна мёртвых прогонов. Возвращает (закрыто, застряло-намертво).
+
+    ЗАСТРЯВШИЕ — не оговорка, а измеренный потолок. Окно, потерявшее ВКЛАДКУ («tabless zombie»),
+    не закрывается ничем: ни `close … whose id is`, ни `close … whose name contains` — обе формы
+    рапортуют успех и оставляют окно на экране. Проверено на живой системе, на конкретном зомби.
+
+    Поэтому мы ПРОВЕРЯЕМ результат, а не верим своей же команде. Отчёт «закрыл N», когда ничего
+    не закрыл, — ровно то враньё, от которого написан весь этот инструмент: `close` возвращает
+    успех, и поверить ему было бы так же легко, как когда-то поверить `|| true` в страже.
+    """
+    if osa is None:
+
+        def osa(script):
+            return subprocess.run(
+                ["osascript", "-e", script], capture_output=True, text=True, check=False
+            ).stdout.strip()
+
+    dead = dead_windows(osa)
+    if not dead:
+        return 0, 0
+
+    for wid in dead:
+        osa(f'tell application "Terminal" to close (every window whose id is {wid}) saving no')
+
+    stuck = set(dead_windows(osa)) & set(dead)
+    return len(dead) - len(stuck), len(stuck)
+
+
 def window_still_open(osa, title: str) -> bool:
     """Осталось ли НАШЕ окно висеть на экране.
 

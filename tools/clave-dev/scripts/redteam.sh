@@ -24,12 +24,73 @@ cd "$(dirname "$0")/.." || exit 1
 PY=${CLAVE_DEV_PYTHON:-.venv/bin/python3}
 [ -x "$PY" ] || PY=python3
 
+# ЭТОТ СКРИПТ ЛОМАЕТ РАБОЧЕЕ ДЕРЕВО. Пока он идёт, файлы правил, гейтов и CI-стражей физически
+# отсутствуют или испорчены — на доли секунды, но по очереди и подолгу.
+#
+# Замок нужен от того, что уже случилось: я запустил red-team в фоне, а сам параллельно сделал
+# `git add -A && git commit`. В коммит попал release.yml БЕЗ СТРАЖА — ровно та дыра, через которую
+# тег с develop опубликовал бы пользователям бинарь с инструментами саморазработки. Коммит не был
+# запушен только по случайности.
+#
+# Инструмент, который ломает дерево, обязан кричать об этом и не давать себя запустить дважды.
+LOCK=.redteam.lock
+if [ -e "$LOCK" ]; then
+	echo "red-team уже идёт (замок $LOCK). Дождись его: он ломает дерево, и параллельный" >&2
+	echo "коммит утащит в историю СНЕСЁННУЮ защиту. Если это мёртвый замок — удали его руками." >&2
+	exit 2
+fi
+echo "$$" >"$LOCK"
+
+cat >&2 <<'ПРЕДУПРЕЖДЕНИЕ'
+  ⚠ red-team ЛОМАЕТ рабочее дерево: сносит правила, потрошит гейты, выдирает стражей из CI.
+    Пока он идёт — НЕ коммить и не гоняй тесты: `git add -A` утащит в историю снесённую защиту.
+    Всё унесённое возвращается в конце и при любом убийстве (INT/TERM), но не при `kill -9`.
+
+ПРЕДУПРЕЖДЕНИЕ
+
 WF=../../.github/workflows/dev-rules.yml
 REL=../../.github/workflows/release.yml
 GUARD=../../.github/workflows/self-dev-guard.yml
 DIST=../../dist-workspace.toml
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+
+# ВОССТАНОВЛЕНИЕ ПРИ ЛЮБОМ ИСХОДЕ, включая убийство.
+#
+# Скрипт ломает защиту нарочно: сносит правила, потрошит гейты, выдирает стража из CI. Прежний
+# `trap 'rm -rf "$TMP"' EXIT` при этом УНИЧТОЖАЛ единственную копию: если скрипт убить между
+# «снести правило» и «вернуть на место», файл оставался в $TMP — и trap сносил $TMP вместе с ним.
+#
+# Так и вышло: red-team прервали на атаке «снести test_rules_are_enforced», и правило исчезло.
+# Спасло только то, что оно в git. Инструмент, который проверяет защиту, не имеет права её убить.
+#
+# Теперь восстановление идёт ПЕРЕД уборкой и ловит не только EXIT, но и INT/TERM. Возвращаем
+# ровно то, что унесли: git тут не помощник — он затёр бы незакоммиченные правки заодно.
+restore_all() {
+	# Файлы, унесённые в $TMP целиком (mv): вернуть по исходным путям.
+	[ -f "$TMP/test_gates_can_fail.py" ] && mv -f "$TMP/test_gates_can_fail.py" tests/
+	[ -f "$TMP/test_unverified.py" ] && mv -f "$TMP/test_unverified.py" tests/
+	[ -f "$TMP/test_no_dead_modules.py" ] && mv -f "$TMP/test_no_dead_modules.py" tests/
+	[ -f "$TMP/test_rules_are_enforced.py" ] && mv -f "$TMP/test_rules_are_enforced.py" tests/
+	[ -f "$TMP/RULES.lock" ] && mv -f "$TMP/RULES.lock" .
+	[ -f "$TMP/dr.yml" ] && mv -f "$TMP/dr.yml" "$WF"
+	[ -f "$TMP/sg.yml" ] && mv -f "$TMP/sg.yml" "$GUARD"
+	[ -d "$TMP/tests" ] && mv -f "$TMP/tests" .
+	# Файлы, испорченные на месте (cp): вернуть копию.
+	[ -f "$TMP/g.py" ] && cp -f "$TMP/g.py" tests/test_gates_can_fail.py
+	[ -f "$TMP/p.py" ] && cp -f "$TMP/p.py" scripts/prove_gate.py
+	[ -f "$TMP/c.py" ] && cp -f "$TMP/c.py" clave_dev/checks.py
+	[ -f "$TMP/c2.py" ] && cp -f "$TMP/c2.py" clave_dev/checks.py
+	[ -f "$TMP/r.yml" ] && cp -f "$TMP/r.yml" "$REL"
+	[ -f "$TMP/d.toml" ] && cp -f "$TMP/d.toml" "$DIST"
+	rm -f clave_dev/nobody_runs_me.py
+	rm -f "$LOCK"
+	return 0
+}
+# EXIT — просто уборка. INT/TERM — уборка И ВЫХОД: без явного exit bash выполняет обработчик и
+# продолжает скрипт дальше, снова ломая то, что только что вернул. Замерено: после TERM red-team
+# как ни в чём не бывало шёл дальше по атакам.
+trap 'restore_all; rm -rf "$TMP"' EXIT
+trap 'restore_all; rm -rf "$TMP"; exit 130' INT TERM
 
 pass=0
 holes=0
