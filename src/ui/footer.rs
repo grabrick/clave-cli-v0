@@ -757,4 +757,61 @@ mod tests {
             "гаснущий текст идёт от accent_soft к accent_dim"
         );
     }
+
+    /// Часы у перехода настоящие (`Instant::elapsed`), поэтому «состаренный» момент отсчёта
+    /// сам по себе ничего не гарантирует: планировщик может вытеснить поток между созданием
+    /// `Instant` и вызовом. Берём замер в скобки — `before`/`after` вокруг вызова; из-за
+    /// монотонности `Instant` попадание обеих границ в окно означает, что и внутри вызова
+    /// elapsed был в нём же. Промах не роняет тест, а просто отбрасывает попытку.
+    fn sample_segment(age_ms: u64, lo: u128, hi: u128) -> (String, Style) {
+        for _ in 0..1000 {
+            let mut app = segments_app();
+            app.footer_right_text = "чат: Claude".to_string();
+            app.footer_right_previous_text = Some("тема: Amber".to_string());
+            let changed_at = Instant::now() - Duration::from_millis(age_ms);
+            app.footer_right_changed_at = Some(changed_at);
+
+            let before = changed_at.elapsed().as_millis();
+            let segment = footer_right_segment(&app);
+            let after = changed_at.elapsed().as_millis();
+
+            if before >= lo && after < hi {
+                return segment;
+            }
+            std::thread::yield_now();
+        }
+        panic!("не удалось попасть в окно {lo}..{hi} мс за 1000 попыток");
+    }
+
+    /// До границы показан ПРЕДЫДУЩИЙ текст и он гаснет. Замена `<` на `==` или `>` уводит
+    /// сюда else-ветку — вместо «тема: Amber» вылезет «чат: Claude».
+    #[test]
+    fn before_the_switch_the_previous_text_is_still_fading_out() {
+        let (text, style) = sample_segment(135, 90, 180);
+
+        assert_eq!(text, "тема: Amber");
+        assert_eq!(style, Style::default().fg(Color::Gray));
+    }
+
+    /// Ровно 360 мс — единственная точка, где `<` и `<=` расходятся: оригинал уже переключился
+    /// на новый текст. Цвет тут у обеих веток один и тот же (`fade[4]` и `entering[0]` — это
+    /// accent_dim), поэтому мутанта держит именно ТЕКСТ, стиль — второй якорь.
+    #[test]
+    fn exactly_at_the_boundary_the_new_text_is_already_shown() {
+        let (text, style) = sample_segment(360, 360, 361);
+
+        assert_eq!(text, "чат: Claude");
+        assert_eq!(style, Style::default().fg(Color::Indexed(136)));
+    }
+
+    /// После границы шаг лестницы считается ВЫЧИТАНИЕМ: 495 - 360 = 135 → шаг 1 → DarkGray.
+    /// Сложение дало бы 855 → клэмп 4 → accent_soft(229), деление — 1 → шаг 0 → accent_dim(136).
+    /// Три разных цвета, поэтому обе подмены ловятся одним сравнением стиля.
+    #[test]
+    fn after_the_switch_the_new_text_fades_in_from_the_subtracted_offset() {
+        let (text, style) = sample_segment(495, 450, 540);
+
+        assert_eq!(text, "чат: Claude");
+        assert_eq!(style, Style::default().fg(Color::DarkGray));
+    }
 }
