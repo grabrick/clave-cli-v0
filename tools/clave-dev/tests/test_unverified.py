@@ -72,5 +72,40 @@ class UnverifiedTest(unittest.TestCase):
         self.assertTrue(any("не «сошлось»" in line for line in lines))
 
 
+class DoesNotCryWolfTest(unittest.TestCase):
+    """Правило не имеет права врать и в другую сторону.
+
+    Живой прогон: агент ПЕРЕПИСАЛ существующий тест (гонку с env убрал в чистую функцию). Новых
+    `#[test]` в диффе нет, поэтому отчёт объявил «правку не проверяет ничто, кроме того, что она
+    компилируется» — сразу после того, как мутационный гейт сказал «тесты агента кусаются».
+
+    Ложная тревога съедает правило не медленнее ложного «сошлось»: то, что кричит всегда,
+    перестают читать, а потом отключают.
+    """
+
+    def test_a_passing_mutation_gate_beats_the_missing_test_heuristic(self):
+        # Гейт ломал изменённый код — и тесты это заметили (иначе выжившие не дали бы сойтись).
+        lines = unverified(["src/ui/footer.rs"], RUST_NO_TEST, converged=True, mutants_tested=11)
+
+        self.assertFalse(
+            any("не проверяет ничто" in line for line in lines),
+            f"гейт доказал обратное, а отчёт всё равно кричит: {lines}",
+        )
+        self.assertTrue(any("мутационный гейт проверил 11" in line for line in lines))
+
+    def test_but_correctness_is_still_nobody_s_job(self):
+        # Мутации доказывают, что тесты кусаются, — и ровно ничего про ВЕРНОСТЬ решения.
+        lines = unverified(["src/ui/footer.rs"], RUST_NO_TEST, converged=True, mutants_tested=11)
+
+        self.assertTrue(any("не проверяла и не умеет" in line for line in lines))
+
+    def test_a_gate_that_ran_nothing_proves_nothing(self):
+        # Ноль мутантов — это «гейт не работал», а не «работал и всё чисто». Та же болезнь, что
+        # `all([]) == True`: отсутствие проверки читается как пройденная проверка.
+        lines = unverified(["src/app/footer.rs"], RUST_NO_TEST, converged=True, mutants_tested=0)
+
+        self.assertTrue(any("не проверяет ничто" in line for line in lines))
+
+
 if __name__ == "__main__":
     unittest.main()

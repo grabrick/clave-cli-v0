@@ -5,7 +5,9 @@
 ноль, возвращать единицу и вычитать вместо сложения — и все 125 тестов оставались зелёными.
 """
 import unittest
+from pathlib import Path
 
+from clave_dev import mutation
 from clave_dev.mutation import (
     added_functions,
     describe,
@@ -130,6 +132,65 @@ class PreflightTest(unittest.TestCase):
 
         self.assertIn("cargo-mutants", reason)
         self.assertIn("--no-mutants", reason)
+
+
+class TestedCountTest(unittest.TestCase):
+    """Сколько мутантов гейт РЕАЛЬНО проверил — от этого зависит, врать ли правилу 2.
+
+    Нужно, чтобы отчёт не объявлял «правку не проверяет ничто» сразу после того, как гейт сказал
+    «тесты агента кусаются». Живой прогон поймал ровно это: агент переписал существующий тест,
+    новых `#[test]` в диффе не появилось.
+    """
+
+    def test_counts_what_the_gate_reported(self):
+        self.assertEqual(mutation.tested("11 mutants tested in 19s: 11 caught"), 11)
+        self.assertEqual(mutation.tested("5 mutants tested in 13s: 5 missed"), 5)
+        self.assertEqual(mutation.tested("1 mutant tested in 3s: 1 caught"), 1)
+
+    def test_a_gate_that_ran_nothing_reports_zero(self):
+        # Ноль — это «гейт не работал», а не «работал и всё чисто». Молчание не равно успеху.
+        self.assertEqual(mutation.tested(""), 0)
+        self.assertEqual(mutation.tested("error: cargo-mutants не установлен"), 0)
+
+
+class TheLoopActuallyAsksTheGateTest(unittest.TestCase):
+    """Тест на МЕСТО ВЫЗОВА: петля обязана донести результат гейта до отчёта.
+
+    Юнит-тест `tested()` останется зелёным, даже если из петли выкинуть её вызов — и правило 2
+    снова начнёт кричать на проверенную правку. Ровно эта дыра (функция проверена, вызов не
+    проверен) уже уронила /dev на TypeError в _emit_final.
+    """
+
+    def test_the_report_carries_the_mutation_result(self):
+        from clave_dev import loop
+
+        seen = {}
+
+        class Spy:
+            enabled = False
+
+            def diff(self, payload):
+                pass
+
+            def report(self, payload):
+                seen.update(payload)
+
+        original_diff_text, original_changed = loop.diff_text, loop.changed_paths
+        loop.diff_text = lambda *a, **k: "+fn f() {}\n"
+        loop.changed_paths = lambda *a, **k: ["src/ui/footer.rs"]
+        try:
+            cfg = loop.RunConfig(
+                known_good=Path("/x"), worktree=Path("/wt"), repo=Path("/r"), env={},
+                profile="debug", task="t", effort="high", rounds=1, max_rounds=1, scenarios=(),
+            )
+            loop._emit_final(Spy(), cfg, True, 1, "v", "converged", mutants_tested=11)
+        finally:
+            loop.diff_text, loop.changed_paths = original_diff_text, original_changed
+
+        self.assertTrue(
+            any("мутационный гейт проверил 11" in line for line in seen["unverified"]),
+            f"результат гейта до отчёта не доехал: {seen.get('unverified')}",
+        )
 
 
 if __name__ == "__main__":

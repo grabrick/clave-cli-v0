@@ -156,7 +156,9 @@ def _vision_payload(verdicts, blocking) -> dict:
     }
 
 
-def _emit_final(emitter, cfg, converged_flag, rounds_used, known_good_version, status) -> None:
+def _emit_final(
+    emitter, cfg, converged_flag, rounds_used, known_good_version, status, mutants_tested=0
+) -> None:
     # Диф считаем только когда есть кому его показать (protocol-mode); иначе — лишняя работа.
     # Патч пишем ВНЕ worktree: внутри он попал бы в собственный диф (build_diff делает
     # `git add -N .`, чтобы видеть новые файлы) и в changed_paths.
@@ -178,7 +180,7 @@ def _emit_final(emitter, cfg, converged_flag, rounds_used, known_good_version, s
         # Исход не имеет права ехать один: «converged: true» без этого читается как
         # «сделано верно», а гейты этого не проверяли и не умеют. См. unverified.
         "unverified": unverified(
-            changed_paths(cfg.worktree, cfg.base_sha), text, converged_flag
+            changed_paths(cfg.worktree, cfg.base_sha), text, converged_flag, mutants_tested
         ),
     })
 
@@ -244,6 +246,7 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
         checks = run_checks(cfg.worktree, cfg.env, cfg.profile)
         _emit_checks(emitter, checks)
         grids, assertion_results, vision_verdicts, unproven_mutants = [], [], [], []
+        mutants_tested = 0  # сколько мутантов гейт реально проверил — это доедет до отчёта
         if checks.build_ok:
             fresh = fresh_binary(cfg.worktree, cfg.profile)
             for scenario in cfg.scenarios:
@@ -270,9 +273,14 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
                     mutants_cmd(patch), cwd=str(cfg.worktree), env=cfg.env,
                     capture_output=True, text=True, check=False,
                 )
+                mutants_output = res.stdout + res.stderr
                 unproven_mutants = unproven(
-                    diff_text(cfg.worktree, cfg.base_sha), res.stdout + res.stderr
+                    diff_text(cfg.worktree, cfg.base_sha), mutants_output
                 )
+                # Отчёт обязан знать, что гейт РАБОТАЛ: иначе он объявит «правку не проверяет
+                # ничто» сразу после того, как гейт сказал «тесты агента кусаются». Переписанный
+                # (а не добавленный) тест — ровно этот случай, и он поймал меня на живом прогоне.
+                mutants_tested = tested(mutants_output)
                 emitter.check({
                     "name": "мутации",
                     "ok": not unproven_mutants,
@@ -313,7 +321,9 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
             )
             == "converged"
         ):
-            _emit_final(emitter, cfg, True, round_i, known_good_version, "converged")
+            _emit_final(
+                emitter, cfg, True, round_i, known_good_version, "converged", mutants_tested
+            )
             return RunReport(True, round_i, cfg.max_rounds, assertion_results, known_good_version, "converged")
 
         context = build_context(checks, grids, assertion_results)

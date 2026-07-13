@@ -62,10 +62,21 @@ def human_lines(type_: str, payload) -> list:
         return lines
 
     if type_ == "diff":
-        files = payload.get("files") or []
+        # Ключи — из build_diff, а не из головы. Первая версия читала `files`/`patch`, которых там
+        # отродясь не было, и живой прогон показал «± правок нет» строкой ниже «изменено файлов: 1».
+        # Тест не поймал, потому что проверял выдуманный payload; теперь он гоняет настоящий diff.
+        files = payload.get("changed_files") or []
         if not files:
             return ["  ± правок нет"]
-        return [f"  ± файлов: {len(files)}, патч: {payload.get('patch', '—')}"]
+        # У `git diff --stat` последняя строка — сводка («1 file changed, 17 insertions(+)…»).
+        # Само полотно не показываем: файлы уже названы в progress, а на 200 файлах это простыня.
+        stat = (payload.get("stat") or "").strip().splitlines()
+        summary = stat[-1].strip() if stat else f"файлов: {len(files)}"
+        lines = [f"  ± {summary}"]
+        if payload.get("truncated"):
+            lines.append(f"      · в списке первые {len(files)}")
+        lines.append(f"      · патч: {payload.get('patch_path', '—')}")
+        return lines
 
     if type_ == "report":
         # Самое важное событие прогона: здесь живёт правило 2. В TUI оно и приезжает — раньше

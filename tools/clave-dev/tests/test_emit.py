@@ -1,9 +1,13 @@
 import contextlib
 import io
 import json
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 
-from clave_dev.emit import Emitter, format_line, no_op_emitter
+from clave_dev.diff import build_diff
+from clave_dev.emit import Emitter, format_line, human_lines, no_op_emitter
 
 VISION_WITH_DETAILS = {
     "pass": False,
@@ -92,6 +96,82 @@ class HumanModeTest(unittest.TestCase):
 
         self.assertEqual(err.getvalue(), "")
         self.assertFalse(hasattr(e._human, "getvalue"), "сток обязан выбрасывать, а не копить")
+
+
+class TuiSeesWhatTheHumanSeesTest(unittest.TestCase):
+    """В TUI уезжал СЫРОЙ JSON — а рендер человеку был только в терминале.
+
+    Живой прогон /dev показал ровно это: `✓ {"name":"test","ok":false,…}` с зелёной галочкой на
+    упавшей проверке (иконка бралась по ТИПУ события), а строки «не проверено машиной» из отчёта
+    тонули внутри дампа. Правило, которое не дочитывают, — декорация.
+
+    Поэтому событие несёт готовое `human`, и рендер ОДИН — здесь. Вторая реализация в Rust уже
+    разъехалась бы с этой.
+    """
+
+    def _payload(self, type_, payload):
+        prefix = f"CLAVE-DEV {type_} "
+        line = format_line(type_, payload)
+        self.assertEqual(len(line.splitlines()), 1, "обрамлённая строка обязана быть ОДНОЙ")
+        return json.loads(line[len(prefix):])
+
+    def test_a_failed_check_carries_its_own_mark_and_reason(self):
+        got = self._payload(
+            "check",
+            {"name": "test", "ok": False, "detail": "1 failed", "failures": ["render::footer"]},
+        )
+        self.assertEqual(got["human"], ["  ✗ test — 1 failed", "      · render::footer"])
+
+    def test_the_report_carries_what_the_machine_did_not_check(self):
+        got = self._payload(
+            "report",
+            {
+                "converged": True,
+                "status": "converged",
+                "rounds": 1,
+                "max_rounds": 3,
+                "worktree": "/tmp/wt",
+                "unverified": ["решена ли задача ВЕРНО — машина не проверяла"],
+            },
+        )
+        self.assertEqual(got["human"][0], "⏺ converged — раундов: 1/3")
+        self.assertIn("  ⚠ решена ли задача ВЕРНО — машина не проверяла", got["human"])
+
+
+class DiffLineMatchesRealBuildDiffTest(unittest.TestCase):
+    """Ключи payload берём из build_diff, а не из головы.
+
+    Первая версия читала `files`/`patch` — таких ключей там нет и не было. Прогон показал «± правок
+    нет» строкой ниже «изменено файлов: 1»: отчёт врал о собственной работе. Юнит-тест на выдуманном
+    payload это пропустил, поэтому здесь — НАСТОЯЩИЙ build_diff на настоящем git.
+    """
+
+    def test_a_real_diff_is_summarised_not_denied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp) / "wt"
+            wt.mkdir()
+            run = lambda *a: subprocess.run(  # noqa: E731
+                ["git", *a], cwd=str(wt), capture_output=True, check=True
+            )
+            run("init", "-q")
+            run("config", "user.email", "t@t")
+            run("config", "user.name", "t")
+            (wt / "a.rs").write_text("fn main() {}\n")
+            run("add", "-A")
+            run("commit", "-qm", "base")
+
+            (wt / "a.rs").write_text("fn main() {\n    println!(\"правка\");\n}\n")
+            payload = build_diff(wt, Path(tmp) / "p.patch")
+
+            lines = human_lines("diff", payload)
+
+        self.assertNotIn("  ± правок нет", lines, "настоящую правку отчёт назвал отсутствием правок")
+        self.assertIn("1 file changed", lines[0])
+        self.assertTrue(any("p.patch" in line for line in lines))
+
+    def test_an_empty_diff_still_reads_as_empty(self):
+        # Гейт, который ругается всегда, — тоже декорация.
+        self.assertEqual(human_lines("diff", {"changed_files": [], "stat": ""}), ["  ± правок нет"])
 
 
 class VisionDetailsTest(unittest.TestCase):

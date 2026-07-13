@@ -83,6 +83,9 @@ NEUTERED = {
     "clave_dev.diff:changed_paths": lambda worktree, base_sha=None: ["src/подменено.rs"],
     # «Тесты агента всё доказывают» — всегда. Обезвредь — и тест-декорация снова пройдёт.
     "clave_dev.mutation:unproven": lambda diff_text, mutants_output: [],
+    # «Мутационный гейт много чего проверил» — всегда. Обезвредь — и правило 2 замолчит там,
+    # где обязано кричать: правка без тестов снова прочтётся как доказанная.
+    "clave_dev.mutation:tested": lambda output: 42,
     # Канарейку не зовёт ни один тест — обезвредить её набор не заметит. Ответ обязан быть «1».
     CANARY: lambda *a, **k: "обезврежено",
 }
