@@ -9,7 +9,7 @@ from .assertions import structural_assertions
 from .binaries import fresh_binary
 from .checks import run_checks
 from .context import build_context, build_mutation_context, build_visual_context
-from .diff import build_diff, changed_paths
+from .diff import build_diff, changed_paths, diff_text
 from .emit import no_op_emitter
 from .mutation import describe as describe_mutants
 from .mutation import mutants_cmd, unproven
@@ -145,12 +145,14 @@ def _emit_final(emitter, cfg, converged_flag, rounds_used, known_good_version, s
     # Диф считаем только когда есть кому его показать (protocol-mode); иначе — лишняя работа.
     # Патч пишем ВНЕ worktree: внутри он попал бы в собственный диф (build_diff делает
     # `git add -N .`, чтобы видеть новые файлы) и в changed_paths.
-    diff_text = ""
     if emitter.enabled:
-        diff_text = build_diff(
-            cfg.worktree, cfg.worktree.parent / "clave-dev.patch", base_sha=cfg.base_sha
+        emitter.diff(
+            build_diff(
+                cfg.worktree, cfg.worktree.parent / "clave-dev.patch", base_sha=cfg.base_sha
+            )
         )
-        emitter.diff(diff_text)
+    # ТЕКСТ диффа, а не словарь build_diff: он нужен, чтобы посчитать добавленные тесты.
+    text = diff_text(cfg.worktree, cfg.base_sha)
     emitter.report({
         "converged": converged_flag,
         "status": status,
@@ -161,7 +163,7 @@ def _emit_final(emitter, cfg, converged_flag, rounds_used, known_good_version, s
         # Исход не имеет права ехать один: «converged: true» без этого читается как
         # «сделано верно», а гейты этого не проверяли и не умеют. См. unverified.
         "unverified": unverified(
-            changed_paths(cfg.worktree, cfg.base_sha), diff_text, converged_flag
+            changed_paths(cfg.worktree, cfg.base_sha), text, converged_flag
         ),
     })
 
@@ -248,12 +250,14 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
                     "проверки зелёные — мутационный гейт: умеют ли тесты агента падать"
                 )
                 patch = cfg.worktree.parent / "clave-dev.patch"
-                diff_text = build_diff(cfg.worktree, patch, base_sha=cfg.base_sha)
+                build_diff(cfg.worktree, patch, base_sha=cfg.base_sha)  # пишет патч на диск
                 res = subprocess.run(
                     mutants_cmd(patch), cwd=str(cfg.worktree), env=cfg.env,
                     capture_output=True, text=True, check=False,
                 )
-                unproven_mutants = unproven(diff_text, res.stdout + res.stderr)
+                unproven_mutants = unproven(
+                    diff_text(cfg.worktree, cfg.base_sha), res.stdout + res.stderr
+                )
                 emitter.check({
                     "name": "мутации",
                     "ok": not unproven_mutants,

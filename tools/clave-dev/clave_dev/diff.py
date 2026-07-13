@@ -43,6 +43,23 @@ def changed_paths(worktree: Path, base_sha: str = None) -> list:
     )
 
 
+def diff_text(worktree: Path, base_sha: str = None) -> str:
+    """ТЕКСТ диффа от базы.
+
+    Отдельно от `build_diff` нарочно. `build_diff` возвращает СЛОВАРЬ (stat, список файлов, путь к
+    патчу) — его payload уезжает в TUI, и класть туда весь патч нельзя. Я об этом забыл и передал
+    словарь в регулярку: мутационный гейт упал `TypeError: expected string or bytes-like object`
+    посреди живого прогона, а тот же промах во втором месте ронял бы `/dev` из TUI в конце КАЖДОГО
+    прогона.
+
+    Юнит-тесты не спасли: я проверил чистую функцию строкой и ни разу — место вызова. Ровно то, за
+    что ругаю агента.
+    """
+    _git(worktree, "add", "-N", ".")  # без intent-to-add новые файлы в дифф не попадают
+    against = [base_sha] if base_sha else []
+    return _git(worktree, "diff", *against)
+
+
 def build_diff(worktree: Path, patch_path: Path, max_files: int = 200, base_sha: str = None) -> dict:
     """Полный патч пишется в patch_path (не льётся в транскрипт); в TUI идут stat+файлы.
 
