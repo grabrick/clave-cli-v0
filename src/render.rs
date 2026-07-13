@@ -541,6 +541,155 @@ fn to_crossterm_color(color: Color) -> CtColor {
 mod tests {
     use super::*;
 
+    /// Приложение с ПОЛНОСТЬЮ детерминированным футером: правый слот берётся из полей
+    /// (а не из стенных часов), панели и верхний слот погашены — значит футер это
+    /// последняя строка блока, и её можно сверять посимвольно.
+    fn footer_app() -> App {
+        let mut app = App::new();
+        app.onboarding = None;
+        app.overlay = Overlay::None;
+        app.ask = None;
+        app.input.clear();
+        app.cursor = 0;
+        app.running = false;
+        app.live_turn = None;
+        app.reveal = None;
+        app.last_run_duration = None;
+        app.footer_notice = None;
+        app.lang = Language::Ru;
+        app.theme = Theme::Purple;
+        app.chat_mode = ChatMode::Discussion;
+        app.git_ref = Some("main".to_string());
+        app.footer_right_text = "чат: Claude".to_string();
+        app.footer_right_previous_text = None;
+        app.footer_right_changed_at = None;
+        app
+    }
+
+    /// Строка футера из оффскрин-буфера — ровно те символы, что увидит терминал.
+    fn footer_line(app: &App, width: u16) -> String {
+        let (lines, _, _) = build_dynamic(app, width, 20);
+        lines
+            .last()
+            .expect("блок не пуст")
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// Слева направо: режим, хоткей, подсказки, воздух, индикатор, слот. Числа посчитаны
+    /// руками (13 + 1 + 9 + 2 + 23 + 8 + 9 + 2 + 11 = 78 = ширина − запас у стены).
+    #[test]
+    fn footer_puts_git_before_the_right_slot() {
+        let app = footer_app();
+
+        assert_eq!(
+            footer_line(&app, 80),
+            format!(
+                ">> Обсуждение Shift+Tab  ? подсказки · / команды{}git: main{}чат: Claude  ",
+                " ".repeat(8),
+                " ".repeat(2)
+            )
+        );
+    }
+
+    /// Слот шире текущего текста (идёт переход со старого сегмента) — добивка пробелами
+    /// идёт ПОСЛЕ индикатора: сам индикатор не съезжает.
+    #[test]
+    fn wider_previous_segment_pads_the_slot_after_git() {
+        let mut app = footer_app();
+        app.footer_right_previous_text = Some("усилие: Codex xhigh".to_string()); // 19 колонок
+
+        // 38 + 20 (воздух) + 9 (git) + 2 (зазор) + 8 (добивка слота) + 11 = 98 = 100 − 2.
+        assert_eq!(
+            footer_line(&app, 100),
+            format!(
+                ">> Обсуждение Shift+Tab  ? подсказки · / команды{}git: main{}чат: Claude  ",
+                " ".repeat(20),
+                " ".repeat(2 + 8)
+            )
+        );
+    }
+
+    /// Узко: рядом с индикатором не влезает даже первый пункт подсказок — индикатор уходит,
+    /// подсказки усекаются, правый слот остаётся на месте.
+    #[test]
+    fn narrow_footer_drops_git_and_keeps_the_slot() {
+        let app = footer_app();
+
+        assert_eq!(
+            footer_line(&app, 50),
+            format!(">> Обсуждение Shift+Tab  ? подсказ…{}чат: Claude  ", "  ")
+        );
+    }
+
+    /// Уведомление занимает футер, но индикатор постоянный — он остаётся у правого края.
+    #[test]
+    fn notice_keeps_git_at_the_right_edge() {
+        let mut app = footer_app();
+        app.show_footer_notice("Сохранено");
+
+        // 9 (текст) + 58 (воздух) + 2 (зазор) + 9 (git) = 78.
+        assert_eq!(
+            footer_line(&app, 80),
+            format!("Сохранено{}git: main  ", " ".repeat(58 + 2))
+        );
+    }
+
+    /// Длинное уведомление режется по бюджету МИНУС индикатор: git не вытесняется за край.
+    #[test]
+    fn long_notice_is_truncated_to_leave_room_for_git() {
+        let mut app = footer_app();
+        app.show_footer_notice("a".repeat(100));
+
+        // budget 78 − git_total 11 = 67 колонок под текст: 66 символов и «…».
+        assert_eq!(
+            footer_line(&app, 80),
+            format!("{}…  git: main  ", "a".repeat(66))
+        );
+    }
+
+    /// Граница: бюджет РАВЕН ширине индикатора с зазором — места нет, рисуем одно уведомление.
+    /// Иначе (при `>=`) от текста уведомления не осталось бы ничего.
+    #[test]
+    fn notice_drops_git_when_the_budget_only_matches_it() {
+        let mut app = footer_app();
+        app.show_footer_notice("ok");
+
+        // width 13 → budget 11 == display_width("git: main") + 2.
+        assert_eq!(footer_line(&app, 13), format!("ok{}", " ".repeat(11)));
+    }
+
+    /// Без репозитория уведомление занимает футер целиком.
+    #[test]
+    fn notice_without_git_fills_the_footer() {
+        let mut app = footer_app();
+        app.git_ref = None;
+        app.show_footer_notice("Готово");
+
+        assert_eq!(footer_line(&app, 80), format!("Готово{}", " ".repeat(74)));
+    }
+
+    /// Уведомление живёт 2 секунды: устаревшее не рисуется, футер возвращается к обычному виду.
+    #[test]
+    fn expired_notice_gives_the_footer_back() {
+        let mut app = footer_app();
+        let stale = Instant::now()
+            .checked_sub(Duration::from_secs(3))
+            .expect("часы монотонны");
+        app.footer_notice = Some(("Сохранено".to_string(), stale));
+
+        assert_eq!(
+            footer_line(&app, 80),
+            format!(
+                ">> Обсуждение Shift+Tab  ? подсказки · / команды{}git: main{}чат: Claude  ",
+                " ".repeat(8),
+                " ".repeat(2)
+            )
+        );
+    }
+
     #[test]
     fn sanitize_strips_escape_and_control_keeps_text() {
         // ESC/OSC/цвет/CR/BEL — вырезаются (инъекция в терминал невозможна).

@@ -41,15 +41,17 @@ pub(crate) fn footer_layout(
     let sep_width = 2;
     let min_gap = 2;
 
+    // Левая часть до подсказок: режим, хоткей и разделитель. Её ширина от раскладки не зависит.
+    let left_fixed = mode_width + switch_width + sep_width;
+
     // Правый сегмент ограничиваем доступным местом; не влезает — усекаем с «…», а не
     // молча теряем символ у края. Индикатор в эту ширину не вмешивается — слот на месте.
-    let right_available = budget.saturating_sub(mode_width + switch_width + sep_width + min_gap);
+    let right_available = budget.saturating_sub(left_fixed + min_gap);
     let right_slot_width = right_slot_width.min(right_available);
     let right = truncate_display(right, right_slot_width);
     let right_width = display_width(&right);
 
-    let free =
-        budget.saturating_sub(mode_width + switch_width + sep_width + right_slot_width + min_gap);
+    let free = budget.saturating_sub(left_fixed + right_slot_width + min_gap);
 
     // Приоритет: правый слот → git → подсказки. Индикатор забирает место раньше подсказок,
     // но не съедает их полностью: пока первый пункт подсказок не влезает целиком — уступает
@@ -66,7 +68,7 @@ pub(crate) fn footer_layout(
     };
 
     let hints = truncate_display(hints, free.saturating_sub(git_total));
-    let left_width = mode_width + switch_width + sep_width + display_width(&hints);
+    let left_width = left_fixed + display_width(&hints);
     let gap = budget.saturating_sub(left_width + git_total + right_slot_width);
     let right_padding = right_slot_width.saturating_sub(right_width);
 
@@ -368,6 +370,58 @@ mod tests {
         assert_eq!(display_width(&widest), max_cols);
     }
 
+    /// Режим включает переменная окружения — и только значение `1`.
+    #[test]
+    fn static_render_is_switched_by_the_env_flag() {
+        std::env::set_var("CLAVE_STATIC_RENDER", "1");
+        assert!(static_render());
+        std::env::set_var("CLAVE_STATIC_RENDER", "0");
+        assert!(!static_render());
+        std::env::remove_var("CLAVE_STATIC_RENDER");
+        assert!(!static_render());
+    }
+
+    /// Что бы ни показывал слот (вращение или статичный режим) — это ОДИН из сегментов
+    /// приложения, а не пустота и не посторонняя строка.
+    #[test]
+    fn footer_right_target_is_one_of_the_app_segments() {
+        let app = App::new();
+        let target = footer_right_target(&app);
+
+        assert!(!target.is_empty());
+        assert!(
+            footer_right_segments(&app).contains(&target),
+            "правый слот показывает не свой сегмент: {target:?}"
+        );
+    }
+
+    #[test]
+    fn git_segment_is_prefixed_and_capped_by_columns() {
+        let mut app = App::new();
+
+        app.git_ref = None;
+        assert_eq!(footer_git_segment(&app), None);
+
+        app.git_ref = Some("main".to_string());
+        assert_eq!(footer_git_segment(&app).as_deref(), Some("git: main"));
+
+        // Длинная ветка усечена до GIT_REF_MAX_COLS (20): 19 символов и «…».
+        app.git_ref = Some("feature/very-long-branch-name".to_string());
+        assert_eq!(
+            footer_git_segment(&app).as_deref(),
+            Some("git: feature/very-long-b…")
+        );
+    }
+
+    /// Пол подсказок — их ПЕРВЫЙ пункт, без хвостового пробела перед разделителем.
+    #[test]
+    fn first_hint_is_the_leading_item_without_trailing_space() {
+        assert_eq!(first_hint(HINTS), "? подсказки");
+        assert_eq!(first_hint("? shortcuts · / commands"), "? shortcuts");
+        // Разделителя нет — пунктом считается вся строка.
+        assert_eq!(first_hint("? подсказки"), "? подсказки");
+    }
+
     #[test]
     fn without_static_render_the_slot_still_rotates() {
         let picked = pick_right_segment(segments(), false);
@@ -395,6 +449,54 @@ mod tests {
             + git_gap
             + l.right_padding
             + display_width(&l.right)
+    }
+
+    /// Раскладка целиком, на руках посчитанная. budget = 98; слева 3 + 10 + 2 = 15,
+    /// подсказки 23, индикатор 9 + 2 зазора, слот 20 → воздух ровно 29 колонок.
+    #[test]
+    fn layout_columns_are_pinned_to_exact_numbers() {
+        let l = footer_layout(100, MODE, SWITCH, HINTS, Some("git: main"), RIGHT, 20);
+
+        assert_eq!(
+            l,
+            FooterLayout {
+                hints: HINTS.to_string(),
+                git: "git: main".to_string(),
+                gap: 29,
+                right: RIGHT.to_string(),
+                right_padding: 0,
+                right_slot_width: 20,
+            }
+        );
+    }
+
+    /// Граница появления индикатора: он остаётся, пока рядом влезает первый пункт подсказок
+    /// целиком (free == git + зазор + пол подсказок), и уходит на колонку раньше.
+    #[test]
+    fn git_appears_exactly_when_it_fits_next_to_the_first_hint() {
+        // width 61 → free = 22 == (9 + 2) + 11.
+        let fits = footer_layout(61, MODE, SWITCH, HINTS, Some("git: main"), RIGHT, 20);
+        assert_eq!(fits.git, "git: main");
+        assert_eq!(fits.hints, "? подсказк…"); // 11 колонок — ровно пол
+
+        let tight = footer_layout(60, MODE, SWITCH, HINTS, Some("git: main"), RIGHT, 20);
+        assert_eq!(tight.git, "");
+        assert_eq!(tight.hints, "? подсказки · / кома…"); // 21 колонка: место индикатора отдано им
+    }
+
+    /// Узкий футер: слот не может занять свои 20 колонок и урезается ровно до того, что
+    /// осталось от бюджета после левой части и минимального зазора. budget = 28,
+    /// слева 3 + 10 + 2 = 15, зазор 2 → слоту достаётся ровно 11 колонок, и правый сегмент
+    /// усечён по ним («…» внутри бюджета).
+    #[test]
+    fn narrow_footer_caps_the_right_slot_by_the_columns_left_over() {
+        let l = layout(30, Some("git: main"));
+
+        assert_eq!(l.right_slot_width, 11);
+        assert_eq!(l.right, "роли: Code…");
+        assert_eq!(l.right_padding, 0);
+        assert_eq!(l.git, ""); // на индикатор места уже нет
+        assert_eq!(rendered_width(&l), 30 - 2);
     }
 
     #[test]

@@ -225,6 +225,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn truncate_display_cuts_by_columns_and_keeps_the_ellipsis_inside() {
+        // Ровно по бюджету — строка цела, «…» не появляется.
+        assert_eq!(truncate_display("abc", 3), "abc");
+        // На колонку шире — режем так, чтобы «…» ВЛЕЗЛО в бюджет: 4 символа + «…» = 5.
+        assert_eq!(truncate_display("abcdef", 5), "abcd…");
+        // Широкие (CJK) символы считаются за 2 колонки: 2 + 2 + «…» = 5.
+        assert_eq!(truncate_display("機能機能", 5), "機能…");
+        // Нулевой бюджет — пусто, даже без «…».
+        assert_eq!(truncate_display("abc", 0), "");
+    }
+
+    #[test]
     fn wrap_preserving_spaces_is_stable() {
         // Характеризующий тест: оптимизация (O(n)) обязана давать тот же результат.
         assert_eq!(wrap_terminal_text_preserving_spaces("", 5), vec![""]);
