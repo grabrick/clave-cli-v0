@@ -739,4 +739,34 @@ mod tests {
             );
         }
     }
+
+    fn stub_git_ref(_dir: &std::path::Path) -> Option<String> {
+        Some("stub".to_string())
+    }
+
+    /// Смена рабочего каталога обязана обновить индикатор футера в ЭТОМ же кадре: иначе
+    /// футер продолжал бы показывать ветку прошлого каталога.
+    #[test]
+    fn set_work_dir_moves_the_cwd_and_refreshes_the_git_indicator() {
+        let dir = env::temp_dir().join(format!("clave-setdir-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("mkdir");
+
+        let mut app = App::new();
+        // Конфиг сохраняется на диск — пишем во временный, а не в настоящий файл пользователя.
+        app.config_path = dir.join("config.json");
+        app.git_ref_detector = stub_git_ref;
+        app.git_ref = None;
+
+        app.set_work_dir_command(&dir.to_string_lossy());
+        assert_eq!(app.work_dir, dir.to_string_lossy());
+        assert_eq!(app.git_ref.as_deref(), Some("stub"));
+
+        // Несуществующая папка: ни каталог, ни индикатор не трогаем.
+        app.git_ref = None;
+        app.set_work_dir_command(&dir.join("missing").to_string_lossy());
+        assert_eq!(app.work_dir, dir.to_string_lossy());
+        assert_eq!(app.git_ref, None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
