@@ -45,8 +45,20 @@ on:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
+  # Релиз собирается по ТЕГУ с любой ветки — мимо prod-guard.yml, который сторожит только main.
+  # Тег на коммите develop опубликовал бы бинарь со спрятанным входом '--run tandem'. Поэтому
+  # `plan` (корень всего пайплайна) зависит от этого стража: грязное дерево → релиз не соберётся.
+  #
+  # ВНИМАНИЕ: release.yml автогенерируется cargo-dist. Регенерация выбросит эти строки, если
+  # `plan-jobs` не прописан в dist-workspace.toml. От этого сторожит тест
+  # tests/test_rules_are_enforced.py — он краснеет, если guard пропал.
+  self-dev-guard:
+    uses: ./.github/workflows/self-dev-guard.yml
+
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
+    needs:
+      - self-dev-guard
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}

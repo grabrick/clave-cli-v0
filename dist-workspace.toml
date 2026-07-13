@@ -7,6 +7,10 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
+# Релиз собирается по тегу с ЛЮБОЙ ветки, мимо prod-guard.yml (тот сторожит только main).
+# Этот job проверяет дерево до всего остального: тег на develop не должен опубликовать бинарь
+# с входом самопиления внутри.
+plan-jobs = ["./self-dev-guard"]
 # The installers to generate for each app
 installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax)
