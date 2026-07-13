@@ -40,6 +40,7 @@ GATES = [
     "clave_dev.diff:changed_paths",
     "clave_dev.mutation:unproven",
     "clave_dev.mutation:tested",
+    "clave_dev.mutation_py:unproven",
 ]
 
 
@@ -111,7 +112,7 @@ class GatesCanFailTest(unittest.TestCase):
     def test_the_list_of_gates_is_not_quietly_empty(self):
         # Мета-тест, который ничего не проверяет, — сам декорация. Пустой список гейтов дал бы
         # вечно-зелёный результат, и это ровно та болезнь, которую он лечит.
-        self.assertGreaterEqual(len(GATES), 11)
+        self.assertGreaterEqual(len(GATES), 12)
         self.assertTrue(PROVE.is_file(), "скрипт мутации пропал — правило перестало действовать")
 
 

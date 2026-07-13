@@ -2,18 +2,21 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from collections import namedtuple
 
 from .agent import run_agent
 from .assertions import structural_assertions
 from .binaries import fresh_binary
-from .checks import run_checks
+from .checks import python_suite_dir, run_checks
 from .context import build_context, build_mutation_context, build_visual_context
 from .diff import build_diff, changed_paths, diff_text
 from .emit import no_op_emitter
 from .failures import failure_payload
 from .mutation import describe as describe_mutants
-from .mutation import mutants_cmd, unproven
+from .mutation import mutants_cmd, tested, unproven
+from .mutation_py import describe as describe_py_mutants
+from .mutation_py import unproven as unproven_py
 from .unverified import unverified
 from .observer import run_scenario
 from .visual_observer import observe_visual_all
@@ -274,9 +277,17 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
                     capture_output=True, text=True, check=False,
                 )
                 mutants_output = res.stdout + res.stderr
-                unproven_mutants = unproven(
-                    diff_text(cfg.worktree, cfg.base_sha), mutants_output
-                )
+                text = diff_text(cfg.worktree, cfg.base_sha)
+                unproven_mutants = unproven(text, mutants_output)
+
+                # ...и то же самое для PYTHON-половины. cargo mutants её не видит вовсе, поэтому
+                # правки в самом супервайзере проверяло НИЧТО: пиши к ним `assertTrue(True)`, и
+                # набор зелёный. Дыра ровно та, ради которой гейт и заведён, — только в половине
+                # проекта, где живёт он сам.
+                pkg = python_suite_dir(cfg.worktree)
+                if pkg is not None:
+                    unproven_mutants = unproven_mutants + unproven_py(pkg, text, sys.executable)
+
                 # Отчёт обязан знать, что гейт РАБОТАЛ: иначе он объявит «правку не проверяет
                 # ничто» сразу после того, как гейт сказал «тесты агента кусаются». Переписанный
                 # (а не добавленный) тест — ровно этот случай, и он поймал меня на живом прогоне.

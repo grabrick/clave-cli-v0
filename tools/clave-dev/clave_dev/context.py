@@ -50,7 +50,13 @@ def build_mutation_context(mutants) -> str:
     снова пройдёт cargo. Требование должно быть про ПАДЕНИЕ: тест обязан краснеть, если функцию
     сломать. Именно это и проверяет мутация.
     """
-    from .mutation import describe
+    # Список смешанный: Rust мутирует cargo-mutants, python-половину — свой гейт. Описания у них
+    # разные, и звать один describe на оба типа значит уронить петлю на AttributeError в конце
+    # прогона. Ровно так уже падал /dev в _emit_final: функция проверена, МЕСТО ВЫЗОВА — нет.
+    from .mutation import Mutant
+    from .mutation import describe as describe_rust
+    from .mutation_py import PyMutant
+    from .mutation_py import describe as describe_py
 
     lines = [
         "## Твои тесты ничего не доказывают",
@@ -59,7 +65,8 @@ def build_mutation_context(mutants) -> str:
         "функцию — декорация: он не умеет упасть. Зелёный `cargo test` тут ничего не значит.",
         "",
     ]
-    lines += [f"- {line}" for line in describe(mutants)]
+    lines += [f"- {line}" for line in describe_rust([m for m in mutants if isinstance(m, Mutant)])]
+    lines += [f"- {line}" for line in describe_py([m for m in mutants if isinstance(m, PyMutant)])]
     lines += [
         "",
         "Перепиши тесты так, чтобы каждый из них ПАДАЛ при такой мутации: прибей их к конкретным",

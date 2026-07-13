@@ -18,8 +18,14 @@ from pathlib import Path
 
 
 def _git(worktree: Path, *args: str) -> str:
+    # core.quotepath=false — иначе git экранирует не-ASCII пути в кавычки с octal-escape'ами
+    # («+++ "b/clave_dev/\320\277.py"»), и всё, что разбирает дифф по именам файлов, такой файл
+    # ПРОПУСКАЕТ МОЛЧА. Мутационный гейт на нём слеп: код есть, проверок нет, отчёт зелёный.
     return subprocess.run(
-        ["git", "-C", str(worktree), *args], capture_output=True, text=True, check=False
+        ["git", "-C", str(worktree), "-c", "core.quotepath=false", *args],
+        capture_output=True,
+        text=True,
+        check=False,
     ).stdout
 
 

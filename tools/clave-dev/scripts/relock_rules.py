@@ -30,6 +30,9 @@ PROTECTED = [
     "tests/test_rules_are_enforced.py",
     "scripts/prove_gate.py",
     "scripts/prove_no_dead_modules.py",
+    # Мутационный гейт python-половины: выпотрошить neuter.py так же тихо, как prove_gate.
+    "scripts/neuter.py",
+    "clave_dev/mutation_py.py",
     "clave_dev/unverified.py",
     "../../.github/workflows/dev-rules.yml",
     # Релиз — второй путь в прод: тег собирает бинарь с ЛЮБОЙ ветки, мимо стража main.
