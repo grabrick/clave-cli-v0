@@ -1,5 +1,6 @@
 use crate::prelude::*;
 use crate::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Настраивает дочерний процесс лидером НОВОЙ группы процессов, чтобы его собственные
 /// под-процессы (Bash-инструменты агента) попадали в ту же группу. Тогда при отмене или
@@ -67,6 +68,141 @@ fn private_temp_dir() -> PathBuf {
         let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     }
     dir
+}
+
+/// Временный файл для `-o` codex: удаляется при выходе из области видимости по ЛЮБОЙ
+/// ветке (успех, отмена, таймаут, ошибка спавна). Раньше `remove_file` был рассыпан по
+/// веткам — забыть его в новой ветке означало утечку файла в /tmp на каждый прогон.
+struct TempOut {
+    path: PathBuf,
+}
+
+impl TempOut {
+    /// Имя уникально в пределах процесса за счёт счётчика (часы могут не дать
+    /// уникальности двум соседним вызовам — два шага тандема писали бы в один файл),
+    /// а между процессами — за счёт pid в имени каталога (`private_temp_dir`).
+    fn new(prefix: &str) -> Self {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        Self {
+            path: private_temp_dir().join(format!("{prefix}-{seq}.txt")),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Содержимое файла (пусто, если провайдер его не создавал — например claude).
+    fn read(&self) -> String {
+        fs::read_to_string(&self.path).unwrap_or_default()
+    }
+}
+
+impl Drop for TempOut {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Команда запуска провайдера. Единственное место, где решается «claude или codex»:
+/// у обоих раннеров (чат и тандем) сборка одинакова.
+fn provider_command(
+    provider: &str,
+    effort: &str,
+    prompt: &str,
+    codex_out: &Path,
+    access: RunAccess,
+) -> Command {
+    if provider == "claude" {
+        let mut command = Command::new(claude_binary());
+        command.args(claude_chat_args(effort, access, prompt));
+        return command;
+    }
+    let mut command = Command::new(codex_binary());
+    command.args([
+        "exec",
+        "--json",
+        "-o",
+        &codex_out.to_string_lossy(),
+        "-c",
+        &format!("model_reasoning_effort=\"{}\"", effort),
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--color",
+        "never",
+        "-s",
+        access.codex_sandbox(),
+        prompt,
+    ]);
+    command
+}
+
+/// Ридер stdout под провайдера: claude отдаёт stream-json (токены ответа + tool_use),
+/// codex — JSONL событий. Возвращаемая строка — сырьё для `provider_result`.
+fn spawn_provider_reader<R: Read + Send + 'static>(
+    provider: &str,
+    out: R,
+    tx: Sender<WorkerEvent>,
+    lang: Language,
+    last_activity: Arc<Mutex<Instant>>,
+) -> thread::JoinHandle<String> {
+    if provider == "claude" {
+        spawn_claude_activity_reader(out, tx, lang, last_activity)
+    } else {
+        spawn_codex_activity_reader(out, tx, lang, last_activity)
+    }
+}
+
+/// Ответ провайдера из уже собранных кусков: claude кладёт всё в stdout (result-событие),
+/// codex — текст в файл `-o`, usage в JSONL stdout, ошибку сообщает только кодом выхода.
+fn provider_result(
+    provider: &str,
+    stdout: &str,
+    codex_text: String,
+) -> (String, Option<RunUsage>, bool) {
+    if provider == "claude" {
+        let parsed = parse_claude_response(stdout);
+        return (parsed.text, parsed.usage, parsed.is_error);
+    }
+    (codex_text, parse_codex_usage(stdout), false)
+}
+
+/// Код выхода прогона: claude может выйти с 0, пометив ответ `is_error` — такой прогон
+/// НЕ успешен, иначе ошибка провайдера утекла бы в чат как нормальный ответ.
+fn final_code(status: Option<i32>, is_error: bool) -> i32 {
+    let code = status.unwrap_or(1);
+    if is_error && code == 0 {
+        return 1;
+    }
+    code
+}
+
+/// Простой дольше лимита — провайдер считается зависшим (граница включительная).
+fn idle_expired(elapsed: Duration, timeout: Duration) -> bool {
+    elapsed >= timeout
+}
+
+/// Сколько простаивает провайдер (отравленный mutex → 0: живой процесс не убиваем зря).
+fn idle_elapsed(last_activity: &Arc<Mutex<Instant>>) -> Duration {
+    last_activity
+        .lock()
+        .map(|t| t.elapsed())
+        .unwrap_or_default()
+}
+
+fn idle_timeout_message(lang: Language) -> String {
+    idle_timeout_message_for(lang, idle_timeout())
+}
+
+/// Текст «провайдер молчал N секунд» в отрыве от окружения (тест прибивает секунды).
+fn idle_timeout_message_for(lang: Language, timeout: Duration) -> String {
+    format!(
+        "{} {}{}",
+        lang.choose("Провайдер не отвечал", "Provider produced no output for"),
+        timeout.as_secs(),
+        lang.choose(" c — остановлен по таймауту.", "s — stopped (timeout)."),
+    )
 }
 
 pub(crate) fn spawn_reader<R>(reader: R, tx: Sender<WorkerEvent>)
@@ -474,8 +610,13 @@ pub(crate) fn codex_binary() -> String {
 /// общий таймаут — нормальный агентский прогон постоянно стримит события, поэтому
 /// долгие, но активные раны не страдают. Переопределяется `CLAVE_IDLE_TIMEOUT_SECS`.
 pub(crate) fn idle_timeout() -> Duration {
-    let secs = env::var("CLAVE_IDLE_TIMEOUT_SECS")
-        .ok()
+    idle_timeout_from(env::var("CLAVE_IDLE_TIMEOUT_SECS").ok().as_deref())
+}
+
+/// Разбор лимита простоя из значения переменной. Мусор и ноль → дефолт: нулевой таймаут
+/// убивал бы провайдера сразу после спавна, отрицательный/нечисловой — просто опечатка.
+fn idle_timeout_from(value: Option<&str>) -> Duration {
+    let secs = value
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&s| s > 0)
         .unwrap_or(180);
@@ -500,9 +641,31 @@ pub(crate) fn run_chat_provider(
     lang: Language,
     access: RunAccess,
 ) -> io::Result<ChatRunResult> {
-    let result = run_chat_attempt(
-        provider, effort, prompt, work_dir, &cancel_rx, &tx, lang, access,
-    )?;
+    run_chat_retrying(
+        || {
+            run_chat_attempt(
+                provider, effort, prompt, work_dir, &cancel_rx, &tx, lang, access,
+            )
+        },
+        &cancel_rx,
+        &tx,
+        lang,
+    )
+}
+
+/// Решение о повторе в отрыве от запуска процессов: `attempt` — одна попытка чата
+/// (в проде — `run_chat_attempt`). Шов существует ради тестов: иначе условие ретрая
+/// проверяемо только реальным CLI.
+fn run_chat_retrying<F>(
+    mut attempt: F,
+    cancel_rx: &Receiver<()>,
+    tx: &Sender<WorkerEvent>,
+    lang: Language,
+) -> io::Result<ChatRunResult>
+where
+    F: FnMut() -> io::Result<ChatRunResult>,
+{
+    let result = attempt()?;
     if !is_transient_chat_failure(&result) {
         return Ok(result);
     }
@@ -518,9 +681,7 @@ pub(crate) fn run_chat_provider(
         )
         .to_string(),
     ));
-    run_chat_attempt(
-        provider, effort, prompt, work_dir, &cancel_rx, &tx, lang, access,
-    )
+    attempt()
 }
 
 /// Транзиентный сбой, который имеет смысл повторить: процесс мгновенно вышел с
@@ -545,37 +706,8 @@ fn run_chat_attempt(
     lang: Language,
     access: RunAccess,
 ) -> io::Result<ChatRunResult> {
-    let codex_out_file = private_temp_dir().join(format!(
-        "codex-{}.txt",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    let mut command = if provider == "claude" {
-        let mut command = Command::new(claude_binary());
-        command.args(claude_chat_args(effort, access, prompt));
-        command
-    } else {
-        let mut command = Command::new(codex_binary());
-        let codex_out = codex_out_file.to_string_lossy().into_owned();
-        command.args([
-            "exec",
-            "--json",
-            "-o",
-            &codex_out,
-            "-c",
-            &format!("model_reasoning_effort=\"{}\"", effort),
-            "--skip-git-repo-check",
-            "--ephemeral",
-            "--color",
-            "never",
-            "-s",
-            access.codex_sandbox(),
-            prompt,
-        ]);
-        command
-    };
+    let codex_out = TempOut::new("codex");
+    let mut command = provider_command(provider, effort, prompt, codex_out.path(), access);
 
     configure_process_group(&mut command);
     let mut child = command
@@ -588,13 +720,10 @@ fn run_chat_attempt(
         .stderr(Stdio::piped())
         .spawn()?;
     let last_activity = Arc::new(Mutex::new(Instant::now()));
-    let stdout_handle = child.stdout.take().map(|out| {
-        if provider == "claude" {
-            spawn_claude_activity_reader(out, tx.clone(), lang, last_activity.clone())
-        } else {
-            spawn_codex_activity_reader(out, tx.clone(), lang, last_activity.clone())
-        }
-    });
+    let stdout_handle = child
+        .stdout
+        .take()
+        .map(|out| spawn_provider_reader(provider, out, tx.clone(), lang, last_activity.clone()));
     let stderr_handle = child.stderr.take().map(spawn_capture_reader);
 
     loop {
@@ -605,7 +734,6 @@ fn run_chat_attempt(
             kill_process_tree(&mut child);
             drop(stdout_handle);
             drop(stderr_handle);
-            let _ = fs::remove_file(&codex_out_file);
             return Ok(ChatRunResult::Cancelled);
         }
 
@@ -618,42 +746,23 @@ fn run_chat_attempt(
                     .map(|handle| handle.join().unwrap_or_default())
                     .unwrap_or_default();
 
-                let (text, usage, is_error) = if provider == "claude" {
-                    let parsed = parse_claude_response(&stdout);
-                    (parsed.text, parsed.usage, parsed.is_error)
-                } else {
-                    let text = fs::read_to_string(&codex_out_file).unwrap_or_default();
-                    let usage = parse_codex_usage(&stdout);
-                    let _ = fs::remove_file(&codex_out_file);
-                    (text, usage, false)
-                };
-
-                let mut code = status.code().unwrap_or(1);
-                if is_error && code == 0 {
-                    code = 1;
-                }
+                let (text, usage, is_error) = provider_result(provider, &stdout, codex_out.read());
+                let code = final_code(status.code(), is_error);
                 return Ok(ChatRunResult::Completed(code, text, stderr, usage));
             }
             None => {
-                if last_activity
-                    .lock()
-                    .map(|t| t.elapsed())
-                    .unwrap_or_default()
-                    >= idle_timeout()
-                {
+                if idle_expired(idle_elapsed(&last_activity), idle_timeout()) {
                     // Зависший CLI: убиваем всю его группу (CLI + под-процессы), чтобы
                     // закрылись пайпы, и роняем ридеры — они завершатся сами по EOF.
                     kill_process_tree(&mut child);
                     drop(stdout_handle);
                     drop(stderr_handle);
-                    let _ = fs::remove_file(&codex_out_file);
-                    let secs = idle_timeout().as_secs();
-                    let msg = format!(
-                        "{} {secs}{}",
-                        lang.choose("Провайдер не отвечал", "Provider produced no output for"),
-                        lang.choose(" c — остановлен по таймауту.", "s — stopped (timeout)."),
-                    );
-                    return Ok(ChatRunResult::Completed(124, String::new(), msg, None));
+                    return Ok(ChatRunResult::Completed(
+                        124,
+                        String::new(),
+                        idle_timeout_message(lang),
+                        None,
+                    ));
                 }
                 thread::sleep(Duration::from_millis(80));
             }
@@ -717,37 +826,8 @@ pub(crate) fn run_provider_once(
     tx: &Sender<WorkerEvent>,
     cancel_rx: &Receiver<()>,
 ) -> io::Result<Option<TandemStep>> {
-    let codex_out_file = private_temp_dir().join(format!(
-        "tandem-{}.txt",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    let mut command = if provider == "claude" {
-        let mut command = Command::new(claude_binary());
-        command.args(claude_chat_args(effort, access, prompt));
-        command
-    } else {
-        let mut command = Command::new(codex_binary());
-        let codex_out = codex_out_file.to_string_lossy().into_owned();
-        command.args([
-            "exec",
-            "--json",
-            "-o",
-            &codex_out,
-            "-c",
-            &format!("model_reasoning_effort=\"{}\"", effort),
-            "--skip-git-repo-check",
-            "--ephemeral",
-            "--color",
-            "never",
-            "-s",
-            access.codex_sandbox(),
-            prompt,
-        ]);
-        command
-    };
+    let codex_out = TempOut::new("tandem");
+    let mut command = provider_command(provider, effort, prompt, codex_out.path(), access);
 
     configure_process_group(&mut command);
     let mut child = command
@@ -760,13 +840,10 @@ pub(crate) fn run_provider_once(
         .stderr(Stdio::piped())
         .spawn()?;
     let last_activity = Arc::new(Mutex::new(Instant::now()));
-    let stdout_handle = child.stdout.take().map(|out| {
-        if provider == "claude" {
-            spawn_claude_activity_reader(out, tx.clone(), lang, last_activity.clone())
-        } else {
-            spawn_codex_activity_reader(out, tx.clone(), lang, last_activity.clone())
-        }
-    });
+    let stdout_handle = child
+        .stdout
+        .take()
+        .map(|out| spawn_provider_reader(provider, out, tx.clone(), lang, last_activity.clone()));
     let stderr_handle = child.stderr.take().map(spawn_capture_reader);
 
     loop {
@@ -777,7 +854,6 @@ pub(crate) fn run_provider_once(
             kill_process_tree(&mut child);
             drop(stdout_handle);
             drop(stderr_handle);
-            let _ = fs::remove_file(&codex_out_file);
             return Ok(None);
         }
 
@@ -788,43 +864,19 @@ pub(crate) fn run_provider_once(
                     .unwrap_or_default();
                 let _ = stderr_handle.map(|handle| handle.join().unwrap_or_default());
 
-                let (text, usage, is_error) = if provider == "claude" {
-                    let parsed = parse_claude_response(&stdout);
-                    (parsed.text, parsed.usage, parsed.is_error)
-                } else {
-                    let text = fs::read_to_string(&codex_out_file).unwrap_or_default();
-                    let usage = parse_codex_usage(&stdout);
-                    let _ = fs::remove_file(&codex_out_file);
-                    (text, usage, false)
-                };
-
-                let mut code = status.code().unwrap_or(1);
-                if is_error && code == 0 {
-                    code = 1;
-                }
+                let (text, usage, is_error) = provider_result(provider, &stdout, codex_out.read());
+                let code = final_code(status.code(), is_error);
                 return Ok(Some(TandemStep { text, code, usage }));
             }
             None => {
-                if last_activity
-                    .lock()
-                    .map(|t| t.elapsed())
-                    .unwrap_or_default()
-                    >= idle_timeout()
-                {
+                if idle_expired(idle_elapsed(&last_activity), idle_timeout()) {
                     // Зависший CLI: убиваем всю его группу (CLI + под-процессы), чтобы
                     // закрылись пайпы, и роняем ридеры — они завершатся сами по EOF.
                     kill_process_tree(&mut child);
                     drop(stdout_handle);
                     drop(stderr_handle);
-                    let _ = fs::remove_file(&codex_out_file);
-                    let secs = idle_timeout().as_secs();
-                    let text = format!(
-                        "{} {secs}{}",
-                        lang.choose("Провайдер не отвечал", "Provider produced no output for"),
-                        lang.choose(" c — остановлен по таймауту.", "s — stopped (timeout)."),
-                    );
                     return Ok(Some(TandemStep {
-                        text,
+                        text: idle_timeout_message(lang),
                         code: 124,
                         usage: None,
                     }));
@@ -883,6 +935,44 @@ pub(crate) fn run_tandem(
     tx: Sender<WorkerEvent>,
     lang: Language,
 ) -> io::Result<TandemResult> {
+    let run_step = |provider: &'static str, effort: &str, prompt: &str, access: RunAccess| {
+        run_provider_once(
+            provider, effort, prompt, work_dir, access, lang, &tx, &cancel_rx,
+        )
+    };
+    run_tandem_with(
+        run_step,
+        executor,
+        critic,
+        executor_effort,
+        critic_effort,
+        task,
+        rounds,
+        &cancel_rx,
+        &tx,
+        lang,
+    )
+}
+
+/// Оркестрация тандема в отрыве от запуска процессов: `run_step` — один вызов провайдера
+/// (в проде — `run_provider_once`), `None` = отмена. Шов существует ради тестов: иначе
+/// последовательность фаз и обработка ошибок проверяемы только реальными CLI.
+#[allow(clippy::too_many_arguments)]
+fn run_tandem_with<R>(
+    mut run_step: R,
+    executor: &'static str,
+    critic: &'static str,
+    executor_effort: &str,
+    critic_effort: &str,
+    task: &str,
+    rounds: usize,
+    cancel_rx: &Receiver<()>,
+    tx: &Sender<WorkerEvent>,
+    lang: Language,
+) -> io::Result<TandemResult>
+where
+    R: FnMut(&'static str, &str, &str, RunAccess) -> io::Result<Option<TandemStep>>,
+{
     let mut transcript = TandemTranscript::new();
     let mut total = RunUsage::default();
     let executor_name = provider_display(executor, lang);
@@ -906,23 +996,14 @@ pub(crate) fn run_tandem(
     let mut consensus = false;
     for round in 1..=rounds.max(1) {
         let propose = tandem_propose_prompt(task, &transcript.render(), lang);
-        let step = match run_provider_once(
-            executor,
-            executor_effort,
-            &propose,
-            work_dir,
-            RunAccess::PlanReadonly,
-            lang,
-            &tx,
-            &cancel_rx,
-        )? {
+        let step = match run_step(executor, executor_effort, &propose, RunAccess::PlanReadonly)? {
             Some(s) => s,
             None => return Ok(TandemResult::Cancelled),
         };
         tandem_accumulate(&mut total, &step.usage);
         if step.code != 0 {
             tandem_notice(
-                &tx,
+                tx,
                 format!(
                     "{} {}",
                     executor_name,
@@ -932,7 +1013,7 @@ pub(crate) fn run_tandem(
             return Ok(TandemResult::Completed(step.code, opt_usage(total)));
         }
         emit_tandem_step(
-            &tx,
+            tx,
             "🅐",
             executor_name,
             &format!("{} {round} · {}", lang.choose("раунд", "round"), exec_role),
@@ -948,23 +1029,14 @@ pub(crate) fn run_tandem(
         );
 
         let challenge = tandem_challenge_prompt(task, &transcript.render(), lang);
-        let step = match run_provider_once(
-            critic,
-            critic_effort,
-            &challenge,
-            work_dir,
-            RunAccess::PlanReadonly,
-            lang,
-            &tx,
-            &cancel_rx,
-        )? {
+        let step = match run_step(critic, critic_effort, &challenge, RunAccess::PlanReadonly)? {
             Some(s) => s,
             None => return Ok(TandemResult::Cancelled),
         };
         tandem_accumulate(&mut total, &step.usage);
         if step.code != 0 {
             tandem_notice(
-                &tx,
+                tx,
                 format!(
                     "{} {}",
                     critic_name,
@@ -974,7 +1046,7 @@ pub(crate) fn run_tandem(
             return Ok(TandemResult::Completed(step.code, opt_usage(total)));
         }
         emit_tandem_step(
-            &tx,
+            tx,
             "🅒",
             critic_name,
             &format!("{} {round} · {}", lang.choose("раунд", "round"), crit_role),
@@ -996,7 +1068,7 @@ pub(crate) fn run_tandem(
     }
     if !consensus {
         tandem_notice(
-            &tx,
+            tx,
             lang.choose(
                 "⚠ Консенсус не достигнут за раунды — исполняю последнюю версию.",
                 "⚠ No consensus within the rounds — executing the latest proposal.",
@@ -1010,27 +1082,18 @@ pub(crate) fn run_tandem(
         return Ok(TandemResult::Cancelled);
     }
     let execute = tandem_execute_prompt(task, &transcript.render(), lang);
-    let step = match run_provider_once(
-        executor,
-        executor_effort,
-        &execute,
-        work_dir,
-        RunAccess::PlanExecute,
-        lang,
-        &tx,
-        &cancel_rx,
-    )? {
+    let step = match run_step(executor, executor_effort, &execute, RunAccess::PlanExecute)? {
         Some(s) => s,
         None => {
-            dirty_notice(&tx);
+            dirty_notice(tx);
             return Ok(TandemResult::Cancelled);
         }
     };
     tandem_accumulate(&mut total, &step.usage);
     if step.code != 0 {
-        dirty_notice(&tx);
+        dirty_notice(tx);
         tandem_notice(
-            &tx,
+            tx,
             format!(
                 "{} {}",
                 executor_name,
@@ -1040,7 +1103,7 @@ pub(crate) fn run_tandem(
         return Ok(TandemResult::Completed(step.code, opt_usage(total)));
     }
     emit_tandem_step(
-        &tx,
+        tx,
         "🅐",
         executor_name,
         &format!("{} · {}", lang.choose("исполнение", "execution"), exec_role),
@@ -1054,25 +1117,16 @@ pub(crate) fn run_tandem(
 
     // ФАЗА РЕВЬЮ
     let review = tandem_review_prompt(task, &transcript.render(), lang);
-    let step = match run_provider_once(
-        critic,
-        critic_effort,
-        &review,
-        work_dir,
-        RunAccess::PlanReadonly,
-        lang,
-        &tx,
-        &cancel_rx,
-    )? {
+    let step = match run_step(critic, critic_effort, &review, RunAccess::PlanReadonly)? {
         Some(s) => s,
         None => {
-            dirty_notice(&tx);
+            dirty_notice(tx);
             return Ok(TandemResult::Cancelled);
         }
     };
     tandem_accumulate(&mut total, &step.usage);
     emit_tandem_step(
-        &tx,
+        tx,
         "🅒",
         critic_name,
         &format!("{} · {}", lang.choose("ревью", "review"), crit_role),
@@ -1085,29 +1139,20 @@ pub(crate) fn run_tandem(
     if !review_ok {
         let review_text = step.text.clone();
         if cancel_rx.try_recv().is_ok() {
-            dirty_notice(&tx);
+            dirty_notice(tx);
             return Ok(TandemResult::Cancelled);
         }
         let fix = tandem_fix_prompt(task, &transcript.render(), &review_text, lang);
-        let step = match run_provider_once(
-            executor,
-            executor_effort,
-            &fix,
-            work_dir,
-            RunAccess::PlanExecute,
-            lang,
-            &tx,
-            &cancel_rx,
-        )? {
+        let step = match run_step(executor, executor_effort, &fix, RunAccess::PlanExecute)? {
             Some(s) => s,
             None => {
-                dirty_notice(&tx);
+                dirty_notice(tx);
                 return Ok(TandemResult::Cancelled);
             }
         };
         tandem_accumulate(&mut total, &step.usage);
         emit_tandem_step(
-            &tx,
+            tx,
             "🅐",
             executor_name,
             &format!(
@@ -1124,25 +1169,16 @@ pub(crate) fn run_tandem(
         );
 
         let confirm = tandem_confirm_prompt(task, &transcript.render(), lang);
-        let step = match run_provider_once(
-            critic,
-            critic_effort,
-            &confirm,
-            work_dir,
-            RunAccess::PlanReadonly,
-            lang,
-            &tx,
-            &cancel_rx,
-        )? {
+        let step = match run_step(critic, critic_effort, &confirm, RunAccess::PlanReadonly)? {
             Some(s) => s,
             None => {
-                dirty_notice(&tx);
+                dirty_notice(tx);
                 return Ok(TandemResult::Cancelled);
             }
         };
         tandem_accumulate(&mut total, &step.usage);
         emit_tandem_step(
-            &tx,
+            tx,
             "🅒",
             critic_name,
             &format!(
@@ -1154,7 +1190,7 @@ pub(crate) fn run_tandem(
         );
         if !parse_tandem_signal(&step.text) {
             tandem_notice(
-                &tx,
+                tx,
                 lang.choose(
                     "⚠ Остались замечания критика.",
                     "⚠ The critic still has unresolved issues.",
@@ -2102,6 +2138,974 @@ mod tests {
             None
         )));
         assert!(!is_transient_chat_failure(&ChatRunResult::Cancelled));
+    }
+
+    // --- жизненный цикл процесса: чистые решения ---
+
+    #[test]
+    fn temp_out_lives_in_private_dir_and_is_removed() {
+        let out = TempOut::new("test-out");
+        let path = out.path().to_path_buf();
+        assert!(
+            path.starts_with(env::temp_dir()),
+            "временный файл лежит в приватном каталоге: {path:?}"
+        );
+
+        fs::write(&path, "ответ codex").expect("файл записывается");
+        assert_eq!(out.read(), "ответ codex", "read() отдаёт содержимое файла");
+
+        // Два файла подряд не совпадают: иначе два шага тандема писали бы в один.
+        let other = TempOut::new("test-out");
+        assert_ne!(other.path(), path.as_path());
+
+        drop(out);
+        assert!(!path.exists(), "Drop удаляет файл — иначе утечка в /tmp");
+    }
+
+    #[test]
+    fn temp_out_read_is_empty_when_provider_wrote_nothing() {
+        // claude файл `-o` не создаёт: чтение обязано дать пустоту, а не панику.
+        let out = TempOut::new("test-missing");
+        assert_eq!(out.read(), "");
+    }
+
+    #[test]
+    fn provider_command_is_built_per_provider() {
+        let codex_out = PathBuf::from("/tmp/clave-out.txt");
+        let args = |command: &Command| -> Vec<String> {
+            command
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let claude = provider_command("claude", "max", "промт", &codex_out, RunAccess::PlanExecute);
+        let claude_args = args(&claude);
+        assert!(claude_args.contains(&"-p".to_string()), "{claude_args:?}");
+        assert!(!claude_args.contains(&"exec".to_string()), "не codex-вызов");
+        assert_eq!(claude_args.last().map(String::as_str), Some("промт"));
+
+        let codex = provider_command(
+            "codex",
+            "xhigh",
+            "промт",
+            &codex_out,
+            RunAccess::PlanReadonly,
+        );
+        let codex_args = args(&codex);
+        assert!(codex_args.contains(&"exec".to_string()), "{codex_args:?}");
+        assert!(!codex_args.contains(&"-p".to_string()), "не claude-вызов");
+        // Вывод codex забираем файлом, песочница — из прав запуска, effort — в -c.
+        let out_idx = codex_args
+            .iter()
+            .position(|a| a == "-o")
+            .expect("-o присутствует");
+        assert_eq!(codex_args[out_idx + 1], "/tmp/clave-out.txt");
+        let sandbox_idx = codex_args
+            .iter()
+            .position(|a| a == "-s")
+            .expect("-s присутствует");
+        assert_eq!(
+            codex_args[sandbox_idx + 1],
+            RunAccess::PlanReadonly.codex_sandbox()
+        );
+        assert!(codex_args
+            .iter()
+            .any(|a| a == "model_reasoning_effort=\"xhigh\""));
+        assert_eq!(codex_args.last().map(String::as_str), Some("промт"));
+    }
+
+    #[test]
+    fn provider_reader_is_chosen_by_provider() {
+        let (tx, _rx) = mpsc::channel();
+        let last = Arc::new(Mutex::new(Instant::now()));
+        let event = "{\"type\":\"turn.completed\",\"usage\":{}}\n";
+
+        // codex-ридер отдаёт ВЕСЬ stdout (в нём usage), claude-ридер — только result.
+        let codex = spawn_provider_reader(
+            "codex",
+            io::Cursor::new(event),
+            tx.clone(),
+            Language::Ru,
+            last.clone(),
+        );
+        assert_eq!(codex.join().expect("ридер завершился"), event);
+
+        let claude = spawn_provider_reader(
+            "claude",
+            io::Cursor::new(event),
+            tx.clone(),
+            Language::Ru,
+            last.clone(),
+        );
+        assert_eq!(claude.join().expect("ридер завершился"), "");
+
+        let result_line = "{\"type\":\"result\",\"result\":\"ок\"}";
+        let claude = spawn_provider_reader(
+            "claude",
+            io::Cursor::new(result_line),
+            tx,
+            Language::Ru,
+            last,
+        );
+        assert_eq!(claude.join().expect("ридер завершился"), result_line);
+    }
+
+    #[test]
+    fn provider_result_takes_text_from_the_right_source() {
+        // claude: всё в stdout — файл codex игнорируем, is_error поднимаем.
+        let stdout = r#"{"type":"result","is_error":true,"result":"боом","usage":{"input_tokens":7,"output_tokens":3}}"#;
+        let (text, usage, is_error) = provider_result("claude", stdout, "мусор из файла".into());
+        assert_eq!(text, "боом");
+        assert!(is_error);
+        assert_eq!(usage.expect("usage claude").input, 7);
+
+        // codex: текст — из файла `-o`, usage — из JSONL, ошибок в выводе нет.
+        let jsonl = "{\"usage\":{\"input_tokens\":11,\"output_tokens\":2}}\n";
+        let (text, usage, is_error) = provider_result("codex", jsonl, "ответ codex".into());
+        assert_eq!(text, "ответ codex");
+        assert_eq!(usage.expect("usage codex").input, 11);
+        assert!(!is_error, "codex сообщает об ошибке только кодом выхода");
+    }
+
+    #[test]
+    fn final_code_fails_run_on_soft_claude_error() {
+        assert_eq!(final_code(Some(0), false), 0);
+        // claude вышел с 0, но пометил ответ ошибкой — прогон НЕ успешен.
+        assert_eq!(final_code(Some(0), true), 1);
+        // код провайдера не переписываем.
+        assert_eq!(final_code(Some(3), true), 3);
+        assert_eq!(final_code(Some(3), false), 3);
+        // убит сигналом (status.code() == None) — тоже провал.
+        assert_eq!(final_code(None, false), 1);
+    }
+
+    #[test]
+    fn idle_expired_boundary_is_inclusive() {
+        let limit = Duration::from_secs(180);
+        assert!(idle_expired(limit, limit), "ровно лимит — уже зависание");
+        assert!(idle_expired(Duration::from_millis(180_001), limit));
+        assert!(!idle_expired(Duration::from_millis(179_999), limit));
+        assert!(!idle_expired(Duration::ZERO, limit));
+    }
+
+    #[test]
+    fn activity_resets_the_idle_clock() {
+        let stale = Instant::now()
+            .checked_sub(Duration::from_secs(600))
+            .expect("часы позволяют отмотать назад");
+        let last = Arc::new(Mutex::new(stale));
+        assert!(
+            idle_elapsed(&last) >= Duration::from_secs(600),
+            "простой считается от последней активности"
+        );
+
+        // Строка вывода = активность: живой процесс не должен попасть под таймаут.
+        touch_activity(&last);
+        assert!(idle_elapsed(&last) < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn idle_timeout_falls_back_on_zero_and_garbage() {
+        let default = Duration::from_secs(180);
+        assert_eq!(idle_timeout_from(None), default);
+        assert_eq!(idle_timeout_from(Some("5")), Duration::from_secs(5));
+        assert_eq!(idle_timeout_from(Some("1")), Duration::from_secs(1));
+        // Ноль убивал бы провайдера сразу после спавна.
+        assert_eq!(idle_timeout_from(Some("0")), default);
+        assert_eq!(idle_timeout_from(Some("-1")), default);
+        assert_eq!(idle_timeout_from(Some("abc")), default);
+        // Живой лимит: нулевой таймаут = убийство любого прогона.
+        assert!(idle_timeout() > Duration::ZERO);
+    }
+
+    #[test]
+    fn idle_timeout_message_names_the_limit() {
+        let ru = idle_timeout_message_for(Language::Ru, Duration::from_secs(45));
+        assert!(ru.contains("45") && ru.contains("таймауту"), "{ru}");
+        let en = idle_timeout_message_for(Language::En, Duration::from_secs(45));
+        assert!(en.contains("45") && en.contains("timeout"), "{en}");
+        // Обёртка берёт лимит из окружения, а не из воздуха.
+        assert_eq!(
+            idle_timeout_message(Language::Ru),
+            idle_timeout_message_for(Language::Ru, idle_timeout())
+        );
+    }
+
+    #[test]
+    fn spawn_reader_forwards_every_line() {
+        let (tx, rx) = mpsc::channel();
+        spawn_reader(io::Cursor::new("первая\nвторая\n"), tx);
+        let lines: Vec<String> = rx
+            .iter()
+            .map(|event| match event {
+                WorkerEvent::Line(line) => line,
+                _ => panic!("ожидали Line"),
+            })
+            .collect();
+        assert_eq!(lines, ["первая", "вторая"]);
+    }
+
+    #[test]
+    fn spawn_worker_runs_body_and_reports_panic() {
+        let (tx, rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        spawn_worker(tx.clone(), move || {
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("тело воркера выполнено");
+
+        // Паника воркера обязана дать терминальное событие — иначе вечный лоадер.
+        spawn_worker(tx, || panic!("бум"));
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(WorkerEvent::Failed(msg)) => assert!(msg.contains("паника"), "{msg}"),
+            other => panic!("ожидали Failed после паники: {}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn provider_binaries_default_to_cli_names() {
+        // Пробы авторизации и запуск обязаны брать один и тот же бинарь.
+        assert_eq!(claude_binary(), "claude");
+        assert_eq!(codex_binary(), "codex");
+    }
+
+    // --- чистая логика чата ---
+
+    #[test]
+    fn estimate_tokens_takes_the_larger_estimate() {
+        assert_eq!(estimate_tokens(""), 1, "пустой текст — не ноль токенов");
+        assert_eq!(estimate_tokens("abcdefgh"), 2, "8 символов / 4");
+        assert_eq!(
+            estimate_tokens("a b c d e"),
+            5,
+            "короткие слова: побеждают слова"
+        );
+        assert_eq!(
+            estimate_tokens(&"я".repeat(40)),
+            10,
+            "считаем символы, а не байты"
+        );
+    }
+
+    #[test]
+    fn format_token_count_switches_units_on_thresholds() {
+        assert_eq!(format_token_count(999), "999");
+        assert_eq!(format_token_count(1_000), "1.0k");
+        assert_eq!(format_token_count(999_999), "1000.0k");
+        assert_eq!(format_token_count(1_000_000), "1.0m");
+        assert_eq!(format_token_count(2_500_000), "2.5m");
+    }
+
+    #[test]
+    fn provider_display_names_each_provider() {
+        assert_eq!(provider_display("codex", Language::Ru), "Codex");
+        assert_eq!(provider_display("claude", Language::Ru), "Claude");
+        assert_eq!(provider_display("gpt", Language::Ru), "Модель");
+        assert_eq!(provider_display("gpt", Language::En), "Model");
+    }
+
+    #[test]
+    fn chat_prompt_carries_message_context_and_ask_rules() {
+        let p = chat_prompt(
+            "почини баг",
+            "⏺ прошлый ответ",
+            Language::Ru,
+            ChatMode::Discussion,
+        );
+        assert!(p.contains("почини баг"));
+        assert!(p.contains("⏺ прошлый ответ"));
+        assert!(p.contains("clave-ask"), "правила блока вопросов на месте");
+        // Пустой контекст помечается явно, а не уезжает пустой строкой.
+        assert!(chat_prompt("x", "   ", Language::En, ChatMode::Discussion).contains("(empty)"));
+    }
+
+    #[test]
+    fn tandem_lang_hint_switches_language() {
+        assert!(tandem_lang_hint(Language::Ru).contains("русском"));
+        assert!(tandem_lang_hint(Language::En).contains("English"));
+    }
+
+    #[test]
+    fn recent_chat_context_keeps_tail_in_order_without_echo() {
+        let transcript: Vec<String> = [
+            "первая",
+            "⏺ Отправляю запрос",
+            "вторая",
+            "⏺ Sending request",
+            "третья",
+            "четвёртая",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        // Берём ХВОСТ и отдаём в исходном порядке.
+        assert_eq!(recent_chat_context(&transcript, 2), "третья\nчетвёртая");
+        // Эхо собственных запросов в контекст не попадает — ни русское, ни английское.
+        assert_eq!(
+            recent_chat_context(&transcript, 10),
+            "первая\nвторая\nтретья\nчетвёртая"
+        );
+
+        // Длинные строки режутся на 240 символах (промпт не должен раздуваться).
+        let long = vec!["я".repeat(300)];
+        let cut = recent_chat_context(&long, 1);
+        assert_eq!(cut.chars().count(), 240);
+        assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn codex_command_summary_uses_path_like_token() {
+        // Токен пути — со слэшем ИЛИ с точкой: имя файла рядом тоже путь.
+        assert_eq!(
+            summarize_codex_command("cat notes.md", Language::En),
+            "Reading notes.md"
+        );
+        assert_eq!(
+            summarize_codex_command("cat README", Language::En),
+            "Reading file"
+        );
+    }
+
+    #[test]
+    fn codex_usage_is_found_inside_arrays() {
+        let jsonl = "{\"items\":[{\"usage\":{\"input_tokens\":4,\"output_tokens\":1}}]}\n";
+        let usage = parse_codex_usage(jsonl).expect("usage найден внутри массива");
+        assert_eq!(usage.input, 4);
+        assert_eq!(usage.output, 1);
+    }
+
+    // --- накопление и лента тандема ---
+
+    #[test]
+    fn tandem_accumulate_sums_every_field() {
+        let mut total = RunUsage::default();
+        let first = RunUsage {
+            input: 10,
+            output: 2,
+            cache_read: 3,
+            cache_creation: 4,
+            cost_usd: 0.5,
+        };
+        tandem_accumulate(&mut total, &Some(first));
+        assert_eq!(total, first);
+
+        // Второй шаг ПРИБАВЛЯЕТСЯ (разные значения — перестановка полей заметна).
+        tandem_accumulate(
+            &mut total,
+            &Some(RunUsage {
+                input: 1,
+                output: 20,
+                cache_read: 300,
+                cache_creation: 4000,
+                cost_usd: 0.25,
+            }),
+        );
+        assert_eq!(total.input, 11);
+        assert_eq!(total.output, 22);
+        assert_eq!(total.cache_read, 303);
+        assert_eq!(total.cache_creation, 4004);
+        assert!((total.cost_usd - 0.75).abs() < 1e-9, "{}", total.cost_usd);
+
+        // Шаг без usage (codex без токенов) ничего не портит.
+        tandem_accumulate(&mut total, &None);
+        assert_eq!(total.input, 11);
+        assert_eq!(total.output, 22);
+    }
+
+    #[test]
+    fn opt_usage_hides_only_the_empty_total() {
+        assert!(opt_usage(RunUsage::default()).is_none());
+        let some = RunUsage {
+            input: 1,
+            ..RunUsage::default()
+        };
+        assert_eq!(opt_usage(some), Some(some));
+    }
+
+    #[test]
+    fn emit_tandem_step_streams_header_and_body() {
+        let (tx, rx) = mpsc::channel();
+        emit_tandem_step(
+            &tx,
+            "🅐",
+            "Claude",
+            "раунд 1 · Исполнитель",
+            "  первая\nвторая  ",
+        );
+        drop(tx);
+        let lines: Vec<String> = rx
+            .iter()
+            .map(|event| match event {
+                WorkerEvent::ChatLine(line) => line,
+                _ => panic!("ожидали ChatLine"),
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            ["", "🅐 Claude · раунд 1 · Исполнитель", "первая", "вторая"],
+            "разделитель ПЕРЕД шагом, заголовок, затем тело"
+        );
+    }
+
+    #[test]
+    fn tandem_notice_goes_to_the_status_line() {
+        let (tx, rx) = mpsc::channel();
+        tandem_notice(&tx, "⚠ внимание".to_string());
+        match rx.try_recv() {
+            Ok(WorkerEvent::Line(line)) => assert_eq!(line, "⚠ внимание"),
+            _ => panic!("уведомление не отправлено"),
+        }
+    }
+
+    #[test]
+    fn tandem_transcript_keeps_everything_while_short() {
+        // Много КОРОТКИХ записей — усечения нет (лимит по объёму, а не по числу).
+        let mut t = TandemTranscript::new();
+        for i in 1..=6 {
+            t.push("Критик", "раунд", &format!("запись {i}"));
+        }
+        let render = t.render();
+        assert!(!render.contains("усечены"));
+        assert!(render.contains("запись 2"));
+
+        // Четыре ДЛИННЫЕ записи — тоже целиком: обрезать нечего, это первый круг.
+        let mut big = TandemTranscript::new();
+        for i in 1..=4 {
+            big.push(
+                "Исполнитель",
+                "раунд",
+                &format!("запись {i} {}", "x".repeat(4000)),
+            );
+        }
+        assert!(!big.render().contains("усечены"));
+    }
+
+    #[test]
+    fn tandem_transcript_truncation_keeps_head_and_last_three() {
+        let mut t = TandemTranscript::new();
+        for i in 1..=5 {
+            t.push(
+                "Исполнитель",
+                "раунд",
+                &format!("запись {i} {}", "x".repeat(4000)),
+            );
+        }
+        let render = t.render();
+        assert!(render.contains("усечены"));
+        assert!(
+            render.contains("запись 1"),
+            "первая запись — задача — остаётся"
+        );
+        assert!(!render.contains("запись 2"), "ранние раунды выброшены");
+        for i in 3..=5 {
+            assert!(
+                render.contains(&format!("запись {i}")),
+                "хвост — последние три"
+            );
+        }
+    }
+
+    // --- решение о повторе в чате ---
+
+    fn completed(code: i32, text: &str, stderr: &str) -> ChatRunResult {
+        ChatRunResult::Completed(code, text.to_string(), stderr.to_string(), None)
+    }
+
+    #[test]
+    fn chat_retries_silent_failure_exactly_once() {
+        let (tx, rx) = mpsc::channel();
+        let (_cancel_tx, cancel_rx) = mpsc::channel();
+        let mut calls = 0;
+        let result = run_chat_retrying(
+            || {
+                calls += 1;
+                Ok(if calls == 1 {
+                    completed(1, "", "")
+                } else {
+                    completed(0, "ответ", "")
+                })
+            },
+            &cancel_rx,
+            &tx,
+            Language::Ru,
+        )
+        .expect("повтор не падает");
+
+        assert_eq!(calls, 2, "молчаливый сбой повторяется ровно один раз");
+        match result {
+            ChatRunResult::Completed(code, text, ..) => {
+                assert_eq!(code, 0);
+                assert_eq!(text, "ответ", "возвращается результат ПОВТОРА");
+            }
+            ChatRunResult::Cancelled => panic!("не отменяли"),
+        }
+        drop(tx);
+        let notices: Vec<String> = rx
+            .iter()
+            .filter_map(|event| match event {
+                WorkerEvent::Line(line) => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(|line| line.contains("повтор")),
+            "пользователь видит, что идёт повтор: {notices:?}"
+        );
+    }
+
+    #[test]
+    fn chat_does_not_retry_success_timeout_or_after_cancel() {
+        let attempts = |result: ChatRunResult, cancelled: bool| -> usize {
+            let (tx, _rx) = mpsc::channel();
+            let (cancel_tx, cancel_rx) = mpsc::channel();
+            if cancelled {
+                cancel_tx.send(()).expect("отмена уходит в канал");
+            }
+            let mut calls = 0;
+            let mut once = Some(result);
+            run_chat_retrying(
+                || {
+                    calls += 1;
+                    Ok(once.take().unwrap_or_else(|| completed(0, "повтор", "")))
+                },
+                &cancel_rx,
+                &tx,
+                Language::Ru,
+            )
+            .expect("прогон не падает");
+            calls
+        };
+
+        assert_eq!(attempts(completed(0, "ответ", ""), false), 1, "успех");
+        assert_eq!(attempts(completed(1, "", "boom"), false), 1, "есть stderr");
+        assert_eq!(attempts(completed(1, "ответ", ""), false), 1, "есть ответ");
+        assert_eq!(attempts(completed(124, "", ""), false), 1, "таймаут");
+        assert_eq!(
+            attempts(ChatRunResult::Cancelled, false),
+            1,
+            "отменённый прогон"
+        );
+        // Транзиентный сбой, но пользователь уже прервал — повтора быть не должно.
+        assert_eq!(attempts(completed(1, "", ""), true), 1, "отмена до повтора");
+    }
+
+    // --- оркестрация тандема ---
+
+    fn step(text: &str) -> Option<TandemStep> {
+        Some(TandemStep {
+            text: text.to_string(),
+            code: 0,
+            usage: None,
+        })
+    }
+
+    fn failing_step(code: i32) -> Option<TandemStep> {
+        Some(TandemStep {
+            text: "сбой".to_string(),
+            code,
+            usage: None,
+        })
+    }
+
+    struct TandemRun {
+        result: TandemResult,
+        calls: Vec<(&'static str, RunAccess)>,
+        notices: Vec<String>,
+        chat: Vec<String>,
+    }
+
+    /// Прогоняет оркестратор на СЦЕНАРИИ шагов (None = отмена внутри шага).
+    /// `cancel_after` — послать отмену в канал после N-го шага.
+    fn fake_tandem(
+        steps: Vec<Option<TandemStep>>,
+        rounds: usize,
+        cancel_after: Option<usize>,
+    ) -> TandemRun {
+        let (tx, rx) = mpsc::channel();
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        let mut calls = Vec::new();
+        let mut scripted = steps.into_iter();
+        let mut done = 0usize;
+
+        let result = run_tandem_with(
+            |provider, _effort, _prompt, access| {
+                calls.push((provider, access));
+                done += 1;
+                if cancel_after == Some(done) {
+                    cancel_tx.send(()).expect("отмена уходит в канал");
+                }
+                Ok(scripted.next().flatten())
+            },
+            "claude",
+            "codex",
+            "max",
+            "xhigh",
+            "задача",
+            rounds,
+            &cancel_rx,
+            &tx,
+            Language::Ru,
+        )
+        .expect("оркестратор не падает");
+
+        drop(tx);
+        let mut notices = Vec::new();
+        let mut chat = Vec::new();
+        for event in rx.iter() {
+            match event {
+                WorkerEvent::Line(line) => notices.push(line),
+                WorkerEvent::ChatLine(line) => chat.push(line),
+                _ => {}
+            }
+        }
+        TandemRun {
+            result,
+            calls,
+            notices,
+            chat,
+        }
+    }
+
+    #[test]
+    fn tandem_stops_at_consensus_and_scopes_access_per_phase() {
+        let run = fake_tandem(
+            vec![
+                step("предложение"),
+                step("TANDEM: CONSENSUS"),
+                step("сделал"),
+                step("ревью ок\nTANDEM: CONSENSUS"),
+            ],
+            3,
+            None,
+        );
+
+        // Дебаты и ревью — только чтение; правки разрешены ТОЛЬКО в исполнении.
+        assert_eq!(
+            run.calls,
+            vec![
+                ("claude", RunAccess::PlanReadonly),
+                ("codex", RunAccess::PlanReadonly),
+                ("claude", RunAccess::PlanExecute),
+                ("codex", RunAccess::PlanReadonly),
+            ],
+            "консенсус в раунде 1 → второго раунда нет, правка не нужна"
+        );
+        match run.result {
+            TandemResult::Completed(code, usage) => {
+                assert_eq!(code, 0);
+                assert!(
+                    usage.is_none(),
+                    "шаги без usage → пустой итог не показываем"
+                );
+            }
+            TandemResult::Cancelled => panic!("не отменяли"),
+        }
+        assert!(
+            run.notices.is_empty(),
+            "успешный тандем ничем не предупреждает: {:?}",
+            run.notices
+        );
+        assert!(
+            run.chat
+                .iter()
+                .any(|l| l == "🅐 Claude · раунд 1 · Исполнитель"),
+            "шаги стримятся в чат: {:?}",
+            run.chat
+        );
+        assert!(run.chat.iter().any(|l| l.contains("ревью")));
+    }
+
+    #[test]
+    fn tandem_warns_when_rounds_end_without_consensus() {
+        let run = fake_tandem(
+            vec![
+                step("предложение 1"),
+                step("TANDEM: CONTINUE"),
+                step("предложение 2"),
+                step("TANDEM: CONTINUE"),
+                step("сделал"),
+                step("TANDEM: CONSENSUS"),
+            ],
+            2,
+            None,
+        );
+        assert_eq!(
+            run.calls.len(),
+            6,
+            "оба раунда дебатов + исполнение + ревью"
+        );
+        assert!(
+            run.notices
+                .iter()
+                .any(|line| line.contains("Консенсус не достигнут")),
+            "{:?}",
+            run.notices
+        );
+    }
+
+    #[test]
+    fn tandem_fixes_after_review_and_reports_leftovers() {
+        let unresolved = fake_tandem(
+            vec![
+                step("предложение"),
+                step("TANDEM: CONSENSUS"),
+                step("сделал"),
+                step("TANDEM: CONTINUE — течёт память"),
+                step("починил"),
+                step("TANDEM: CONTINUE"),
+            ],
+            1,
+            None,
+        );
+        assert_eq!(
+            unresolved.calls[4..],
+            [
+                ("claude", RunAccess::PlanExecute),
+                ("codex", RunAccess::PlanReadonly)
+            ],
+            "правка исполнителя (с доступом на запись) + подтверждение критика"
+        );
+        assert!(
+            unresolved
+                .notices
+                .iter()
+                .any(|line| line.contains("Остались замечания")),
+            "{:?}",
+            unresolved.notices
+        );
+
+        // Подтверждение получено — предупреждения нет.
+        let resolved = fake_tandem(
+            vec![
+                step("предложение"),
+                step("TANDEM: CONSENSUS"),
+                step("сделал"),
+                step("TANDEM: CONTINUE — течёт память"),
+                step("починил"),
+                step("TANDEM: CONSENSUS"),
+            ],
+            1,
+            None,
+        );
+        assert_eq!(resolved.calls.len(), 6);
+        assert!(resolved.notices.is_empty(), "{:?}", resolved.notices);
+    }
+
+    #[test]
+    fn tandem_review_with_nonzero_code_is_not_consensus() {
+        // Ревью упало с ошибкой, но текст содержит сигнал — доверять ему нельзя.
+        let run = fake_tandem(
+            vec![
+                step("предложение"),
+                step("TANDEM: CONSENSUS"),
+                step("сделал"),
+                Some(TandemStep {
+                    text: "TANDEM: CONSENSUS".to_string(),
+                    code: 2,
+                    usage: None,
+                }),
+                step("починил"),
+                step("TANDEM: CONSENSUS"),
+            ],
+            1,
+            None,
+        );
+        assert_eq!(run.calls.len(), 6, "правка всё равно выполняется");
+    }
+
+    #[test]
+    fn tandem_stops_on_provider_error_in_each_phase() {
+        // Ошибка исполнителя в дебатах: дальше не идём, код возврата — провайдера.
+        let debate = fake_tandem(vec![failing_step(7)], 2, None);
+        assert_eq!(debate.calls.len(), 1);
+        match debate.result {
+            TandemResult::Completed(code, _) => assert_eq!(code, 7),
+            TandemResult::Cancelled => panic!("не отменяли"),
+        }
+        assert!(
+            debate
+                .notices
+                .iter()
+                .any(|line| line.contains("Claude") && line.contains("ошибку")),
+            "{:?}",
+            debate.notices
+        );
+        assert!(
+            !debate
+                .notices
+                .iter()
+                .any(|line| line.contains("Файлы были изменены")),
+            "до исполнения файлы не трогали"
+        );
+
+        // Ошибка критика в дебатах.
+        let critic = fake_tandem(vec![step("предложение"), failing_step(5)], 2, None);
+        assert_eq!(critic.calls.len(), 2);
+        match critic.result {
+            TandemResult::Completed(code, _) => assert_eq!(code, 5),
+            TandemResult::Cancelled => panic!("не отменяли"),
+        }
+        assert!(critic
+            .notices
+            .iter()
+            .any(|line| line.contains("Codex") && line.contains("ошибку")));
+
+        // Ошибка на ИСПОЛНЕНИИ: файлы уже могли измениться — предупреждаем.
+        let execute = fake_tandem(
+            vec![
+                Some(TandemStep {
+                    text: "предложение".to_string(),
+                    code: 0,
+                    usage: Some(RunUsage {
+                        input: 5,
+                        ..RunUsage::default()
+                    }),
+                }),
+                step("TANDEM: CONSENSUS"),
+                Some(TandemStep {
+                    text: "упал".to_string(),
+                    code: 9,
+                    usage: Some(RunUsage {
+                        input: 2,
+                        ..RunUsage::default()
+                    }),
+                }),
+            ],
+            1,
+            None,
+        );
+        assert_eq!(execute.calls.len(), 3);
+        match execute.result {
+            TandemResult::Completed(code, usage) => {
+                assert_eq!(code, 9);
+                assert_eq!(
+                    usage.expect("usage суммируется даже при сбое").input,
+                    7,
+                    "5 + 2 — токены обоих шагов"
+                );
+            }
+            TandemResult::Cancelled => panic!("не отменяли"),
+        }
+        assert!(
+            execute
+                .notices
+                .iter()
+                .any(|line| line.contains("Файлы были изменены")),
+            "{:?}",
+            execute.notices
+        );
+    }
+
+    #[test]
+    fn tandem_cancellation_warns_only_after_files_could_change() {
+        // Отмена внутри шага дебатов — файлы ещё чистые.
+        let debate = fake_tandem(vec![None], 2, None);
+        assert!(matches!(debate.result, TandemResult::Cancelled));
+        assert!(debate.notices.is_empty(), "{:?}", debate.notices);
+
+        // Отмена ПОСЛЕ дебатов (перед исполнением) — тоже без правок.
+        let before_execute = fake_tandem(
+            vec![step("предложение"), step("TANDEM: CONSENSUS")],
+            1,
+            Some(2),
+        );
+        assert!(matches!(before_execute.result, TandemResult::Cancelled));
+        assert_eq!(before_execute.calls.len(), 2, "исполнение не запускалось");
+        assert!(before_execute.notices.is_empty());
+
+        // Отмена внутри ИСПОЛНЕНИЯ — предупреждаем о возможных правках.
+        let during_execute = fake_tandem(
+            vec![step("предложение"), step("TANDEM: CONSENSUS"), None],
+            1,
+            None,
+        );
+        assert!(matches!(during_execute.result, TandemResult::Cancelled));
+        assert!(during_execute
+            .notices
+            .iter()
+            .any(|line| line.contains("Файлы были изменены")));
+
+        // Отмена между ревью и правкой — файлы уже изменены.
+        let before_fix = fake_tandem(
+            vec![
+                step("предложение"),
+                step("TANDEM: CONSENSUS"),
+                step("сделал"),
+                step("TANDEM: CONTINUE"),
+            ],
+            1,
+            Some(4),
+        );
+        assert!(matches!(before_fix.result, TandemResult::Cancelled));
+        assert_eq!(before_fix.calls.len(), 4, "правка не запускалась");
+        assert!(before_fix
+            .notices
+            .iter()
+            .any(|line| line.contains("Файлы были изменены")));
+
+        // Отмена внутри ревью / правки / подтверждения — тот же режим.
+        let during_review = fake_tandem(
+            vec![
+                step("предложение"),
+                step("TANDEM: CONSENSUS"),
+                step("сделал"),
+                None,
+            ],
+            1,
+            None,
+        );
+        assert!(matches!(during_review.result, TandemResult::Cancelled));
+        assert!(during_review
+            .notices
+            .iter()
+            .any(|line| line.contains("Файлы были изменены")));
+    }
+
+    // Единственный тест, который реально запускает «провайдера»: жизненный цикл процесса
+    // (спавн → чтение stdout → код выхода → разбор ответа) нечем проверить иначе. Бинарь
+    // подменяем штатным env-override (он и заведён для моков); других читателей
+    // CLAVE_CLAUDE в тестах нет.
+    #[cfg(unix)]
+    #[test]
+    fn run_provider_once_runs_the_cli_and_maps_its_answer() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = private_temp_dir().join("fake-claude.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\necho '{\"type\":\"result\",\"is_error\":false,\"result\":\"готово\",\
+             \"usage\":{\"input_tokens\":5,\"output_tokens\":2}}'\n",
+        )
+        .expect("скрипт записан");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        env::set_var("CLAVE_CLAUDE", &script);
+
+        let (tx, _rx) = mpsc::channel();
+        let (_cancel_tx, cancel_rx) = mpsc::channel();
+        let outcome = run_provider_once(
+            "claude",
+            "max",
+            "промт",
+            &env::temp_dir(),
+            RunAccess::PlanReadonly,
+            Language::Ru,
+            &tx,
+            &cancel_rx,
+        );
+
+        env::remove_var("CLAVE_CLAUDE");
+        let _ = fs::remove_file(&script);
+
+        let step = outcome
+            .expect("провайдер запустился")
+            .expect("шаг не отменён");
+        assert_eq!(step.text, "готово");
+        assert_eq!(step.code, 0);
+        assert_eq!(step.usage.expect("usage разобран").input, 5);
     }
 
     // Критично: при отмене/таймауте мы убиваем ВСЮ группу процессов, а не только сам
