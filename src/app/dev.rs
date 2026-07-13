@@ -16,6 +16,12 @@ pub(crate) fn format_dev_lines(raw: &str) -> Vec<String> {
     };
     let (type_, payload) = rest.split_once(' ').unwrap_or((rest, ""));
 
+    // Пустой log — это отсутствие вывода агента, а не строка вывода: раньше в транскрипт
+    // уезжали два пробела. Пустой error, наоборот, оставляем видимым.
+    if type_ == "log" && payload.trim().is_empty() {
+        return Vec::new();
+    }
+
     if let Some(human) = human_lines(payload) {
         return human;
     }
@@ -349,6 +355,18 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_log_event_yields_no_transcript_line() {
+        // Пустой вывод агента — не строка транскрипта: уезжали два пробела (иконка + ничего).
+        assert!(format_dev_lines("CLAVE-DEV log ").is_empty());
+        assert!(format_dev_lines("CLAVE-DEV log").is_empty());
+        assert!(format_dev_lines("CLAVE-DEV log    \t").is_empty());
+        // ...но глушим ТОЛЬКО пустоту и ТОЛЬКО у log.
+        assert_eq!(format_dev_lines("CLAVE-DEV log сырьё"), ["  сырьё"]);
+        assert_eq!(format_dev_lines("CLAVE-DEV progress "), ["• "]);
+        assert_eq!(format_dev_lines("CLAVE-DEV error "), ["✗ "]);
+    }
+
+    #[test]
     fn the_reader_renders_every_line_of_the_stream() {
         // Тест на МЕСТО ВЫЗОВА. Мутационный прогон показал, что `spawn_dev_reader` можно
         // заменить пустышкой и ни один тест не заметит: `format_dev_lines` проверена, а то,
@@ -358,6 +376,8 @@ mod tests {
         let stream = std::io::Cursor::new(
             concat!(
                 "CLAVE-DEV progress раунд 1\n",
+                // Пустой log в потоке не должен породить НИ ОДНОГО WorkerEvent::Line.
+                "CLAVE-DEV log \n",
                 r#"CLAVE-DEV check {"ok":false,"human":["  ✗ test — 1 failed","      · render::footer"]}"#,
                 "\n",
             )
