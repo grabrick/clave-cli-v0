@@ -14,6 +14,7 @@ ChecksResult = namedtuple(
 )
 
 _TEST_RESULT = re.compile(r"test result:\s*\w+\.\s*\d+ passed;\s*(\d+) failed")
+_RAN = re.compile(r"^Ran (\d+) tests?", re.M)
 
 # Правила самопроверки инструмента. Перечислены ПОИМЁННО, и это принципиально: удалить
 # правило через discover можно молча, а по имени — только с ModuleNotFoundError.
@@ -28,6 +29,22 @@ RULE_TESTS = (
 def parse_test_failures(output: str) -> int:
     """Сумма 'N failed' по всем строкам 'test result:' (или 0, если ни одной нет)."""
     return sum(int(m.group(1)) for m in _TEST_RESULT.finditer(output))
+
+
+def tests_ran(output: str) -> int:
+    """Сколько тестов НА САМОМ ДЕЛЕ прогнано. Коду возврата тут верить нельзя.
+
+    `sys.exit(0)` в любом модуле, который импортирует тест, убивает unittest молча: ноль тестов,
+    пустой вывод, КОД ВОЗВРАТА 0. Прогон, который не состоялся, читается как прогон, который
+    прошёл, — та же болезнь, что `all([]) == True`, только на уровне процесса.
+
+    Поймано red-team-прогоном, и это был не теоретический риск: `prove_gate.py`, выпотрошенный до
+    `sys.exit(0)`, гасил ВЕСЬ набор правил и оставался «зелёным». Замок ловил правку файла, но
+    замок — сирена, а не запрет: одна команда `relock_rules.py` её выключает.
+
+    Поэтому гейт больше не спрашивает «упало ли», он спрашивает «а сколько ты прогнал».
+    """
+    return sum(int(m.group(1)) for m in _RAN.finditer(output))
 
 
 def _run(worktree: Path, env: dict, args: list, cwd: Path = None) -> subprocess.CompletedProcess:
@@ -81,6 +98,19 @@ def run_checks(worktree: Path, env: dict, profile: str) -> ChecksResult:
         )
         py = _run(worktree, env, [sys.executable, "-m", "unittest", "discover", "-s", "tests"], cwd=pkg)
         raw["python"] = rules.stdout + rules.stderr + py.stdout + py.stderr
-        py_ok = rules.returncode == 0 and py.returncode == 0
+
+        # Код возврата — ненадёжный сигнал: `sys.exit(0)` в импортируемом модуле гасит unittest
+        # молча, и «ноль тестов» приходит с кодом 0. Поэтому требуем ПРЕДЪЯВИТЬ прогнанное.
+        rules_ran = tests_ran(rules.stdout + rules.stderr)
+        py_ran = tests_ran(py.stdout + py.stderr)
+        py_ok = (
+            rules.returncode == 0
+            and py.returncode == 0
+            # Хотя бы по одному тесту на каждое правило: иначе набор не запускался вовсе.
+            and rules_ran >= len(RULE_TESTS)
+            # Полный набор содержит правила, значит тестов в нём не меньше. Без магических чисел:
+            # инвариант структурный, и порог не придётся двигать при каждом новом тесте.
+            and py_ran >= rules_ran
+        )
 
     return ChecksResult(True, test_failures, clippy_ok, fmt_ok, raw, py_ok)

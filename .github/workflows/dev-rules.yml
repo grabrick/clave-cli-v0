@@ -35,18 +35,40 @@ jobs:
       # Ставим зависимость, чтобы ни один модуль не получил освобождение по недосмотру среды.
       - run: pip install pyte
 
+      # Коду возврата тут верить НЕЛЬЗЯ, и это не паранойя, а находка red-team-прогона:
+      # `sys.exit(0)` в любом модуле, который импортирует тест, гасит unittest молча — ноль
+      # тестов, пустой вывод, КОД 0. Шаг зелёный, проверок не было. Та же болезнь, что
+      # `all([]) == True`, только на уровне процесса: отсутствие проверки читается как
+      # пройденная проверка.
+      #
+      # Поэтому шаг не спрашивает «упало ли», он требует ПРЕДЪЯВИТЬ прогнанное.
       - name: Правила названы поимённо — удалить их молча нельзя
         working-directory: tools/clave-dev
         run: |
+          set -o pipefail
           python -m unittest -v \
             tests.test_gates_can_fail \
             tests.test_unverified \
             tests.test_no_dead_modules \
-            tests.test_rules_are_enforced
+            tests.test_rules_are_enforced 2>&1 | tee /tmp/rules.log
+
+          ran=$(grep -oE '^Ran ([0-9]+) tests?' /tmp/rules.log | grep -oE '[0-9]+' || echo 0)
+          echo "прогнано тестов правил: $ran"
+          [ "${ran:-0}" -ge 4 ] \
+            || { echo "::error::набор правил не запускался (прогнано $ran) — тишина не равна успеху"; exit 1; }
 
       - name: Весь набор clave-dev
         working-directory: tools/clave-dev
-        run: python -m unittest discover -s tests -v
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests -v 2>&1 | tee /tmp/all.log
+
+          ran=$(grep -oE '^Ran ([0-9]+) tests?' /tmp/all.log | grep -oE '[0-9]+' || echo 0)
+          echo "прогнано тестов: $ran"
+          # Полный набор ВКЛЮЧАЕТ правила, значит тестов в нём заведомо больше. Порог структурный,
+          # не магическое число: его не придётся двигать при каждом новом тесте.
+          [ "${ran:-0}" -gt 4 ] \
+            || { echo "::error::набор не запускался (прогнано $ran) — тишина не равна успеху"; exit 1; }
 
   product:
     name: продукт собирается и зелёный

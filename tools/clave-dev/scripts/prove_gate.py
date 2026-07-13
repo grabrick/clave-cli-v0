@@ -37,6 +37,18 @@ sys.path.insert(0, str(ROOT))
 # полному прогону каждый. Восемь гейтов × вложенный прогон и давали 22с на ровном месте.
 META_TESTS = ("test_gates_can_fail", "test_no_dead_modules", "test_rules_are_enforced")
 
+# КАНАРЕЙКА: гейт, заведомо не проверенный ничем. На нём скрипт ОБЯЗАН ответить «не доказано».
+#
+# Иначе правило 1 держалось только на замке. Red-team-прогон это и показал: заменяешь весь скрипт
+# на `import sys; sys.exit(0)`, перевыпускаешь RULES.lock — и девять гейтов разом читаются как
+# доказанные, набор зелёный, правило мертво. Тест смотрел на код возврата, а «ничего не сделал и
+# вышел нулём» неотличимо от «проверил и всё сошлось».
+#
+# Та же болезнь, от которой написано само правило: ОТСУТСТВИЕ ПРОВЕРКИ ЧИТАЕТСЯ КАК ПРОЙДЕННАЯ.
+# Лечится симметрично — доказательство тоже обязано уметь провалиться. Скрипт, который умеет
+# отвечать только «OK», на канарейке и ловится.
+CANARY = "clave_dev.loop:_канарейка"
+
 
 def _always_pass_verdict(samples, base=(), min_hits=2):
     from clave_dev.visual_verdict import ChecklistItem, VisionVerdict
@@ -65,11 +77,26 @@ NEUTERED = {
     "clave_dev.assertions:evaluate": lambda assertions, grid, exit_code: [],
     # «Падений тестов нет» — всегда.
     "clave_dev.checks:parse_test_failures": lambda output: 0,
+    # «Тестов прогнано полно» — всегда. Обезвредь — и молчащий набор снова читается как зелёный.
+    "clave_dev.checks:tests_ran": lambda output: 999,
     # «Агент что-то изменил» — всегда (тогда no-op снова читается как сходимость).
     "clave_dev.diff:changed_paths": lambda worktree, base_sha=None: ["src/подменено.rs"],
     # «Тесты агента всё доказывают» — всегда. Обезвредь — и тест-декорация снова пройдёт.
     "clave_dev.mutation:unproven": lambda diff_text, mutants_output: [],
+    # Канарейку не зовёт ни один тест — обезвредить её набор не заметит. Ответ обязан быть «1».
+    CANARY: lambda *a, **k: "обезврежено",
 }
+
+
+def _plant_canary() -> None:
+    """Посадить в модуль функцию, которой нет ни в одном тесте.
+
+    Обезвредить её набор не заметит — и скрипт обязан честно сказать «этот гейт не проверен
+    ничем». Так проверяется сам инструмент, а не дерево: ровно как канарейка в страже prod-ветки,
+    где шаблоны сперва гоняются по эталонным образцам.
+    """
+    module_name, _, attr = CANARY.partition(":")
+    setattr(importlib.import_module(module_name), attr, lambda *a, **k: None)
 
 
 def run_suite_without_self() -> unittest.TestResult:
@@ -89,6 +116,9 @@ def main(argv=None) -> int:
         return 2
 
     target = argv[0]
+    if target == CANARY:
+        _plant_canary()
+
     module_name, _, attr = target.partition(":")
     module = importlib.import_module(module_name)
     if not hasattr(module, attr):

@@ -22,6 +22,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from scripts.prove_gate import CANARY  # noqa: E402
+
 PROVE = ROOT / "scripts" / "prove_gate.py"
 
 GATES = [
@@ -32,23 +36,32 @@ GATES = [
     "clave_dev.visual_verdict:is_infra_failure",
     "clave_dev.assertions:evaluate",
     "clave_dev.checks:parse_test_failures",
+    "clave_dev.checks:tests_ran",
     "clave_dev.diff:changed_paths",
     "clave_dev.mutation:unproven",
 ]
 
 
-def _prove(gate: str):
-    """Один прогон набора с обезвреженным гейтом. Возвращает жалобу или None."""
-    res = subprocess.run(
+def _run(gate: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
         [sys.executable, str(PROVE), gate],
         capture_output=True,
         text=True,
         cwd=str(ROOT),
         check=False,
     )
-    if res.returncode == 0:
-        return None
-    return f"{gate}: {res.stderr.strip() or res.stdout.strip()}"
+
+
+def _prove(gate: str):
+    """Один прогон набора с обезвреженным гейтом. Возвращает жалобу или None."""
+    res = _run(gate)
+    if res.returncode != 0:
+        return f"{gate}: {res.stderr.strip() or res.stdout.strip()}"
+    # Кода возврата мало: скрипт обязан ПРЕДЪЯВИТЬ, что он доказал. Молчаливый ноль — это ровно
+    # «ничего не сделал», и отличить его от «проверил, всё сошлось» нечем.
+    if gate not in res.stdout:
+        return f"{gate}: скрипт ответил «доказано», но не сказал ЧТО: {res.stdout.strip()!r}"
+    return None
 
 
 class GatesCanFailTest(unittest.TestCase):
@@ -64,10 +77,29 @@ class GatesCanFailTest(unittest.TestCase):
             "гейт, который нельзя провалить, — декорация:\n" + "\n".join(theatre),
         )
 
+    def test_the_prover_itself_can_say_no(self):
+        """Правило 1, применённое к самому доказательству: оно обязано уметь провалиться.
+
+        До этого теста правило держалось на честном слове скрипта. Red-team-прогон это и вскрыл:
+        заменяешь весь prove_gate.py на `import sys; sys.exit(0)`, перевыпускаешь замок — и девять
+        гейтов разом читаются как доказанные. Набор зелёный, правила нет.
+
+        Канарейка — гейт, не проверенный ни одним тестом. На нём скрипт ОБЯЗАН сказать «нет».
+        Умеющий отвечать только «OK» тут и ловится, и никакой перевыпуск замка не спасает.
+        """
+        res = _run(CANARY)
+
+        self.assertEqual(
+            res.returncode,
+            1,
+            "prove_gate ответил «доказано» на гейт, не проверенный ничем — значит он отвечает "
+            f"«доказано» вообще всегда, и правило 1 — декорация.\n{res.stdout}{res.stderr}",
+        )
+
     def test_the_list_of_gates_is_not_quietly_empty(self):
         # Мета-тест, который ничего не проверяет, — сам декорация. Пустой список гейтов дал бы
         # вечно-зелёный результат, и это ровно та болезнь, которую он лечит.
-        self.assertGreaterEqual(len(GATES), 9)
+        self.assertGreaterEqual(len(GATES), 10)
         self.assertTrue(PROVE.is_file(), "скрипт мутации пропал — правило перестало действовать")
 
 
