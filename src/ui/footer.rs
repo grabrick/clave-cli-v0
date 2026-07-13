@@ -702,4 +702,59 @@ mod tests {
             }
         }
     }
+
+    /// Лестница перехода — чистая таблица, и проверять её надо целиком, точными цветами.
+    /// Момент `1` мс обязан быть в списке: только на нём видно, что шаг СЧИТАЕТСЯ делением.
+    /// Делить на 90 — шаг 0, умножать — шаг 4, брать остаток — шаг 1; три разных цвета.
+    /// На нуле все три варианта дают шаг 0 и подмену не поймать — одного `0` в таблице мало.
+    /// Границы 89/90, 179/180, 269/270 держат ширину ступени ровно в 90 мс,
+    /// а 10_000 — клэмп `.min(4)`: без него это выход за край палитры, то есть паника.
+    #[test]
+    fn transition_color_walks_the_ramp_in_both_directions() {
+        fn ramp(entering: bool) -> Vec<Color> {
+            [0, 1, 89, 90, 179, 180, 269, 270, 359, 360, 10_000]
+                .iter()
+                .map(|&ms| footer_transition_color(Theme::Amber, ms, entering))
+                .collect()
+        }
+
+        let dim = Color::Indexed(136);
+        let soft = Color::Indexed(229);
+
+        assert_eq!(
+            ramp(true),
+            vec![
+                dim,
+                dim,
+                dim,
+                Color::DarkGray,
+                Color::DarkGray,
+                Color::Gray,
+                Color::Gray,
+                soft,
+                soft,
+                soft,
+                soft,
+            ],
+            "появляющийся текст идёт от accent_dim к accent_soft"
+        );
+
+        assert_eq!(
+            ramp(false),
+            vec![
+                soft,
+                soft,
+                soft,
+                Color::Gray,
+                Color::Gray,
+                Color::DarkGray,
+                Color::DarkGray,
+                dim,
+                dim,
+                dim,
+                dim,
+            ],
+            "гаснущий текст идёт от accent_soft к accent_dim"
+        );
+    }
 }
