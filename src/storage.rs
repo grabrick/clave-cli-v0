@@ -748,6 +748,518 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Изолированный каталог под тест: только temp_dir, никаких путей в $HOME.
+    fn temp_case(name: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!("clave-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// Записать мини-конфиг и сразу прочитать его продуктовым парсером.
+    fn config_from(dir: &Path, name: &str, content: &str) -> AppConfig {
+        let path = dir.join(name);
+        fs::write(&path, content).expect("write config");
+        load_config(&path)
+    }
+
+    #[test]
+    fn config_round_trip_preserves_every_field() {
+        let dir = temp_case("config-roundtrip");
+        let path = dir.join("config");
+
+        let saved = AppConfig {
+            onboarding_done: true,
+            mode: Mode::CodexClaude,
+            direct_provider: Provider::Claude,
+            theme: Theme::Amber,
+            lang: Language::En,
+            rounds: 5,
+            work_dir: "/tmp/work".to_string(),
+            out_dir: "artifacts".to_string(),
+            effort_index: 2,
+            codex_effort_index: 0,
+            claude_effort_index: 1,
+            linked_effort_split: false,
+            last_chat_id: Some("chat-42".to_string()),
+            path_link_target: Some(PathTarget::Cursor),
+        };
+        save_config(&path, &saved).expect("save config");
+
+        // Каждое поле отличается от дефолта — значит сверка ловит и «ничего не записали»,
+        // и «ничего не прочитали».
+        let loaded = load_config(&path);
+        assert!(loaded.onboarding_done);
+        assert_eq!(loaded.mode, Mode::CodexClaude);
+        assert_eq!(loaded.direct_provider, Provider::Claude);
+        assert_eq!(loaded.theme, Theme::Amber);
+        assert_eq!(loaded.lang, Language::En);
+        assert_eq!(loaded.rounds, 5);
+        assert_eq!(loaded.work_dir, "/tmp/work");
+        assert_eq!(loaded.out_dir, "artifacts");
+        assert_eq!(loaded.effort_index, 2);
+        assert_eq!(loaded.codex_effort_index, 0);
+        assert_eq!(loaded.claude_effort_index, 1);
+        assert!(!loaded.linked_effort_split);
+        assert_eq!(loaded.last_chat_id.as_deref(), Some("chat-42"));
+        assert_eq!(loaded.path_link_target, Some(PathTarget::Cursor));
+
+        // Несуществующий файл → чистые дефолты.
+        let missing = load_config(&dir.join("nope"));
+        assert!(!missing.onboarding_done);
+        assert_eq!(missing.rounds, AppConfig::default().rounds);
+        assert_eq!(missing.last_chat_id, None);
+
+        // Перевод строки в значении не должен разваливать построчный формат.
+        let with_newline = AppConfig {
+            work_dir: "a\nb".to_string(),
+            ..saved
+        };
+        save_config(&path, &with_newline).expect("save config 2");
+        let loaded = load_config(&path);
+        assert_eq!(loaded.work_dir, "a b");
+        assert_eq!(loaded.theme, Theme::Amber);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn out_dir_legacy_value_is_remapped() {
+        let dir = temp_case("config-outdir");
+        assert_eq!(
+            config_from(&dir, "legacy", "out_dir=\".ai-runs\"\n").out_dir,
+            DEFAULT_ARTIFACT_DIR
+        );
+        assert_eq!(
+            config_from(&dir, "custom", "out_dir=\"builds\"\n").out_dir,
+            "builds"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn last_chat_is_sanitized_and_empty_is_ignored() {
+        let dir = temp_case("config-lastchat");
+        assert_eq!(
+            config_from(&dir, "traversal", "last_chat=\"../../etc\"\n").last_chat_id,
+            Some("etc".to_string())
+        );
+        // После вычистки мусорных символов не осталось ничего → чата нет.
+        assert_eq!(
+            config_from(&dir, "garbage", "last_chat=\"///\"\n").last_chat_id,
+            None
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_effort_fills_only_supported_providers() {
+        let dir = temp_case("config-legacy-effort");
+
+        // "low" поддерживают оба провайдера → раздаётся обоим.
+        let low = config_from(&dir, "low", "effort=\"low\"\n");
+        assert_eq!(low.effort_index, 0);
+        assert_eq!(low.codex_effort_index, 0);
+        assert_eq!(low.claude_effort_index, 0);
+
+        // "max" есть только у claude → codex остаётся на своём дефолте.
+        let max = config_from(&dir, "max", "effort=\"max\"\n");
+        assert_eq!(max.effort_index, 4);
+        assert_eq!(
+            max.codex_effort_index,
+            AppConfig::default().codex_effort_index
+        );
+        assert_eq!(max.claude_effort_index, 4);
+
+        // "xhigh" есть только у codex → claude остаётся на своём дефолте.
+        let xhigh = config_from(&dir, "xhigh", "effort=\"xhigh\"\n");
+        assert_eq!(xhigh.codex_effort_index, 3);
+        assert_eq!(
+            xhigh.claude_effort_index,
+            AppConfig::default().claude_effort_index
+        );
+
+        // Явные per-provider значения легаси-ключ не перетирает.
+        let explicit = config_from(
+            &dir,
+            "explicit",
+            "effort=\"low\"\ncodex_effort=\"high\"\nclaude_effort=\"medium\"\n",
+        );
+        assert_eq!(explicit.effort_index, 0);
+        assert_eq!(explicit.codex_effort_index, 2);
+        assert_eq!(explicit.claude_effort_index, 1);
+
+        // common_effort — алиас legacy-effort со всей раздачей.
+        let common = config_from(&dir, "common", "common_effort=\"low\"\n");
+        assert_eq!(common.effort_index, 0);
+        assert_eq!(common.codex_effort_index, 0);
+        assert_eq!(common.claude_effort_index, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn effort_split_aliases_all_flip_the_flag() {
+        let dir = temp_case("config-split-alias");
+        assert!(
+            AppConfig::default().linked_effort_split,
+            "тест опирается на дефолт split=true"
+        );
+
+        // Все алиасы «true/false» должны увести флаг из дефолтного true в false.
+        for key in [
+            "split_effort",
+            "effort_split",
+            "linked_effort_split",
+            "per_model_effort",
+            "effort_per_model",
+        ] {
+            let config = config_from(&dir, key, &format!("{key}=\"false\"\n"));
+            assert!(!config.linked_effort_split, "ключ {key} не выключил split");
+        }
+
+        // Инвертированные алиасы: shared=true означает split=false.
+        for key in ["effort_shared", "effort_common"] {
+            let config = config_from(&dir, key, &format!("{key}=\"true\"\n"));
+            assert!(!config.linked_effort_split, "ключ {key} не выключил split");
+        }
+
+        // Режимные алиасы: стартуем из false, чтобы «split» был реальным изменением.
+        for key in ["model_effort_mode", "effort_mode"] {
+            let config = config_from(
+                &dir,
+                key,
+                &format!("split_effort=\"false\"\n{key}=\"split\"\n"),
+            );
+            assert!(config.linked_effort_split, "ключ {key} не включил split");
+        }
+
+        // linked_effort проверяем в обе стороны, каждый раз стартуя из противоположного.
+        assert!(
+            !config_from(&dir, "linked-shared", "linked_effort=\"shared\"\n").linked_effort_split
+        );
+        assert!(
+            config_from(
+                &dir,
+                "linked-split",
+                "split_effort=\"false\"\nlinked_effort=\"per-model\"\n"
+            )
+            .linked_effort_split
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_round_trip_and_cap() {
+        let dir = temp_case("history");
+        let path = dir.join("history");
+
+        // Сохранение обрезает историю до последних MAX_HISTORY_LINES.
+        let history = (0..250).map(|i| format!("line-{i}")).collect::<Vec<_>>();
+        save_history(&path, &history).expect("save history");
+        let loaded = load_history(&path).expect("load history");
+        assert_eq!(loaded.len(), MAX_HISTORY_LINES);
+        assert_eq!(loaded.first().unwrap(), "line-50");
+        assert_eq!(loaded.last().unwrap(), "line-249");
+
+        // Многострочная команда переживает round-trip (encode/decode полей).
+        save_history(&path, &["echo a\nb\tc".to_string()]).expect("save history 2");
+        assert_eq!(
+            load_history(&path).unwrap(),
+            vec!["echo a\nb\tc".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_history_caps_oversized_file_and_drops_blanks() {
+        let dir = temp_case("history-oversized");
+        let path = dir.join("history");
+
+        // Файл заведомо длиннее лимита (мог остаться от старой версии) — чтение обязано
+        // отдать ровно последние MAX_HISTORY_LINES строк, пустые не в счёт.
+        let mut raw = String::from("\n   \n");
+        for i in 0..250 {
+            raw.push_str(&format!("line-{i}\n"));
+        }
+        fs::write(&path, raw).expect("write history");
+
+        let loaded = load_history(&path).expect("load history");
+        assert_eq!(loaded.len(), MAX_HISTORY_LINES);
+        assert_eq!(loaded.first().unwrap(), "line-50");
+        assert_eq!(loaded.last().unwrap(), "line-249");
+        assert!(!loaded.iter().any(|line| line.trim().is_empty()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_chat_line_creates_file_and_keeps_previous_lines() {
+        let dir = temp_case("append-chat");
+        let path = chat_path_for_id(&dir, "chat-append");
+
+        // Файла ещё нет → append обязан создать чат с header и записать строку.
+        append_chat_line(&path, "первая").expect("append 1");
+        let raw = fs::read_to_string(&path).expect("read chat");
+        assert!(raw.starts_with("# Clave Chat\n"), "нет header: {raw}");
+        assert_eq!(
+            load_chat_transcript(&path).unwrap(),
+            vec!["первая".to_string()]
+        );
+
+        // Файл уже есть → append дописывает, а не затирает.
+        append_chat_line(&path, "вторая").expect("append 2");
+        assert_eq!(
+            load_chat_transcript(&path).unwrap(),
+            vec!["первая".to_string(), "вторая".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_saved_chats_returns_only_chat_files() {
+        let dir = temp_case("list-chats");
+        for id in ["chat-a", "chat-b", "chat-c"] {
+            save_chat_transcript(&chat_path_for_id(&dir, id), id, &[format!("◆ {id}")])
+                .expect("save chat");
+        }
+        // Посторонний файл в том же каталоге не должен попасть в список.
+        fs::write(dir.join("notes.txt"), "не чат").expect("write notes");
+
+        let listed = list_saved_chats(&dir, 10);
+        let mut ids = listed.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, vec!["chat-a", "chat-b", "chat-c"]);
+        assert!(listed.iter().all(|c| c.lines == 1));
+
+        // limit реально ограничивает выдачу.
+        assert_eq!(list_saved_chats(&dir, 2).len(), 2);
+        // Несуществующий каталог → пусто.
+        assert!(list_saved_chats(&dir.join("nope"), 10).is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_chat_title_replaces_previous_title() {
+        let dir = temp_case("chat-retitle");
+        let id = "chat-retitle";
+        let path = chat_path_for_id(&dir, id);
+        save_chat_transcript(&path, id, &["◆ тело чата".to_string()]).expect("save");
+
+        set_chat_title(&path, id, "Первый").expect("title 1");
+        set_chat_title(&path, id, "Второй").expect("title 2");
+
+        assert_eq!(read_chat_title(&path), Some("Второй".to_string()));
+        let raw = fs::read_to_string(&path).expect("read chat");
+        // Старый заголовок вычищен из header, header остался header'ом, тело цело.
+        assert_eq!(raw.matches("title=").count(), 1);
+        assert!(raw.starts_with("# Clave Chat\n"), "header уехал: {raw}");
+        assert_eq!(
+            load_chat_transcript(&path).unwrap(),
+            vec!["◆ тело чата".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chat_display_title_falls_back_to_first_nonblank_line() {
+        let dir = temp_case("chat-title-blank");
+        // Файла нет → кастомного заголовка нет; в строках нет ни одного «◆».
+        let path = chat_path_for_id(&dir, "chat-none");
+        let lines = vec!["   ".to_string(), "просто текст".to_string()];
+        assert_eq!(chat_display_title(&path, &lines, "empty"), "просто текст");
+        assert_eq!(chat_display_title(&path, &[], "empty"), "empty");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_paths_are_derived_from_state_dir() {
+        // Окружение не трогаем (тесты идут параллельно) — проверяем согласованность путей.
+        let root = clave_state_dir();
+        assert!(!root.as_os_str().is_empty());
+        assert_eq!(history_path(), root.join("history"));
+        assert_eq!(chats_dir(), root.join("chats"));
+
+        let expected_config = match env::var("CLAVE_CONFIG") {
+            Ok(path) => PathBuf::from(path),
+            Err(_) => root.join("config"),
+        };
+        assert_eq!(config_path(), expected_config);
+
+        match env::var("HOME") {
+            Ok(home) => assert_eq!(
+                default_home_state_dir(".clave-test"),
+                Some(PathBuf::from(home).join(".clave-test"))
+            ),
+            Err(_) => assert_eq!(default_home_state_dir(".clave-test"), None),
+        }
+    }
+
+    #[test]
+    fn find_last_run_takes_the_latest_brief() {
+        let transcript = vec![
+            "Final brief: /tmp/first".to_string(),
+            "какой-то ответ".to_string(),
+            "Final brief: /tmp/second".to_string(),
+        ];
+        assert_eq!(find_last_run(&transcript), Some("/tmp/second".to_string()));
+        assert_eq!(find_last_run(&["просто строка".to_string()]), None);
+        assert_eq!(find_last_run(&[]), None);
+    }
+
+    #[test]
+    fn new_chat_id_carries_a_real_timestamp() {
+        // Сентябрь 2020 — заведомо в прошлом; ноль/единица из мутанта сюда не попадут.
+        const PAST: u128 = 1_600_000_000_000;
+        assert!(unix_millis() > PAST);
+
+        let id = new_chat_id();
+        let millis = id
+            .strip_prefix("chat-")
+            .expect("id начинается с chat-")
+            .parse::<u128>()
+            .expect("хвост id — это миллисекунды");
+        assert!(millis > PAST);
+    }
+
+    #[test]
+    fn is_welcome_line_matches_every_greeting() {
+        for line in [
+            "✦ Добро пожаловать в clave",
+            "✦ Welcome to clave",
+            "Введите задачу и нажмите Enter",
+            "Type a task and press Enter",
+            "Это Claude Code-style интерфейс",
+            "This is a Claude Code-style UI",
+            "  ✦ Welcome to clave  ",
+        ] {
+            assert!(is_welcome_line(line), "не распознано приветствие: {line}");
+        }
+        assert!(!is_welcome_line("◆ обычный промт"));
+        assert!(!is_welcome_line(""));
+    }
+
+    #[test]
+    fn truncate_chars_handles_zero_and_one() {
+        assert_eq!(truncate_chars("привет", 0), "");
+        assert_eq!(truncate_chars("привет", 1), "…");
+        assert_eq!(truncate_chars("привет", 3), "пр…");
+        assert_eq!(truncate_chars("привет", 6), "привет");
+    }
+
+    #[test]
+    fn sanitize_chat_id_keeps_only_id_chars() {
+        assert_eq!(sanitize_chat_id("chat-7_a /..x!"), "chat-7_ax");
+        assert_eq!(sanitize_chat_id("chat-9.clave"), "chat-9");
+        assert_eq!(sanitize_chat_id("../../etc"), "etc");
+        assert_eq!(sanitize_chat_id("///"), "");
+    }
+
+    #[test]
+    fn encode_field_escapes_control_chars() {
+        // Через файл \r и \t не отличить от сырых символов — проверяем кодировщик напрямую.
+        assert_eq!(encode_field("a\\b\nc\rd\te"), "a\\\\b\\nc\\rd\\te");
+        assert_eq!(decode_field("a\\\\b\\nc\\rd\\te"), "a\\b\nc\rd\te");
+        assert_eq!(encode_field("обычная строка"), "обычная строка");
+    }
+
+    #[test]
+    fn final_brief_extracts_known_sections() {
+        let dir = temp_case("brief-sections");
+        let path = dir.join("brief.md");
+        fs::write(
+            &path,
+            "шапка\n## Header\nмусор\n## Current Spec\nспека 1\n## Last Review\nревью 1\n",
+        )
+        .expect("write brief");
+
+        let lines = final_brief_lines_for_chat(path.to_str().unwrap(), Language::Ru).unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "## Текущая спека".to_string(),
+                "спека 1".to_string(),
+                "## Последнее ревью".to_string(),
+                "ревью 1".to_string(),
+            ]
+        );
+
+        // Английская локаль подставляет свои заголовки.
+        let en = final_brief_lines_for_chat(path.to_str().unwrap(), Language::En).unwrap();
+        assert_eq!(en.first().unwrap(), "## Current Spec");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn final_brief_falls_back_to_whole_file() {
+        let dir = temp_case("brief-fallback");
+
+        // Секций нет вовсе → отдаём файл целиком.
+        let plain = dir.join("plain.md");
+        fs::write(&plain, "привет\nмир\n").expect("write");
+        assert_eq!(
+            final_brief_lines_for_chat(plain.to_str().unwrap(), Language::Ru).unwrap(),
+            vec!["привет".to_string(), "мир".to_string()]
+        );
+
+        // Секция есть, но пустая → одни заголовки бесполезны, отдаём файл целиком.
+        let empty = dir.join("empty.md");
+        fs::write(&empty, "заметка\n## Current Spec\n").expect("write");
+        assert_eq!(
+            final_brief_lines_for_chat(empty.to_str().unwrap(), Language::Ru).unwrap(),
+            vec!["заметка".to_string(), "## Current Spec".to_string()]
+        );
+
+        // Несуществующий файл → ошибка, а не пустой список.
+        assert!(
+            final_brief_lines_for_chat(dir.join("nope.md").to_str().unwrap(), Language::Ru)
+                .is_err()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn final_brief_collapses_blanks_and_truncates() {
+        let dir = temp_case("brief-compact");
+
+        // Подряд идущие пустые строки схлопываются в одну.
+        let blanks = dir.join("blanks.md");
+        fs::write(&blanks, "a\n\n\nb\n").expect("write");
+        assert_eq!(
+            final_brief_lines_for_chat(blanks.to_str().unwrap(), Language::Ru).unwrap(),
+            vec!["a".to_string(), String::new(), "b".to_string()]
+        );
+
+        // Длинный файл обрезается на 140 строках + маркер обрезки.
+        let long = dir.join("long.md");
+        let content = (0..200)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&long, content).expect("write");
+        let lines = final_brief_lines_for_chat(long.to_str().unwrap(), Language::Ru).unwrap();
+        assert_eq!(lines.len(), 141);
+        assert_eq!(lines[139], "line-139");
+        assert!(lines[140].starts_with("… ответ обрезан"));
+
+        // Слишком длинная строка режется по символам.
+        let wide = dir.join("wide.md");
+        fs::write(&wide, "я".repeat(300)).expect("write");
+        let wide_lines = final_brief_lines_for_chat(wide.to_str().unwrap(), Language::Ru).unwrap();
+        assert_eq!(wide_lines[0].chars().count(), 220);
+        assert!(wide_lines[0].ends_with('…'));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn config_value_sanitized_strips_newlines_keeps_backslashes() {
         // Windows-путь с обратным слэшем не искажается (иначе сломался бы round-trip).
