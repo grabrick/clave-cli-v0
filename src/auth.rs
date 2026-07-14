@@ -413,23 +413,30 @@ mod tests {
         assert_eq!(first_nonempty_line(""), None);
     }
 
+    /// Фальшивый провайдер БЕЗ временного файла: скрипт уходит в `/bin/sh -c`.
+    ///
+    /// Первая версия писала свежий `.sh` и запускала его — и это стоило по 200–400 мс НА КАЖДЫЙ
+    /// вызов: macOS проверяет (подпись/Gatekeeper) каждый впервые исполняемый файл, и кэш тут не
+    /// помогает, потому что файл каждый раз новый. Три таких теста растянули весь набор с
+    /// полутора до пяти с половиной секунд — а под `cargo mutants` набор гоняется на КАЖДОГО из
+    /// 2400 мутантов, и полный замер ядра раздулся с 22 минут до шести часов.
+    ///
+    /// `/bin/sh` система уже проверила и закэшировала: спавн стоит 3 мс. Заодно исчезает мусор в
+    /// /tmp, на который я же и жаловался.
     #[cfg(unix)]
-    fn write_script(name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = env::temp_dir().join(format!("clave-auth-{}-{name}.sh", std::process::id()));
-        fs::write(&path, body).expect("скрипт записан");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
-        path
+    fn fake_provider(script: &'static str) -> (&'static str, [&'static str; 2]) {
+        ("/bin/sh", ["-c", script])
     }
 
     /// Пробу гоняем в отдельном потоке и ждём с запасом. Смысл в том, что при откате
     /// починки тест ОБЯЗАН УПАСТЬ, а не повиснуть: набор, висящий вечно, ничего не
     /// сообщает — он просто вешает CI.
     #[cfg(unix)]
-    fn probe_in_thread(binary: PathBuf, timeout: Duration) -> Receiver<AuthProbe> {
+    fn probe_in_thread(script: &'static str, timeout: Duration) -> Receiver<AuthProbe> {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(auth_probe(&binary.to_string_lossy(), &[], timeout));
+            let (binary, args) = fake_provider(script);
+            let _ = tx.send(auth_probe(binary, &args, timeout));
         });
         rx
     }
@@ -455,14 +462,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_mute_provider_with_a_grandchild_does_not_freeze_the_probe() {
-        let script = write_script("mute", "#!/bin/sh\nsleep 30 &\nwait\n");
-        let rx = probe_in_thread(script.clone(), Duration::from_secs(1));
+        let rx = probe_in_thread("sleep 30 & wait", Duration::from_secs(1));
 
         let probe = rx.recv_timeout(Duration::from_secs(15)).expect(
             "проба обязана вернуться по потолку — а вернуться она может, только если убита \
              ВСЯ группа: иначе wait() внутри kill_process_tree ждал бы внука полминуты",
         );
-        let _ = fs::remove_file(&script);
 
         assert!(probe.installed, "бинарь запустился — значит, установлен");
         assert!(
@@ -479,9 +484,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn probe_takes_the_answer_of_a_live_provider() {
-        let script = write_script("ready", "#!/bin/sh\necho 'Logged in as user@example.com'\n");
-        let probe = auth_probe(&script.to_string_lossy(), &[], Duration::from_secs(10));
-        let _ = fs::remove_file(&script);
+        let (binary, args) = fake_provider("echo 'Logged in as user@example.com'");
+        let probe = auth_probe(binary, &args, Duration::from_secs(10));
 
         assert!(probe.installed);
         assert!(
@@ -496,12 +500,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn probe_takes_stderr_and_the_exit_code() {
-        let script = write_script(
-            "denied",
-            "#!/bin/sh\necho 'You are not logged in.' >&2\nexit 1\n",
-        );
-        let probe = auth_probe(&script.to_string_lossy(), &[], Duration::from_secs(10));
-        let _ = fs::remove_file(&script);
+        let (binary, args) = fake_provider("echo 'You are not logged in.' >&2; exit 1");
+        let probe = auth_probe(binary, &args, Duration::from_secs(10));
 
         assert!(probe.installed, "процесс запустился — бинарь на месте");
         assert!(!probe.authenticated);
