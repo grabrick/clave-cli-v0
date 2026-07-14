@@ -803,4 +803,483 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// App для тестов клавиатуры: `App::new()` читает конфиг/историю с диска, поэтому
+    /// фиксируем поля, которые читает `handle_input_key`, а запись истории и чата уводим
+    /// во временную папку — тесты не трогают пользовательские файлы.
+    fn app_for_keys() -> App {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+        let dir = env::temp_dir().join(format!(
+            "clave-keys-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::create_dir_all(&dir);
+
+        let mut app = App::new();
+        app.config_path = dir.join("config.json");
+        app.history_path = dir.join("history");
+        app.chats_dir = dir.clone();
+        app.chat_path = dir.join("chat.md");
+        app.lang = Language::Ru;
+        app.onboarding = None;
+        app.overlay = Overlay::None;
+        app.chat_mode = ChatMode::Discussion;
+        app.input.clear();
+        app.cursor = 0;
+        app.transcript.clear();
+        app.history.clear();
+        app.history_index = None;
+        app.history_draft = None;
+        app.selected_suggestion = 0;
+        app.pending_plan = None;
+        app.plan_flow = PlanFlow::None;
+        app.pending_messages.clear();
+        app.running = false;
+        app.should_quit = false;
+        app.last_ctrl_c_at = None;
+        app
+    }
+
+    /// App с активным гейтом плана (`pending_plan` + `!running`).
+    fn app_with_plan_gate() -> App {
+        let mut app = app_for_keys();
+        app.pending_plan = Some(PendingPlan {
+            task: "задача".to_string(),
+            plan: "шаг 1".to_string(),
+        });
+        app
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn key_with(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        key_with(code, KeyModifiers::CONTROL)
+    }
+
+    fn alt(code: KeyCode) -> KeyEvent {
+        key_with(code, KeyModifiers::ALT)
+    }
+
+    // ───────────────────────── гейт плана ─────────────────────────
+
+    #[test]
+    fn plan_gate_esc_cancels_plan() {
+        let mut app = app_with_plan_gate();
+        handle_input_key(&mut app, key(KeyCode::Esc));
+        assert!(app.pending_plan.is_none(), "Esc на гейте отменяет план");
+        assert!(
+            app.transcript
+                .iter()
+                .any(|line| line.contains("План отменён")),
+            "отмена видна в ленте: {:?}",
+            app.transcript
+        );
+    }
+
+    #[test]
+    fn plan_gate_ignores_ctrl_and_alt_combinations() {
+        // Гейт перехватывает только чистые клавиши: Ctrl+Esc и Alt+Esc до cancel_plan
+        // не доходят, иначе комбинации редактора рушили бы план.
+        let mut with_ctrl = app_with_plan_gate();
+        handle_input_key(&mut with_ctrl, ctrl(KeyCode::Esc));
+        assert!(
+            with_ctrl.pending_plan.is_some(),
+            "Ctrl+Esc план не отменяет"
+        );
+
+        let mut with_alt = app_with_plan_gate();
+        handle_input_key(&mut with_alt, alt(KeyCode::Esc));
+        assert!(with_alt.pending_plan.is_some(), "Alt+Esc план не отменяет");
+    }
+
+    #[test]
+    fn plan_gate_backtab_keeps_chat_mode() {
+        let mut app = app_with_plan_gate();
+        handle_input_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(
+            app.chat_mode,
+            ChatMode::Discussion,
+            "пока открыт гейт, BackTab режим не переключает"
+        );
+        assert!(app.pending_plan.is_some());
+    }
+
+    #[test]
+    fn plan_gate_passes_plain_typing_to_editor() {
+        // Обычный символ на гейте — это набор замечания, а не отмена плана.
+        let mut app = app_with_plan_gate();
+        handle_input_key(&mut app, key(KeyCode::Char('к')));
+        assert_eq!(app.input, "к");
+        assert!(app.pending_plan.is_some());
+    }
+
+    #[test]
+    fn enter_without_gate_submits_input() {
+        // running = true → start_chat кладёт сообщение в очередь и НЕ поднимает провайдер.
+        let mut app = app_for_keys();
+        app.running = true;
+        app.input = "привет".to_string();
+        app.cursor = app.input.len();
+        handle_input_key(&mut app, key(KeyCode::Enter));
+        assert!(app.input.is_empty(), "инпут очищен отправкой");
+        assert_eq!(
+            app.pending_messages.front().map(String::as_str),
+            Some("привет")
+        );
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline_instead_of_submitting() {
+        let mut app = app_for_keys();
+        app.running = true; // страховка: даже при мутации guard'а отправка уйдёт в очередь
+        app.input = "abc".to_string();
+        app.cursor = app.input.len();
+        handle_input_key(&mut app, key_with(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(app.input, "abc\n");
+        assert!(app.pending_messages.is_empty(), "Shift+Enter не отправляет");
+    }
+
+    // ───────────────────────── Ctrl-ярус ─────────────────────────
+
+    #[test]
+    fn ctrl_c_twice_quits() {
+        let mut app = app_for_keys();
+        handle_input_key(&mut app, ctrl(KeyCode::Char('c')));
+        assert!(!app.should_quit, "первый Ctrl+C только предупреждает");
+        handle_input_key(&mut app, ctrl(KeyCode::Char('c')));
+        assert!(app.should_quit, "двойной Ctrl+C выходит");
+    }
+
+    #[test]
+    fn ctrl_j_inserts_newline() {
+        let mut app = app_for_keys();
+        app.input = "ab".to_string();
+        app.cursor = 2;
+        handle_input_key(&mut app, ctrl(KeyCode::Char('j')));
+        assert_eq!(app.input, "ab\n");
+    }
+
+    #[test]
+    fn ctrl_m_submits_input() {
+        let mut app = app_for_keys();
+        app.running = true;
+        app.input = "ping".to_string();
+        app.cursor = app.input.len();
+        handle_input_key(&mut app, ctrl(KeyCode::Char('m')));
+        assert!(app.input.is_empty());
+        assert_eq!(
+            app.pending_messages.front().map(String::as_str),
+            Some("ping")
+        );
+    }
+
+    #[test]
+    fn ctrl_a_and_ctrl_e_jump_to_line_edges() {
+        let mut app = app_for_keys();
+        app.input = "abc".to_string();
+        app.cursor = 2;
+        handle_input_key(&mut app, ctrl(KeyCode::Char('a')));
+        assert_eq!(app.cursor, 0);
+        handle_input_key(&mut app, ctrl(KeyCode::Char('e')));
+        assert_eq!(app.cursor, 3);
+    }
+
+    #[test]
+    fn ctrl_b_and_ctrl_f_move_by_char() {
+        let mut app = app_for_keys();
+        app.input = "abc".to_string();
+        app.cursor = 2;
+        handle_input_key(&mut app, ctrl(KeyCode::Char('b')));
+        assert_eq!(app.cursor, 1);
+        handle_input_key(&mut app, ctrl(KeyCode::Char('f')));
+        assert_eq!(app.cursor, 2);
+    }
+
+    #[test]
+    fn ctrl_p_and_ctrl_n_walk_history() {
+        let mut app = app_for_keys();
+        app.history = vec!["one".to_string(), "two".to_string()];
+        app.input = "draft".to_string();
+        app.cursor = app.input.len();
+        handle_input_key(&mut app, ctrl(KeyCode::Char('p')));
+        assert_eq!(app.input, "two", "Ctrl+P — последняя команда истории");
+        handle_input_key(&mut app, ctrl(KeyCode::Char('n')));
+        assert_eq!(app.input, "draft", "Ctrl+N возвращает черновик");
+    }
+
+    #[test]
+    fn ctrl_u_and_ctrl_k_kill_around_cursor() {
+        let mut before = app_for_keys();
+        before.input = "abcdef".to_string();
+        before.cursor = 3;
+        handle_input_key(&mut before, ctrl(KeyCode::Char('u')));
+        assert_eq!(before.input, "def");
+        assert_eq!(before.cursor, 0);
+
+        let mut after = app_for_keys();
+        after.input = "abcdef".to_string();
+        after.cursor = 3;
+        handle_input_key(&mut after, ctrl(KeyCode::Char('k')));
+        assert_eq!(after.input, "abc");
+    }
+
+    #[test]
+    fn ctrl_w_deletes_word_back() {
+        let mut app = app_for_keys();
+        app.input = "hello world".to_string();
+        app.cursor = app.input.len();
+        handle_input_key(&mut app, ctrl(KeyCode::Char('w')));
+        assert_eq!(app.input, "hello ");
+    }
+
+    #[test]
+    fn ctrl_backspace_deletes_word_back() {
+        let mut app = app_for_keys();
+        app.input = "hello world".to_string();
+        app.cursor = app.input.len();
+        handle_input_key(&mut app, ctrl(KeyCode::Backspace));
+        assert_eq!(app.input, "hello ");
+    }
+
+    #[test]
+    fn ctrl_d_deletes_char_under_cursor() {
+        let mut app = app_for_keys();
+        app.input = "abc".to_string();
+        app.cursor = 0;
+        handle_input_key(&mut app, ctrl(KeyCode::Char('d')));
+        assert_eq!(app.input, "bc");
+    }
+
+    #[test]
+    fn ctrl_r_opens_search() {
+        let mut app = app_for_keys();
+        handle_input_key(&mut app, ctrl(KeyCode::Char('r')));
+        assert_eq!(app.overlay, Overlay::Search);
+    }
+
+    #[test]
+    fn ctrl_arrows_move_by_word() {
+        let mut app = app_for_keys();
+        app.input = "one two".to_string();
+        app.cursor = app.input.len();
+        handle_input_key(&mut app, ctrl(KeyCode::Left));
+        assert_eq!(app.cursor, 4, "курсор в начало слова «two»");
+        handle_input_key(&mut app, ctrl(KeyCode::Right));
+        assert_eq!(app.cursor, 7, "и обратно в конец слова");
+    }
+
+    #[test]
+    fn ctrl_delete_deletes_word_forward() {
+        let mut app = app_for_keys();
+        app.input = "one two".to_string();
+        app.cursor = 0;
+        handle_input_key(&mut app, ctrl(KeyCode::Delete));
+        assert_eq!(app.input, " two");
+    }
+
+    #[test]
+    fn ctrl_home_and_ctrl_end_jump_to_input_edges() {
+        let mut app = app_for_keys();
+        app.input = "ab\ncd".to_string();
+        app.cursor = 4;
+        handle_input_key(&mut app, ctrl(KeyCode::Home));
+        assert_eq!(app.cursor, 0, "Ctrl+Home — в самое начало ввода");
+        handle_input_key(&mut app, ctrl(KeyCode::End));
+        assert_eq!(app.cursor, app.input.len(), "Ctrl+End — в самый конец");
+    }
+
+    // ───────────────────────── Alt-ярус ─────────────────────────
+
+    #[test]
+    fn alt_enter_inserts_newline() {
+        let mut app = app_for_keys();
+        app.running = true;
+        app.input = "abc".to_string();
+        app.cursor = app.input.len();
+        handle_input_key(&mut app, alt(KeyCode::Enter));
+        assert_eq!(app.input, "abc\n");
+        assert!(app.pending_messages.is_empty(), "Alt+Enter не отправляет");
+    }
+
+    #[test]
+    fn alt_left_and_alt_b_move_word_left() {
+        // Обе клавиши руки — на своём свежем состоянии, иначе успех первой замаскирует
+        // выпавшую вторую.
+        for code in [KeyCode::Left, KeyCode::Char('b')] {
+            let mut app = app_for_keys();
+            app.input = "one two".to_string();
+            app.cursor = app.input.len();
+            handle_input_key(&mut app, alt(code));
+            assert_eq!(app.cursor, 4, "Alt+{code:?} — слово влево");
+            assert_eq!(app.input, "one two", "текст не изменился");
+        }
+    }
+
+    #[test]
+    fn alt_right_and_alt_f_move_word_right() {
+        for code in [KeyCode::Right, KeyCode::Char('f')] {
+            let mut app = app_for_keys();
+            app.input = "one two".to_string();
+            app.cursor = 0;
+            handle_input_key(&mut app, alt(code));
+            assert_eq!(app.cursor, 3, "Alt+{code:?} — слово вправо");
+            assert_eq!(app.input, "one two");
+        }
+    }
+
+    #[test]
+    fn alt_backspace_deletes_word_back() {
+        let mut app = app_for_keys();
+        app.input = "one two".to_string();
+        app.cursor = app.input.len();
+        handle_input_key(&mut app, alt(KeyCode::Backspace));
+        assert_eq!(app.input, "one ");
+    }
+
+    #[test]
+    fn alt_delete_and_alt_d_delete_word_forward() {
+        for code in [KeyCode::Delete, KeyCode::Char('d')] {
+            let mut app = app_for_keys();
+            app.input = "one two".to_string();
+            app.cursor = 0;
+            handle_input_key(&mut app, alt(code));
+            assert_eq!(app.input, " two", "Alt+{code:?} — слово вперёд");
+        }
+    }
+
+    // ───────────────────────── голый ярус ─────────────────────────
+
+    #[test]
+    fn tab_completes_command() {
+        let mut app = app_for_keys();
+        app.input = "/brain".to_string();
+        app.cursor = app.input.len();
+        handle_input_key(&mut app, key(KeyCode::Tab));
+        assert!(
+            app.input.starts_with("/brainstorm"),
+            "Tab дополняет команду: {}",
+            app.input
+        );
+        assert_eq!(app.cursor, app.input.len());
+    }
+
+    #[test]
+    fn backtab_switches_chat_mode() {
+        let mut app = app_for_keys();
+        handle_input_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.chat_mode, ChatMode::Discussion.next());
+        assert_ne!(app.chat_mode, ChatMode::Discussion);
+    }
+
+    #[test]
+    fn backspace_and_delete_edit_around_cursor() {
+        let mut back = app_for_keys();
+        back.input = "abc".to_string();
+        back.cursor = 2;
+        handle_input_key(&mut back, key(KeyCode::Backspace));
+        assert_eq!(back.input, "ac");
+        assert_eq!(back.cursor, 1);
+
+        let mut del = app_for_keys();
+        del.input = "abc".to_string();
+        del.cursor = 1;
+        handle_input_key(&mut del, key(KeyCode::Delete));
+        assert_eq!(del.input, "ac");
+        assert_eq!(del.cursor, 1);
+    }
+
+    #[test]
+    fn arrows_move_cursor_by_char() {
+        let mut app = app_for_keys();
+        app.input = "abc".to_string();
+        app.cursor = 1;
+        handle_input_key(&mut app, key(KeyCode::Right));
+        assert_eq!(app.cursor, 2);
+        handle_input_key(&mut app, key(KeyCode::Left));
+        assert_eq!(app.cursor, 1);
+    }
+
+    #[test]
+    fn up_and_down_walk_history_from_single_line() {
+        // Инпут без «/» — иначе Up/Down листали бы палитру подсказок, а не историю.
+        let mut app = app_for_keys();
+        app.history = vec!["one".to_string(), "two".to_string()];
+        app.input = "draft".to_string();
+        app.cursor = app.input.len();
+        handle_input_key(&mut app, key(KeyCode::Up));
+        assert_eq!(app.input, "two");
+        handle_input_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.input, "draft", "черновик вернулся");
+    }
+
+    #[test]
+    fn home_and_end_jump_within_current_line() {
+        let mut app = app_for_keys();
+        app.input = "ab\ncd".to_string();
+        app.cursor = 4;
+        handle_input_key(&mut app, key(KeyCode::Home));
+        assert_eq!(app.cursor, 3, "Home — в начало ТЕКУЩЕЙ строки");
+        handle_input_key(&mut app, key(KeyCode::End));
+        assert_eq!(app.cursor, 5, "End — в конец текущей строки");
+    }
+
+    #[test]
+    fn esc_clears_input() {
+        let mut app = app_for_keys();
+        app.input = "abc".to_string();
+        app.cursor = 3;
+        app.history = vec!["one".to_string()];
+        app.history_index = Some(0);
+        handle_input_key(&mut app, key(KeyCode::Esc));
+        assert!(app.input.is_empty());
+        assert_eq!(app.cursor, 0);
+        assert!(app.history_index.is_none());
+    }
+
+    #[test]
+    fn question_mark_opens_shortcuts_only_on_empty_input() {
+        let mut empty = app_for_keys();
+        handle_input_key(&mut empty, key(KeyCode::Char('?')));
+        assert_eq!(empty.overlay, Overlay::Shortcuts);
+        assert!(empty.input.is_empty(), "оверлей вместо ввода символа");
+
+        let mut typed = app_for_keys();
+        typed.input = "как".to_string();
+        typed.cursor = typed.input.len();
+        handle_input_key(&mut typed, key(KeyCode::Char('?')));
+        assert_eq!(
+            typed.overlay,
+            Overlay::None,
+            "внутри вопроса оверлей не лезет"
+        );
+        assert_eq!(typed.input, "как?");
+    }
+
+    #[test]
+    fn printable_char_inserts_control_char_does_not() {
+        let mut printable = app_for_keys();
+        handle_input_key(&mut printable, key(KeyCode::Char('ы')));
+        assert_eq!(printable.input, "ы");
+        assert_eq!(
+            printable.cursor,
+            "ы".len(),
+            "курсор шагнул на байты символа"
+        );
+
+        let mut control = app_for_keys();
+        handle_input_key(&mut control, key(KeyCode::Char('\u{1}')));
+        assert!(
+            control.input.is_empty(),
+            "управляющий символ в ввод не попадает"
+        );
+    }
 }
