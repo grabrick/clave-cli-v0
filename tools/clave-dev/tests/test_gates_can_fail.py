@@ -24,24 +24,23 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from scripts.prove_gate import CANARY  # noqa: E402
+from scripts.prove_gate import CANARY, NEUTERED  # noqa: E402
 
 PROVE = ROOT / "scripts" / "prove_gate.py"
 
-GATES = [
-    "clave_dev.loop:converged",
-    "clave_dev.loop:outcome",
-    "clave_dev.visual_verdict:verdict_passes",
-    "clave_dev.visual_verdict:consensus_verdict",
-    "clave_dev.visual_verdict:is_infra_failure",
-    "clave_dev.assertions:evaluate",
-    "clave_dev.checks:parse_test_failures",
-    "clave_dev.checks:tests_ran",
-    "clave_dev.diff:changed_paths",
-    "clave_dev.mutation:unproven",
-    "clave_dev.mutation:tested",
-    "clave_dev.mutation_py:unproven",
-]
+# Список гейтов НЕ дублируем — выводим из NEUTERED.
+#
+# Раньше он был переписан здесь руками, и два списка тихо разъехались на первом же новом гейте:
+# я добавил `clave_dev.flake:unstable` в prove_gate, а сюда — нет, и CI спокойно принял бы гейт,
+# не доказанный НИЧЕМ. Заметил случайно, пересчитывая записи.
+#
+# Это ровно та болезнь, от которой написано само правило: ОТСУТСТВИЕ ПРОВЕРКИ ЧИТАЕТСЯ КАК
+# ПРОЙДЕННАЯ ПРОВЕРКА. Лечится не «не забывать дописывать», а тем, что забыть НЕЛЬЗЯ: источник
+# один, и всё, что попало в NEUTERED, обязано доказаться.
+#
+# Канарейку исключаем сознательно: она обязана НЕ доказываться — её и проверяет
+# test_the_prover_itself_can_say_no.
+GATES = [gate for gate in NEUTERED if gate != CANARY]
 
 
 def _run(gate: str) -> subprocess.CompletedProcess:
@@ -112,8 +111,15 @@ class GatesCanFailTest(unittest.TestCase):
     def test_the_list_of_gates_is_not_quietly_empty(self):
         # Мета-тест, который ничего не проверяет, — сам декорация. Пустой список гейтов дал бы
         # вечно-зелёный результат, и это ровно та болезнь, которую он лечит.
-        self.assertGreaterEqual(len(GATES), 12)
+        self.assertGreaterEqual(len(GATES), 13)
         self.assertTrue(PROVE.is_file(), "скрипт мутации пропал — правило перестало действовать")
+
+    def test_no_gate_can_hide_from_this_test(self):
+        # Гейт, доказательство которого никто не запускает, недоказан ровно так же, как гейт,
+        # который нельзя провалить. Единственный источник — NEUTERED: всё, что там объявлено
+        # гейтом, обязано попасть под проверку. Второго списка, из которого можно молча выпасть,
+        # быть не должно — он уже однажды разъехался.
+        self.assertEqual(set(GATES) | {CANARY}, set(NEUTERED))
 
 
 if __name__ == "__main__":

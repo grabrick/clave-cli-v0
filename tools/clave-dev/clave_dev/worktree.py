@@ -1,6 +1,7 @@
 """Git-безопасность: preflight чистого дерева + изолированный worktree на весь прогон."""
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -46,6 +47,77 @@ def base_sha(worktree: Path) -> str:
 def remove_run_worktree(repo: Path, worktree: Path) -> None:
     _git(repo, "worktree", "remove", "--force", str(worktree))
     _git(repo, "worktree", "prune")
+
+
+# Временный worktree прогона: `<tmp>/clave-dev-XXXXXXXX/wt`. Шаблон ТОЧНЫЙ и с якорями.
+#
+# Это не педантизм, а шрам. Убирая эти каталоги руками, я отфильтровал их как `grep 'clave-dev-'`
+# — и подстрока поймала не только временные `clave-dev-a1b2c3d4`, но и мой рабочий worktree
+# `clave-dev-headless`. Он был снесён вместе с мусором. Спасло только то, что ветка была
+# запушена, а дерево — чистым.
+#
+# Шаблон, который ловит лишнее, — это не уборка, а разрушение. Поэтому: имя каталога целиком,
+# суффикс из mkdtemp, и родитель обязан лежать ровно в tmp.
+_RUN_DIR = re.compile(r"^clave-dev-[A-Za-z0-9_]{8}$")
+
+
+def _registered(repo: Path) -> list:
+    """Пути worktree, о которых знает git (--porcelain: по строке `worktree <путь>`)."""
+    out = _git(repo, "worktree", "list", "--porcelain").stdout
+    return [
+        Path(line[len("worktree ") :].strip())
+        for line in out.splitlines()
+        if line.startswith("worktree ")
+    ]
+
+
+def stale_worktrees(repo: Path, tmp: Path, now: float, older_than_s: float = 6 * 3600) -> list:
+    """Worktree от ПРОШЛЫХ прогонов. Свежие не трогаем.
+
+    Worktree последнего прогона снимать нельзя: в нём лежит дифф, который человек и пришёл читать
+    («ни коммита, ни установки не сделано — ревьюь и решай»). Течёт не он, а все предыдущие: за
+    месяц их накопилось 28, и вычищал я их вручную.
+
+    Фильтр по ВОЗРАСТУ обязателен ровно по той же причине, что и в `stale_dirs`: рядом может идти
+    другой прогон, и снести его worktree — значит выдернуть код из-под живого агента.
+
+    Каталог, которого уже нет, а запись в git осталась (машина подчистила /tmp), — тоже мусор:
+    его тоже отдаём на снос, `git worktree prune` уберёт запись.
+    """
+    tmp = Path(tmp).resolve()
+    found = []
+    for path in _registered(repo):
+        resolved = path.resolve()
+        if resolved.name != "wt" or not _RUN_DIR.match(resolved.parent.name):
+            continue
+        if resolved.parent.parent != tmp:
+            continue
+        try:
+            if now - resolved.parent.stat().st_mtime > older_than_s:
+                found.append(path)
+        except OSError:
+            found.append(path)  # каталога нет, запись висит — мусор
+    return found
+
+
+def sweep_stale_worktrees(
+    repo: Path, tmp: Path = None, now: float = None, older_than_s: float = 6 * 3600
+) -> int:
+    """Прибрать за прошлыми прогонами. Возвращает, сколько worktree снесено."""
+    import shutil
+    import tempfile as _tempfile
+    import time as _time
+
+    tmp = Path(tmp) if tmp is not None else Path(_tempfile.gettempdir())
+    now = _time.time() if now is None else now
+
+    swept = 0
+    for path in stale_worktrees(repo, tmp, now, older_than_s):
+        remove_run_worktree(repo, path)
+        # Каталог прогона держит не только `wt`, но и патч для cargo mutants — сносим целиком.
+        shutil.rmtree(path.parent, ignore_errors=True)
+        swept += 1
+    return swept
 
 
 def git_root(path: Path) -> Path:

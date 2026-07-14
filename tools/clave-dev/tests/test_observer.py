@@ -6,7 +6,27 @@ from pathlib import Path
 from unittest import mock
 
 from clave_dev.assertions import structural_assertions
-from clave_dev.observer import Scenario, run_scenario
+from clave_dev.observer import Scenario, observer_preflight, run_scenario
+
+
+class ObserverPreflightTest(unittest.TestCase):
+    """Предполёт обязан КРИЧАТЬ на старте, а не падать через десять минут после агента."""
+
+    def test_preflight_is_silent_when_pyte_is_there(self):
+        self.assertEqual(observer_preflight(), "")
+
+    def test_preflight_names_the_missing_pyte_and_how_to_fix_it(self):
+        # Без pyte супервайзер падал не на старте, а на стадии наблюдения — то есть уже ПОСЛЕ
+        # того, как агент написал код и прошёл все проверки. Прогон выбрасывался целиком.
+        #
+        # `sys.modules["pyte"] = None` — штатный способ заставить `import pyte` бросить
+        # ImportError, даже если пакет установлен.
+        with mock.patch.dict(sys.modules, {"pyte": None}):
+            reason = observer_preflight()
+        self.assertIn("pyte", reason)
+        # Причина без способа починки — половина сообщения. Меня самого сгубило то, что `ps`
+        # печатает у venv-питона тот же резолвнутый бинарь, что у системного.
+        self.assertIn(".venv", reason)
 
 
 def _fake_binary(directory: Path, script: str) -> Path:

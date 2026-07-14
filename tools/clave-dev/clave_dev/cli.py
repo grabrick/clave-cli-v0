@@ -11,7 +11,7 @@ from .binaries import sanitized_env, snapshot_baseline, snapshot_known_good
 from .emit import Emitter
 from .loop import RunConfig, run_loop
 from .mutation import mutation_preflight
-from .observer import Scenario
+from .observer import Scenario, observer_preflight
 from .report import render_report
 from .terminal_profile import default_profile, describe, observer_profile_mismatch
 from .user_config import (
@@ -26,7 +26,13 @@ from .vision import vision_preflight
 from .vision_claude import select_vision
 from .visual_observer import sweep_dead_windows, sweep_stale_dirs
 from .visual_verdict import BaselineUnavailableError, severities_at_or_above
-from .worktree import DirtyTreeError, assert_clean, base_sha, create_run_worktree
+from .worktree import (
+    DirtyTreeError,
+    assert_clean,
+    base_sha,
+    create_run_worktree,
+    sweep_stale_worktrees,
+)
 
 _ASSERT_FACTORIES = {"visible": visible, "not_visible": not_visible, "line_matches": line_matches}
 
@@ -96,10 +102,15 @@ def main(argv=None) -> int:
     # CLAVE_HOME из-под живого clave.
     swept_dirs = sweep_stale_dirs()
     closed_windows, stuck_windows = sweep_dead_windows()
-    if swept_dirs or closed_windows:
+    # Worktree прошлых прогонов не убирал НИКТО: `remove_run_worktree` была написана и не вызвана
+    # ниоткуда, кроме тестов. Держать worktree ПОСЛЕДНЕГО прогона правильно — в нём дифф, который
+    # человек пришёл читать; течь была в том, что все предыдущие оставались навсегда. За месяц их
+    # накопилось 28, и вычищал я их руками.
+    swept_worktrees = sweep_stale_worktrees(repo)
+    if swept_dirs or closed_windows or swept_worktrees:
         print(
             f"clave-dev: прибрано за прошлыми прогонами — каталогов: {swept_dirs}, "
-            f"окон Terminal: {closed_windows}",
+            f"worktree: {swept_worktrees}, окон Terminal: {closed_windows}",
             file=sys.stderr,
         )
     if stuck_windows:
@@ -181,6 +192,17 @@ def main(argv=None) -> int:
             print(f"clave-dev: ⚠ {mismatch}", file=sys.stderr)
     else:
         print("clave-dev: зрение выключено — текстовое наблюдение", file=sys.stderr)
+
+    # Наблюдение за экраном. Проверяем НА СТАРТЕ, хотя импорт `pyte` внутри ленивый: без него
+    # супервайзер падал на стадии наблюдения — через десять минут, уже ПОСЛЕ того как агент
+    # написал код и прошёл все проверки. Гейт, который падает после всей работы, — это гейт,
+    # выброшенный в мусор. Проверка стоит миллисекунды.
+    reason = observer_preflight()
+    if reason:
+        print(f"clave-dev: {reason}", file=sys.stderr)
+        print("clave-dev: прогон НЕ начат — незачем гонять агента, чтобы упасть в конце.",
+              file=sys.stderr)
+        return 2
 
     # Мутационный гейт. Нет инструмента — НЕ стартуем: молча пропустить проверку значит выдать
     # её отсутствие за прохождение, а это ровно та болезнь, от которой гейт и лечит.

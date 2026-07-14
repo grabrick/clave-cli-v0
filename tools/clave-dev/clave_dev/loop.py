@@ -9,10 +9,16 @@ from .agent import run_agent
 from .assertions import structural_assertions
 from .binaries import fresh_binary
 from .checks import python_suite_dir, run_checks
-from .context import build_context, build_mutation_context, build_visual_context
+from .context import (
+    build_context,
+    build_flake_context,
+    build_mutation_context,
+    build_visual_context,
+)
 from .diff import build_diff, changed_paths, diff_text
 from .emit import no_op_emitter
 from .failures import failure_payload
+from .flake import unstable
 from .mutation import describe as describe_mutants
 from .mutation import mutants_cmd, tested, unproven
 from .mutation_py import describe as describe_py_mutants
@@ -48,7 +54,7 @@ RunReport = namedtuple(
 
 def converged(
     checks, assertion_results, vision_verdicts=(), blocking=(), vision_required=False,
-    unproven_mutants=(),
+    unproven_mutants=(), flaky_tests=(),
 ) -> bool:
     """Здоровье продукта (спека §5+§6): проверки зелёные И текстовые assertions pass И все
     visual-вердикты pass. ВНИМАНИЕ: это НЕ «задача выполнена» — см. `outcome`.
@@ -69,6 +75,12 @@ def converged(
     # означает, что его тест ничего не доказывает — «добавлено тестов: 1» тут враньё.
     if unproven_mutants:
         return False
+    # Набор, падающий ВРАЗБРОС, отравляет всё остальное. Красный набор мутационный гейт
+    # засчитывает как «мутант пойман» — и объявляет покрытым код, который не покрыт ничем
+    # (замерено: 104 «выживших» против 129 настоящих). Пока набор неустойчив, ни одна цифра
+    # этого прогона ничего не стоит, и сходимостью это быть не может.
+    if flaky_tests:
+        return False
     # py_ok — юнит-набор самого clave-dev: без него правка в Python «сходилась» бы на
     # зелёном Rust, ничего про себя не доказав.
     checks_ok = (
@@ -84,7 +96,7 @@ def converged(
 
 def outcome(
     changed, checks, assertion_results, vision_verdicts=(), blocking=(), vision_required=False,
-    unproven_mutants=(),
+    unproven_mutants=(), flaky_tests=(),
 ) -> str:
     """Итог раунда: 'no_changes' | 'converged' | 'continue'.
 
@@ -95,7 +107,8 @@ def outcome(
     if not changed:
         return "no_changes"
     if converged(
-        checks, assertion_results, vision_verdicts, blocking, vision_required, unproven_mutants
+        checks, assertion_results, vision_verdicts, blocking, vision_required, unproven_mutants,
+        flaky_tests,
     ):
         return "converged"
     return "continue"
@@ -249,6 +262,7 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
         checks = run_checks(cfg.worktree, cfg.env, cfg.profile)
         _emit_checks(emitter, checks)
         grids, assertion_results, vision_verdicts, unproven_mutants = [], [], [], []
+        flaky_tests = []
         mutants_tested = 0  # сколько мутантов гейт реально проверил — это доедет до отчёта
         if checks.build_ok:
             fresh = fresh_binary(cfg.worktree, cfg.profile)
@@ -262,13 +276,37 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
 
             cheap_green = converged(checks, assertion_results)
 
+            # Устойчивость — ПЕРЕД мутационным гейтом, потому что она решает, можно ли его
+            # результату верить вообще. `cargo mutants` судит мутанта по цвету набора: покраснел —
+            # «мутант пойман», а ПОЧЕМУ покраснел, ему всё равно. Тест, падающий вразброс, красит
+            # набор сам по себе — и непойманный мутант записывается в пойманные. Замерено на живом
+            # коде: 104 «выживших» против 129 настоящих, 25 дыр гейт объявил закрытыми.
+            if cheap_green and cfg.mutants:
+                emitter.progress(
+                    "проверки зелёные — устойчивость: бьём набор параллельной нагрузкой"
+                )
+                flaky_tests = unstable(cfg.worktree, cfg.env)
+                emitter.check({
+                    "name": "устойчивость",
+                    "ok": not flaky_tests,
+                    "detail": (
+                        f"{len(flaky_tests)} тест(ов) падают ВРАЗБРОС — "
+                        "мутационному гейту верить нельзя"
+                        if flaky_tests
+                        else "набор не разваливается под параллельной нагрузкой"
+                    ),
+                })
+
             # Мутационный гейт — ДО зрения. `cargo test: N passed` не отличает тест, который
             # кусается, от `assert!(true || false)`: замерено, декорация проходит cargo, clippy и
             # fmt, поднимает счётчик и получает от отчёта похвалу «добавлено тестов: 1». Незачем
             # разглядывать пиксели, если доказательства фальшивые.
-            if cheap_green and cfg.mutants:
+            #
+            # На неустойчивом наборе гейт не запускаем вовсе: считать по нему — значит получить
+            # красивую и ложную цифру. Лучше не мерить, чем измерить враньё.
+            if cheap_green and cfg.mutants and not flaky_tests:
                 emitter.progress(
-                    "проверки зелёные — мутационный гейт: умеют ли тесты агента падать"
+                    "набор устойчив — мутационный гейт: умеют ли тесты агента падать"
                 )
                 patch = cfg.worktree.parent / "clave-dev.patch"
                 build_diff(cfg.worktree, patch, base_sha=cfg.base_sha)  # пишет патч на диск
@@ -304,7 +342,7 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
 
             # Зрение — ПОСЛЕДНИЙ гейт. Визуальный проход тяжёлый (окно Terminal.app, снимок,
             # вызов зрячей модели), поэтому запускаем его только когда всё дешёвое уже зелёное.
-            cheap_green = cheap_green and not unproven_mutants
+            cheap_green = cheap_green and not unproven_mutants and not flaky_tests
             if cheap_green and cfg.vision is not None and not cfg.vision.available():
                 # Зрение просили, а бэкенд отвалился уже на ходу (preflight ловит только старт).
                 # Тихо уйти в «сошлось» нельзя: человек просил проверку глазами, её не было.
@@ -328,7 +366,7 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
         if (
             outcome(
                 changed, checks, assertion_results, vision_verdicts,
-                cfg.blocking_severities, vision_required, unproven_mutants,
+                cfg.blocking_severities, vision_required, unproven_mutants, flaky_tests,
             )
             == "converged"
         ):
@@ -342,6 +380,8 @@ def run_loop(cfg: RunConfig, known_good_version: str, emitter=None) -> RunReport
             context = context + "\n" + build_visual_context(vision_verdicts)
         if unproven_mutants:
             context = context + "\n" + build_mutation_context(unproven_mutants)
+        if flaky_tests:
+            context = context + "\n" + build_flake_context(flaky_tests)
 
     _emit_final(emitter, cfg, False, cfg.max_rounds, known_good_version, "exhausted")
     return RunReport(
