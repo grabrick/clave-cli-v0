@@ -422,12 +422,6 @@ mod tests {
         path
     }
 
-    #[cfg(unix)]
-    fn process_alive(pid: i32) -> bool {
-        // kill(pid, 0) сигнал не шлёт — только проверяет, существует ли процесс.
-        unsafe { libc::kill(pid, 0) == 0 }
-    }
-
     /// Пробу гоняем в отдельном потоке и ждём с запасом. Смысл в том, что при откате
     /// починки тест ОБЯЗАН УПАСТЬ, а не повиснуть: набор, висящий вечно, ничего не
     /// сообщает — он просто вешает CI.
@@ -440,18 +434,34 @@ mod tests {
         rx
     }
 
-    // Провайдер, который замолчал и не выходит. Раньше `.output()` ждал бы его вечно — а
-    // пробу зовут из `App::new()` ещё до первого кадра, так что подвисший CLI морозил всю
-    // Clave на старте: пустой экран и никаких объяснений.
+    // Провайдер замолчал — И оставил под собой внука, как делает настоящий CLI, поднимая свои
+    // под-процессы. Один тест ловит сразу две вещи:
+    //
+    //   1. потолок срабатывает. Раньше `.output()` ждал бы вечно, а пробу зовут из `App::new()`
+    //      ещё до первого кадра — подвисший CLI морозил всю Clave на старте: пустой экран и
+    //      никаких объяснений.
+    //
+    //   2. убивается ВСЯ группа. Без `configure_process_group` процесс не лидер группы, сигнал
+    //      `kill(-pid)` не дошёл бы ни до кого, и `wait()` внутри `kill_process_tree` завис бы
+    //      на внуке (sh ждёт свой `sleep 30`). Проба вернулась бы через 30 с, а не через одну, —
+    //      и `recv_timeout(15 с)` этот случай ловит.
+    //
+    // Гонки тут нет намеренно: тест ничего не выясняет про внука до срабатывания потолка.
+    // Первая версия пыталась — читала pid внука из файла-маркера, пока проба ждёт, — и
+    // разваливалась под нагрузкой (`sh` не успевал стартовать за отведённые секунды). Хуже
+    // того: падая на ровном месте, она красила набор и заставляла cargo mutants записывать
+    // мутантов в «пойманные», которых никто не ловил. Флейк не просто шумит — он ВРЁТ гейту,
+    // и врёт в сторону «всё покрыто».
     #[cfg(unix)]
     #[test]
-    fn a_mute_provider_does_not_freeze_the_probe() {
-        let script = write_script("mute", "#!/bin/sh\nsleep 30\n");
+    fn a_mute_provider_with_a_grandchild_does_not_freeze_the_probe() {
+        let script = write_script("mute", "#!/bin/sh\nsleep 30 &\nwait\n");
         let rx = probe_in_thread(script.clone(), Duration::from_secs(1));
 
-        let probe = rx
-            .recv_timeout(Duration::from_secs(15))
-            .expect("проба обязана вернуться по потолку, а не ждать немого провайдера вечно");
+        let probe = rx.recv_timeout(Duration::from_secs(15)).expect(
+            "проба обязана вернуться по потолку — а вернуться она может, только если убита \
+             ВСЯ группа: иначе wait() внутри kill_process_tree ждал бы внука полминуты",
+        );
         let _ = fs::remove_file(&script);
 
         assert!(probe.installed, "бинарь запустился — значит, установлен");
@@ -463,62 +473,6 @@ mod tests {
             probe.status, "no response in 1s",
             "статус обязан назвать причину: иначе это выглядит как «не залогинен», \
              и пользователь пойдёт чинить логин, с которым всё в порядке"
-        );
-    }
-
-    // Внук наследует stdout пробы. Убей мы только сам CLI — внук держал бы пайп открытым,
-    // ридер не дождался бы EOF. Поэтому бьём по ГРУППЕ, и этот тест стережёт лидерство в
-    // ней: без `configure_process_group` сигнал по `-pid` не дойдёт ни до кого.
-    #[cfg(unix)]
-    #[test]
-    fn a_mute_provider_leaves_no_grandchildren() {
-        let marker = env::temp_dir().join(format!("clave-auth-pgrp-{}.pid", std::process::id()));
-        let _ = fs::remove_file(&marker);
-        let script = write_script(
-            "grandchild",
-            &format!(
-                "#!/bin/sh\nsleep 30 & echo $! > {}\nwait\n",
-                marker.to_string_lossy()
-            ),
-        );
-        let rx = probe_in_thread(script.clone(), Duration::from_secs(2));
-
-        let mut grandchild = 0;
-        for _ in 0..300 {
-            if let Some(pid) = fs::read_to_string(&marker)
-                .ok()
-                .and_then(|text| text.trim().parse::<i32>().ok())
-                .filter(|&pid| pid > 0)
-            {
-                grandchild = pid;
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            grandchild > 0,
-            "внук должен был родиться и назвать свой pid"
-        );
-        assert!(process_alive(grandchild), "внук жив, пока проба его ждёт");
-
-        let probe = rx
-            .recv_timeout(Duration::from_secs(15))
-            .expect("проба вернулась по потолку");
-        assert!(!probe.authenticated);
-
-        let mut dead = false;
-        for _ in 0..300 {
-            if !process_alive(grandchild) {
-                dead = true;
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        let _ = fs::remove_file(&script);
-        let _ = fs::remove_file(&marker);
-        assert!(
-            dead,
-            "внук обязан умереть вместе с группой — иначе он держит пайп пробы и течёт наружу"
         );
     }
 
