@@ -1116,42 +1116,24 @@ mod tests {
 
     // ─────────────────────────── /mode и /roles ───────────────────────────
     //
-    // Их не покрыли, решив, что они «уходят в auth-probe (спавн CLI)». Это не так: путь
-    // `/mode` → `apply_mode` → `set_mode` только присваивает поля, а `save_current_config`
-    // пишет во временный конфиг теста. Живых проб на нём нет — проверено. Освобождение от
-    // проверки всегда обосновано и всегда выходит боком: тут за ним прятались ШЕСТЬ мутантов,
-    // включая «apply_mode целиком заменяется пустышкой» — то есть `/mode` молча не переключает
-    // режим, а рапортует «Режим изменён».
-
-    #[test]
-    fn mode_command_switches_every_mode_and_persists_it() {
-        let (mut app, dir) = app_for_commands();
-
-        for (arg, expected) in [
-            ("codex-only", Mode::CodexOnly),
-            ("claude-only", Mode::ClaudeOnly),
-            ("claude-codex", Mode::ClaudeCodex),
-            ("codex-claude", Mode::CodexClaude),
-        ] {
-            let out = joined(&mut app, &format!("/mode {arg}"));
-            assert_eq!(
-                app.mode, expected,
-                "«/mode {arg}» обязан ПЕРЕКЛЮЧИТЬ режим, а не только отрапортовать: {out}"
-            );
-            assert_eq!(app.status, format!("mode:{}", expected.as_str()));
-            assert!(out.contains("Режим изменён"), "нет подтверждения: {out}");
-        }
-
-        // Режим уехал на диск: следующий запуск обязан его помнить.
-        let saved = load_config(&app.config_path);
-        assert_eq!(
-            saved.mode,
-            Mode::CodexClaude,
-            "последний выбранный режим обязан сохраниться в конфиг"
-        );
-
-        let _ = fs::remove_dir_all(&dir);
-    }
+    // `/mode` НЕ ПОКРЫТ, и это осознанно. Здесь стоял мой тест, и он был ошибкой.
+    //
+    // Мутанты `/mode` пропустили с объяснением «уходят в auth-probe (спавн CLI)». Я перепроверил
+    // цепочку — `apply_mode` → `set_mode` (только присваивание) → `save_current_config` (пишет во
+    // временный конфиг теста), — объявил путь чистым и дописал тест. И ОСТАНОВИЛСЯ ЗА ОДНУ СТРОКУ
+    // ДО КОНЦА: последним вызовом `apply_mode` идёт `ensure_auth_ready_for_current_mode()`, а он
+    // делает `Onboarding::new(mode)` — то есть поднимает НАСТОЯЩИЕ `claude` и `codex`.
+    //
+    // Цена ошибки замерена, а не предположена. На машине, где провайдеры установлены и
+    // залогинены, тест зеленел. На машине без них (то есть на CI) экран авторизации открывается
+    // ВСЕГДА, `status` становится «авторизация» вместо «mode:…», и тест падает. Он уехал в main
+    // и, скорее всего, положил там сборку.
+    //
+    // Урок не про `/mode`. Проверять цепочку надо ДО КОНЦА, а не до того места, где она
+    // подтверждает уже сложившееся мнение.
+    //
+    // `/roles` покрыт: `set_roles` заканчивается на `push_command_result` и проверки авторизации
+    // не зовёт — проверено прогоном с `CLAVE_CLAUDE=/nonexistent`.
 
     #[test]
     fn roles_command_sets_the_mode_from_the_pair() {
