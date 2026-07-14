@@ -342,3 +342,373 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Каталог уникален на процесс И на вызов: параллельные прогоны иначе затирают
+    /// файлы друг друга, и мутационный гейт получает случайные падения.
+    fn temp_ask_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "clave-ask-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// App на своих временных путях. `running = true` — обязателен всюду, где ответ уходит
+    /// модели: тогда сообщение встаёт в очередь и живой CLI провайдера не поднимается.
+    fn app_for_ask() -> App {
+        let dir = temp_ask_dir();
+        let config = AppConfig {
+            onboarding_done: true,
+            ..AppConfig::default()
+        };
+        let mut app = App::from_config(
+            config,
+            dir.join("config.json"),
+            dir.join("history"),
+            dir.clone(),
+        );
+        app.lang = Language::Ru;
+        app.onboarding = None;
+        app.overlay = Overlay::None;
+        app.transcript.clear();
+        app
+    }
+
+    fn question(text: &str, multi: bool, options: &[&str], allow_custom: bool) -> AskQuestion {
+        AskQuestion {
+            question: text.to_string(),
+            multi,
+            options: options
+                .iter()
+                .map(|label| AskOption {
+                    label: (*label).to_string(),
+                    note: None,
+                })
+                .collect(),
+            allow_custom,
+        }
+    }
+
+    fn open_ask(app: &mut App, questions: Vec<AskQuestion>) {
+        app.ask = Some(AskState::new(AskPrompt { questions }));
+    }
+
+    fn state(app: &mut App) -> &mut AskState {
+        app.ask.as_mut().expect("селектор открыт")
+    }
+
+    /// Главный контракт селектора: то, что человек выбрал, ОБЯЗАНО уйти модели. Пустышка
+    /// вместо ask_send_all = выбрал, нажал Enter — и ничего не ушло.
+    #[test]
+    fn confirmed_answers_are_sent_to_the_model() {
+        let mut app = app_for_ask();
+        app.running = true; // очередь вместо живого CLI
+        open_ask(
+            &mut app,
+            vec![
+                question("Какой провайдер?", false, &["Codex", "Claude"], true),
+                question("Что затронуть?", true, &["Тесты", "Доки"], true),
+            ],
+        );
+        {
+            let state = state(&mut app);
+            state.answers[0].cursor = 1; // «Claude»
+            state.step = 2; // шаг подтверждения
+            state.confirm_cursor = 2; // строка «Отправить»
+        }
+
+        app.ask_submit();
+
+        assert!(!app.ask_active(), "селектор закрывается после отправки");
+        assert_eq!(
+            app.pending_messages.iter().cloned().collect::<Vec<_>>(),
+            vec![
+                "Ответы:\n1. Какой провайдер?: Claude\n2. Что затронуть?: (пропущено)".to_string()
+            ]
+        );
+    }
+
+    /// Enter на строке ВОПРОСА (а не «Отправить») возвращает к правке, а не шлёт.
+    #[test]
+    fn enter_on_a_question_row_returns_to_editing_instead_of_sending() {
+        let mut app = app_for_ask();
+        app.running = true;
+        open_ask(
+            &mut app,
+            vec![
+                question("Первый?", false, &["A", "B"], true),
+                question("Второй?", false, &["C", "D"], true),
+            ],
+        );
+        {
+            let state = state(&mut app);
+            state.step = 2;
+            state.confirm_cursor = 0; // строка первого вопроса
+        }
+
+        app.ask_submit();
+
+        assert!(app.ask_active(), "селектор остаётся открыт");
+        assert_eq!(
+            state(&mut app).step,
+            0,
+            "вернулись к правке первого вопроса"
+        );
+        assert!(
+            app.pending_messages.is_empty(),
+            "с шага правки модели ничего не уходит"
+        );
+    }
+
+    /// Подписи выбранного: множественный отдаёт отметки и свой ответ, одиночный — один
+    /// вариант либо свой текст; пустой свой ответ не отдаёт ничего.
+    #[test]
+    fn chosen_labels_cover_multi_single_and_custom_rows() {
+        let mut app = app_for_ask();
+        open_ask(
+            &mut app,
+            vec![
+                question("Что затронуть?", true, &["Тесты", "Доки"], true),
+                question("Провайдер?", false, &["Codex", "Claude"], true),
+            ],
+        );
+        {
+            let ask = state(&mut app);
+            ask.answers[0].checked[0] = true;
+            ask.answers[0].custom = "  и рендер  ".to_string();
+            ask.answers[1].cursor = 0;
+        }
+        {
+            let ask = app.ask.as_ref().expect("селектор открыт");
+            assert_eq!(ask.chosen(0), vec!["Тесты", "и рендер"]);
+            assert_eq!(ask.chosen(1), vec!["Codex"]);
+        }
+
+        // Одиночный: курсор на строке «Свой ответ» — идёт свой текст.
+        {
+            let ask = state(&mut app);
+            ask.answers[1].cursor = 2;
+            ask.answers[1].custom = "оба".to_string();
+        }
+        assert_eq!(
+            app.ask.as_ref().expect("селектор").chosen(1),
+            vec!["оба".to_string()]
+        );
+
+        // ...а пустой свой ответ — это ничего, а не пустая строка.
+        state(&mut app).answers[1].custom = "   ".to_string();
+        assert!(app.ask.as_ref().expect("селектор").chosen(1).is_empty());
+    }
+
+    #[test]
+    fn reset_ask_closes_the_selector_and_forgets_the_intent() {
+        let mut app = app_for_ask();
+        open_ask(
+            &mut app,
+            vec![question("Зрение?", false, &["Нет", "Да"], false)],
+        );
+        app.ask_prompt_pending = Some(AskPrompt {
+            questions: vec![question("Ещё?", false, &["A"], false)],
+        });
+        app.ask_intent = Some(AskIntent::DevVision {
+            task: "почини".to_string(),
+        });
+
+        app.reset_ask();
+
+        assert!(!app.ask_active(), "селектор закрыт");
+        assert!(app.ask_prompt_pending.is_none());
+        assert!(app.ask_intent.is_none());
+    }
+
+    /// Локальный вопрос приложения (зрение для `/dev`) обрабатывается сами и уходит в
+    /// start_dev: селектор закрывается, а прогон стартует (здесь — упирается в busy).
+    #[test]
+    fn local_intent_answer_starts_dev_and_closes_the_selector() {
+        let mut app = app_for_ask();
+        app.running = true; // busy-preflight start_dev вместо живого прогона
+        app.ask_intent = Some(AskIntent::DevVision {
+            task: "почини футер".to_string(),
+        });
+        open_ask(
+            &mut app,
+            vec![question("Зрение?", false, &["Нет", "Да"], false)],
+        );
+        state(&mut app).answers[0].cursor = 1;
+
+        app.ask_submit();
+
+        assert!(!app.ask_active(), "локальный вопрос закрывается сам");
+        assert!(app.ask_intent.is_none(), "намерение израсходовано");
+        assert!(
+            app.transcript
+                .iter()
+                .any(|line| line.contains("Clave уже выполняется")),
+            "start_dev вызван: {:?}",
+            app.transcript
+        );
+    }
+
+    /// Строка «свой ответ» для локальных вопросов не поддерживается — прогон не стартует.
+    #[test]
+    fn local_intent_ignores_the_custom_row() {
+        let mut app = app_for_ask();
+        app.running = true;
+        app.ask_intent = Some(AskIntent::DevVision {
+            task: "почини футер".to_string(),
+        });
+        open_ask(
+            &mut app,
+            vec![question("Зрение?", false, &["Нет", "Да"], false)],
+        );
+        state(&mut app).answers[0].cursor = 2; // за пределами вариантов
+
+        app.ask_submit();
+
+        assert!(app.ask_active(), "селектор остаётся открыт");
+        assert!(app.ask_intent.is_some(), "намерение не израсходовано");
+        assert!(app.transcript.is_empty(), "прогон не стартовал");
+    }
+
+    /// На подтверждении курсор ходит по строкам вопросов и «Отправить», заворачиваясь.
+    #[test]
+    fn confirm_cursor_wraps_over_questions_and_the_send_row() {
+        let mut app = app_for_ask();
+        open_ask(
+            &mut app,
+            vec![
+                question("Первый?", false, &["A"], true),
+                question("Второй?", false, &["B"], true),
+            ],
+        );
+        state(&mut app).step = 2;
+
+        // Три строки: вопрос 0, вопрос 1, «Отправить».
+        assert_eq!(app.ask.as_ref().expect("селектор").confirm_rows(), 3);
+
+        app.ask_move(-1);
+        assert_eq!(
+            state(&mut app).confirm_cursor,
+            2,
+            "вверх с нуля — на «Отправить»"
+        );
+
+        state(&mut app).confirm_cursor = 1;
+        app.ask_move(1);
+        assert_eq!(state(&mut app).confirm_cursor, 2, "вниз — на «Отправить»");
+    }
+
+    /// Шаги визарда: вперёд не дальше подтверждения, назад не дальше нуля,
+    /// а одиночный вопрос шагов не имеет вовсе.
+    #[test]
+    fn wizard_steps_stay_inside_their_bounds() {
+        let mut app = app_for_ask();
+        open_ask(
+            &mut app,
+            vec![
+                question("Первый?", false, &["A"], true),
+                question("Второй?", false, &["B"], true),
+            ],
+        );
+        state(&mut app).step = 2; // подтверждение — дальше некуда
+        app.ask_next();
+        assert_eq!(state(&mut app).step, 2);
+
+        state(&mut app).step = 0;
+        app.ask_prev();
+        assert_eq!(state(&mut app).step, 0, "с нулевого шага назад не уходим");
+        app.ask_next();
+        assert_eq!(state(&mut app).step, 1);
+
+        // Одиночный вопрос: шагов нет ни вперёд, ни назад.
+        let mut app = app_for_ask();
+        open_ask(&mut app, vec![question("Один?", false, &["A"], true)]);
+        app.ask_next();
+        assert_eq!(state(&mut app).step, 0, "одиночный вопрос не шагает вперёд");
+        state(&mut app).step = 1;
+        app.ask_prev();
+        assert_eq!(state(&mut app).step, 1, "одиночный вопрос не шагает назад");
+    }
+
+    /// Space отмечает только вариант множественного вопроса.
+    #[test]
+    fn toggle_only_marks_options_of_a_multi_question() {
+        let mut app = app_for_ask();
+        open_ask(
+            &mut app,
+            vec![question("Что затронуть?", true, &["Тесты", "Доки"], true)],
+        );
+
+        app.ask_toggle();
+        assert!(state(&mut app).answers[0].checked[0], "вариант отмечен");
+        app.ask_toggle();
+        assert!(!state(&mut app).answers[0].checked[0], "и снят повторно");
+
+        // Строка «свой ответ» отметок не имеет — отмечать нечего.
+        state(&mut app).answers[0].cursor = 2;
+        app.ask_toggle();
+        assert_eq!(state(&mut app).answers[0].checked, vec![false, false]);
+
+        // Одиночный вопрос не отмечается вовсе.
+        let mut app = app_for_ask();
+        open_ask(
+            &mut app,
+            vec![question("Провайдер?", false, &["Codex"], true)],
+        );
+        app.ask_toggle();
+        assert_eq!(state(&mut app).answers[0].checked, vec![false]);
+    }
+
+    /// Enter внутри визарда: на варианте множественного — отмечает (шаг НЕ двигает),
+    /// на «своём ответе» и на одиночном — уходит на следующий шаг.
+    #[test]
+    fn enter_toggles_multi_options_and_advances_everywhere_else() {
+        let mut app = app_for_ask();
+        app.running = true;
+        open_ask(
+            &mut app,
+            vec![
+                question("Что затронуть?", true, &["Тесты", "Доки"], true),
+                question("Второй?", false, &["B"], true),
+            ],
+        );
+
+        app.ask_submit();
+        assert_eq!(
+            state(&mut app).step,
+            0,
+            "множественный: Enter не прыгает дальше"
+        );
+        assert!(
+            state(&mut app).answers[0].checked[0],
+            "Enter отметил вариант"
+        );
+
+        // Курсор на строке «свой ответ» — Enter уводит на следующий шаг.
+        state(&mut app).answers[0].cursor = 2;
+        app.ask_submit();
+        assert_eq!(state(&mut app).step, 1, "со «своего ответа» — дальше");
+
+        // Одиночный вопрос: Enter на варианте тоже уводит дальше, ничего не отмечая.
+        let mut app = app_for_ask();
+        app.running = true;
+        open_ask(
+            &mut app,
+            vec![
+                question("Провайдер?", false, &["Codex", "Claude"], true),
+                question("Второй?", false, &["B"], true),
+            ],
+        );
+        app.ask_submit();
+        assert_eq!(state(&mut app).step, 1, "одиночный: Enter — следующий шаг");
+    }
+}
