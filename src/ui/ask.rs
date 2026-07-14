@@ -7,13 +7,13 @@ pub(crate) fn ask_panel_height(state: &AskState, width: u16, cap: u16) -> u16 {
     let body = if state.on_confirm() {
         (state.confirm_rows() as u16).min(12)
     } else if let Some(question) = state.question() {
-        // Высота с учётом переноса: строка(и) вопроса + варианты + «Свой ответ».
+        // Высота с учётом переноса: строка(и) вопроса + варианты + «Свой ответ» (если он есть).
         let mut rows = wrapped_rows(display_width(&question.question), iw);
         for opt in &question.options {
             // ~6 символов на маркер/номер/чекбокс перед текстом варианта.
             rows += wrapped_rows(display_width(&opt.label) + 6, iw);
         }
-        rows += 1;
+        rows += usize::from(question.allow_custom);
         rows as u16
     } else {
         1
@@ -121,7 +121,7 @@ fn draw_question_rows(
     let capacity = (inner_h as usize)
         .saturating_sub(lines.len() + 1) // уже занятое + строка подсказки
         .max(1);
-    let total = question.options.len() + 1; // + «Свой ответ»
+    let total = question.options.len() + usize::from(question.allow_custom);
     let offset = command_palette_scroll_offset(answer.cursor, capacity, total);
     for idx in offset..(offset + capacity).min(total) {
         let selected = idx == answer.cursor;
