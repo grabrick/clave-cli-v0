@@ -561,11 +561,54 @@ fn to_crossterm_color(color: Color) -> CtColor {
 mod tests {
     use super::*;
 
+    /// Каталог уникален на процесс И на вызов: параллельные прогоны иначе затирают
+    /// файлы друг друга, и мутационный гейт получает случайные падения.
+    fn temp_render_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "clave-render-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// App на своих временных путях. Через `App::new()` нельзя: она читает настоящий
+    /// конфиг пользователя и при непройденном онбординге поднимает auth-probe процессы.
+    fn render_app() -> App {
+        let dir = temp_render_dir();
+        let config = AppConfig {
+            onboarding_done: true,
+            ..AppConfig::default()
+        };
+        let mut app = App::from_config(
+            config,
+            dir.join("config.json"),
+            dir.join("history"),
+            dir.clone(),
+        );
+        app.git_ref_detector = |_| None;
+        app.transcript.clear();
+        app
+    }
+
+    /// Кадр в память: ровно те байты, что ушли бы в терминал.
+    fn frame(renderer: &mut LiveRenderer, app: &mut App, width: u16, full_h: u16) -> String {
+        let mut out: Vec<u8> = Vec::new();
+        renderer
+            .render_to(&mut out, app, width, full_h)
+            .expect("рендер в память не падает");
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
     /// Приложение с ПОЛНОСТЬЮ детерминированным футером: правый слот берётся из полей
     /// (а не из стенных часов), панели и верхний слот погашены — значит футер это
     /// последняя строка блока, и её можно сверять посимвольно.
     fn footer_app() -> App {
-        let mut app = App::new();
+        let mut app = render_app();
         app.onboarding = None;
         app.overlay = Overlay::None;
         app.ask = None;
@@ -710,6 +753,517 @@ mod tests {
         );
     }
 
+    /// Текст строки блока — как его увидит терминал.
+    fn text_of(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// Покой: воздух, две линейки композера, поле ввода, футер — ровно 5 строк, курсор
+    /// в поле ввода сразу за приглашением.
+    #[test]
+    fn idle_block_is_air_composer_and_footer() {
+        let app = footer_app();
+
+        let (lines, cur_row, cur_col) = build_dynamic(&app, 80, 24);
+
+        assert_eq!((lines.len(), cur_row, cur_col), (5, 2, 2));
+        assert_eq!(text_of(&lines[0]).trim(), "");
+        assert!(
+            text_of(&lines[2]).starts_with('›'),
+            "поле ввода на строке 2"
+        );
+        assert!(text_of(&lines[4]).contains("Обсуждение"), "футер снизу");
+    }
+
+    /// Терминал в 4 строки: блок не проваливается ниже «композер + футер» — иначе поле
+    /// ввода обрезалось бы, а курсор ушёл бы за нижнюю линейку.
+    #[test]
+    fn tiny_terminal_keeps_composer_and_footer() {
+        let app = footer_app();
+
+        let (lines, cur_row, cur_col) = build_dynamic(&app, 80, 4);
+
+        assert_eq!((lines.len(), cur_row, cur_col), (4, 2, 2));
+    }
+
+    /// Реплика текущего рана: ведущая пустая строка бокса срезана — воздух уже даёт gap_top,
+    /// второй пустой строки быть не должно.
+    #[test]
+    fn live_turn_drops_its_leading_blank_line() {
+        let mut app = footer_app();
+        app.live_turn = Some("привет".to_string());
+
+        let (lines, cur_row, _) = build_dynamic(&app, 80, 24);
+
+        assert_eq!((lines.len(), cur_row), (6, 3));
+        assert!(
+            text_of(&lines[1]).starts_with("привет"),
+            "реплика сразу под воздухом: {:?}",
+            text_of(&lines[1])
+        );
+    }
+
+    /// Ран без единого токена: над вводом только лоадер (никакого пустого «⏺») и ровно
+    /// один отступ сверху — второй был бы двойным воздухом.
+    #[test]
+    fn running_without_answer_shows_loader_only() {
+        let mut app = footer_app();
+        app.running = true;
+
+        let (lines, cur_row, _) = build_dynamic(&app, 80, 24);
+
+        assert_eq!((lines.len(), cur_row), (7, 4));
+        let block: String = lines.iter().map(text_of).collect();
+        assert!(
+            !block.contains('⏺'),
+            "пустого ответа в блоке нет: {block:?}"
+        );
+    }
+
+    /// Ран с токенами: ответ рисуется как «⏺ …», между ним и лоадером — отступ.
+    #[test]
+    fn running_with_answer_puts_air_between_answer_and_loader() {
+        let mut app = footer_app();
+        app.running = true;
+        app.live_answer = "привет".to_string();
+
+        let (lines, _, _) = build_dynamic(&app, 80, 24);
+
+        assert!(
+            text_of(&lines[2]).starts_with("⏺ привет"),
+            "ответ в верхнем слоте: {:?}",
+            text_of(&lines[2])
+        );
+        assert_eq!(text_of(&lines[3]).trim(), "", "отступ перед лоадером");
+        // воздух + ответ(2) + отступ + лоадер + отступ + композер(3) + футер(1)
+        assert_eq!(lines.len(), 10);
+    }
+
+    /// Длинный ответ в высоком окне: весь верхний слот влезает, курсор едет вниз вместе
+    /// с ним. Проверяет арифметику высоты блока и строки курсора.
+    #[test]
+    fn long_answer_grows_the_block_and_moves_the_cursor_down() {
+        let mut app = footer_app();
+        app.running = true;
+        app.live_answer = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj".to_string();
+
+        let (lines, cur_row, cur_col) = build_dynamic(&app, 80, 24);
+
+        assert_eq!((lines.len(), cur_row, cur_col), (19, 16, 2));
+        assert!(
+            text_of(&lines[2]).starts_with("⏺ a"),
+            "ответ виден целиком: {:?}",
+            text_of(&lines[2])
+        );
+        assert!(
+            text_of(&lines[16]).starts_with('›'),
+            "курсор стоит на поле ввода"
+        );
+    }
+
+    /// Тот же ответ в НИЗКОМ окне: место под верхний слот считается за вычетом воздуха,
+    /// композера и футера. Ошибка в этом резерве уводит курсор в футер.
+    #[test]
+    fn long_answer_in_a_short_window_is_capped_by_the_reserved_rows() {
+        let mut app = footer_app();
+        app.running = true;
+        app.live_answer = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj".to_string();
+
+        let (lines, cur_row, cur_col) = build_dynamic(&app, 80, 12);
+
+        assert_eq!((lines.len(), cur_row, cur_col), (11, 8, 2));
+        assert!(text_of(&lines[8]).starts_with('›'), "курсор на поле ввода");
+    }
+
+    /// Открытая панель: футер гаснет (панель сама несёт контекст), блок вырастает на её
+    /// высоту, содержимое палитры нарисовано.
+    #[test]
+    fn open_panel_hides_the_footer_and_grows_the_block() {
+        let mut app = footer_app();
+        app.input = "/".to_string();
+        app.cursor = 1;
+
+        let (lines, cur_row, cur_col) = build_dynamic(&app, 80, 24);
+
+        assert_eq!((lines.len(), cur_row, cur_col), (16, 2, 3));
+        let block: String = lines.iter().map(text_of).collect();
+        assert!(
+            block.contains("/brainstorm"),
+            "палитра нарисована: {block:?}"
+        );
+        assert!(!block.contains("Обсуждение"), "футер спрятан под панелью");
+    }
+
+    /// Многострочный ввод: курсор считается по ПЕРЕНЕСЁННЫМ строкам и колонкам, а не по
+    /// смещению в тексте.
+    #[test]
+    fn cursor_follows_the_wrapped_input() {
+        let mut app = footer_app();
+        app.input = "ab\ncde".to_string();
+        app.cursor = 6;
+
+        let (lines, cur_row, cur_col) = build_dynamic(&app, 80, 24);
+
+        assert_eq!((lines.len(), cur_row, cur_col), (6, 3, 5));
+    }
+
+    /// Ширина в одну колонку: курсор не вылезает за правый край.
+    #[test]
+    fn cursor_column_never_leaves_the_screen() {
+        let app = footer_app();
+
+        let (_, _, cur_col) = build_dynamic(&app, 1, 10);
+
+        assert_eq!(cur_col, 0);
+    }
+
+    /// Буфер → строки: одинаковые стили схлопываются в спан, РАЗНЫЕ рвут его. Иначе футер
+    /// уехал бы в один серый спан и подсветка исчезла.
+    #[test]
+    fn buffer_lines_split_spans_by_style() {
+        let app = footer_app();
+
+        let (lines, _, _) = build_dynamic(&app, 80, 24);
+
+        let footer = lines.last().expect("блок не пуст");
+        assert!(footer.spans.len() > 1, "футер разбит по стилям: {footer:?}");
+        assert!(
+            footer.spans.iter().all(|span| !span.content.is_empty()),
+            "пустых спанов не бывает: {footer:?}"
+        );
+        assert!(
+            footer.spans.iter().any(|span| span.style.fg.is_some()),
+            "цвет сохранён: {footer:?}"
+        );
+        assert_eq!(
+            text_of(footer),
+            footer_line(&app, 80),
+            "текст строки собран без потерь"
+        );
+    }
+
+    /// Первый кадр: курсор прячется, печатается история и весь блок, курсор ставится в поле
+    /// ввода и ПОКАЗЫВАЕТСЯ обратно. Перевод строки — ровно один на строку истории и на
+    /// каждую строку блока, кроме последней (иначе блок «сползал» бы вниз каждый кадр).
+    #[test]
+    fn first_frame_prints_history_and_the_block() {
+        let mut app = footer_app();
+        app.transcript.push("привет".to_string());
+        let mut renderer = LiveRenderer::new();
+
+        let out = frame(&mut renderer, &mut app, 80, 24);
+
+        assert!(out.starts_with("\u{1b}[?25l"), "курсор спрятан: {out:?}");
+        assert!(out.ends_with("\u{1b}[?25h"), "курсор возвращён: {out:?}");
+        assert!(out.contains("привет"), "история напечатана");
+        assert!(out.contains("Обсуждение"), "футер напечатан");
+        assert!(out.contains("\u{1b}[38;5;97m"), "цвет спанов на месте");
+        assert_eq!(
+            out.matches("\r\n").count(),
+            5,
+            "1 строка истории + 5−1 блока"
+        );
+        // хвост: в начало строки → вверх на (последняя − строка курсора) → вправо на колонку
+        assert!(
+            out.ends_with("\u{1b}[1G\u{1b}[2A\u{1b}[2C\u{1b}[?25h"),
+            "курсор поставлен в поле ввода: {out:?}"
+        );
+        assert_eq!(app.scrollback_count, 1, "история ушла в скроллбэк");
+    }
+
+    /// Второй кадр без изменений не пишет НИЧЕГО: иначе футер мерцал бы на каждом тике.
+    #[test]
+    fn unchanged_frame_writes_nothing() {
+        let mut app = footer_app();
+        app.transcript.push("привет".to_string());
+        let mut renderer = LiveRenderer::new();
+
+        assert!(!frame(&mut renderer, &mut app, 80, 24).is_empty());
+        assert_eq!(frame(&mut renderer, &mut app, 80, 24), "");
+    }
+
+    /// Новая строка ленты уходит в скроллбэк РОВНО ОДИН РАЗ: второй кадр печатает только её,
+    /// старую историю не повторяет.
+    #[test]
+    fn new_history_is_printed_once() {
+        let mut app = footer_app();
+        app.transcript.push("первая".to_string());
+        let mut renderer = LiveRenderer::new();
+        frame(&mut renderer, &mut app, 80, 24);
+
+        app.transcript.push("вторая".to_string());
+        let out = frame(&mut renderer, &mut app, 80, 24);
+
+        assert!(out.contains("вторая"), "новая строка напечатана: {out:?}");
+        assert!(!out.contains("первая"), "старая — не повторяется: {out:?}");
+        assert_eq!(app.scrollback_count, 2);
+        // Структурный путь: спуститься на низ старого блока → на его верх → стереть вниз.
+        assert!(
+            out.starts_with("\u{1b}[?25l\u{1b}[2B\u{1b}[1G\u{1b}[4A\u{1b}[J"),
+            "старый блок стёрт с его верхней строки: {out:?}"
+        );
+        assert_eq!(
+            out.matches("\r\n").count(),
+            5,
+            "1 строка истории + 5−1 блока"
+        );
+
+        // и третий кадр (уже без новостей) снова молчит
+        assert_eq!(frame(&mut renderer, &mut app, 80, 24), "");
+    }
+
+    /// Дифф: меняем ОДНУ строку блока — в терминал уходит только она. Ни рамок композера,
+    /// ни очистки экрана: остальные строки не трогаем, поэтому футер не мерцает.
+    #[test]
+    fn diff_frame_touches_only_the_changed_line() {
+        let mut app = footer_app();
+        let mut renderer = LiveRenderer::new();
+        frame(&mut renderer, &mut app, 80, 24);
+
+        app.show_footer_notice("Сохранено");
+        let out = frame(&mut renderer, &mut app, 80, 24);
+
+        assert!(
+            out.contains("Сохранено"),
+            "изменившаяся строка ушла: {out:?}"
+        );
+        assert!(
+            !out.contains('─'),
+            "рамки композера не перерисованы: {out:?}"
+        );
+        assert!(!out.contains("\u{1b}[J"), "экран не стирался: {out:?}");
+        assert!(
+            !out.contains("\r\n"),
+            "дифф не двигает блок переводами строк"
+        );
+        assert!(
+            out.starts_with("\u{1b}[?25l\u{1b}[2B\u{1b}[1G\u{1b}[4A"),
+            "встали на верх блока: {out:?}"
+        );
+        // спуск ровно по одному разу на каждую строку блока, кроме последней
+        assert_eq!(out.matches("\u{1b}[1B").count(), 4);
+        assert!(out.ends_with("\u{1b}[1G\u{1b}[2A\u{1b}[2C\u{1b}[?25h"));
+    }
+
+    /// Курсор упирается в нижнюю строку блока (панель съела всё место): нулевых сдвигов
+    /// в выводе быть не должно — `ESC[0A`/`ESC[0B`/`ESC[0C` терминал понимает как сдвиг на 1.
+    #[test]
+    fn zero_moves_are_never_emitted() {
+        let mut app = footer_app();
+        app.input = "/".to_string();
+        app.cursor = 1;
+        let mut renderer = LiveRenderer::new();
+
+        let first = frame(&mut renderer, &mut app, 80, 4);
+        assert!(!first.contains("\u{1b}[0A"), "первый кадр: {first:?}");
+
+        // дифф-кадр: курсор на последней строке блока → шага вниз быть не должно
+        app.input = "/c".to_string();
+        app.cursor = 2;
+        let diff = frame(&mut renderer, &mut app, 80, 4);
+        assert!(diff.contains("/c"), "строка ввода перерисована: {diff:?}");
+        assert!(!diff.contains("\u{1b}[0B"), "дифф: {diff:?}");
+        assert!(!diff.contains("\u{1b}[0A"), "дифф: {diff:?}");
+
+        // структурный кадр из того же положения
+        app.transcript.push("x".to_string());
+        let structural = frame(&mut renderer, &mut app, 80, 4);
+        assert!(
+            !structural.contains("\u{1b}[0B"),
+            "структурный: {structural:?}"
+        );
+        assert!(
+            structural.starts_with("\u{1b}[?25l\u{1b}[1G\u{1b}[2A\u{1b}[J"),
+            "структурный встаёт на верх блока: {structural:?}"
+        );
+
+        // и уход вниз из того же положения
+        let mut buf: Vec<u8> = Vec::new();
+        renderer.leave_below_to(&mut buf).expect("уход вниз");
+        let leave = String::from_utf8_lossy(&buf);
+        assert!(!leave.contains("\u{1b}[0B"), "leave_below: {leave:?}");
+
+        // курсор в колонке 0 (ширина в одну колонку) — сдвига вправо тоже нет
+        let mut narrow = footer_app();
+        let mut renderer = LiveRenderer::new();
+        let out = frame(&mut renderer, &mut narrow, 1, 10);
+        assert!(!out.contains("\u{1b}[0C"), "нулевой сдвиг вправо: {out:?}");
+        assert!(out.ends_with("\u{1b}[1G\u{1b}[2A\u{1b}[?25h"), "{out:?}");
+    }
+
+    /// `/clear`: стираем экран И нативный скроллбэк, блок рисуем заново с нуля. История
+    /// уже в скроллбэке — её не перепечатываем.
+    #[test]
+    fn pending_clear_screen_wipes_the_terminal() {
+        let mut app = footer_app();
+        app.transcript.push("привет".to_string());
+        let mut renderer = LiveRenderer::new();
+        frame(&mut renderer, &mut app, 80, 24);
+
+        app.pending_clear_screen = true;
+        let out = frame(&mut renderer, &mut app, 80, 24);
+
+        assert!(
+            out.starts_with("\u{1b}[2J\u{1b}[3J\u{1b}[1;1H"),
+            "экран и скроллбэк: {out:?}"
+        );
+        assert!(!app.pending_clear_screen, "запрос погашен");
+        assert!(out.contains("Обсуждение"), "блок перерисован");
+        assert!(!out.contains("привет"), "история не печатается заново");
+        // кэш позиций сброшен: блок рисуется от текущей строки, без сдвигов вверх
+        assert!(
+            out.contains("\u{1b}[?25l\u{1b}[1G\u{1b}[J"),
+            "кэш позиций сброшен: {out:?}"
+        );
+        assert_eq!(app.scrollback_count, 1, "счётчик истории цел");
+    }
+
+    /// Ресайз: терминал перелил историю под новую ширину — чистим экран, скроллбэк И счётчик,
+    /// историю печатаем заново, иначе живой блок дублируется.
+    #[test]
+    fn pending_full_redraw_reprints_history_from_scratch() {
+        let mut app = footer_app();
+        app.transcript.push("привет".to_string());
+        let mut renderer = LiveRenderer::new();
+        frame(&mut renderer, &mut app, 80, 24);
+
+        app.pending_full_redraw = true;
+        let out = frame(&mut renderer, &mut app, 60, 24);
+
+        assert!(
+            out.starts_with("\u{1b}[2J\u{1b}[3J\u{1b}[1;1H"),
+            "экран и скроллбэк: {out:?}"
+        );
+        assert!(!app.pending_full_redraw, "запрос погашен");
+        assert!(
+            out.contains("привет"),
+            "история перепечатана под новую ширину"
+        );
+        assert_eq!(app.scrollback_count, 1, "счётчик пересобран");
+    }
+
+    /// `invalidate` заставляет следующий кадр перерисоваться целиком (после внешней команды
+    /// экран под нами уже не тот, что в кэше).
+    #[test]
+    fn invalidate_forces_a_full_repaint() {
+        let mut app = footer_app();
+        let mut renderer = LiveRenderer::new();
+        frame(&mut renderer, &mut app, 80, 24);
+        assert_eq!(
+            frame(&mut renderer, &mut app, 80, 24),
+            "",
+            "кадр без изменений молчит"
+        );
+
+        renderer.invalidate();
+        let out = frame(&mut renderer, &mut app, 80, 24);
+
+        assert!(
+            out.contains("Обсуждение"),
+            "блок перерисован целиком: {out:?}"
+        );
+    }
+
+    /// Заголовок окна ставится один раз на смену имени: безымянный чат — пусто, названный —
+    /// имя, повтор — тишина (иначе терминал моргал бы заголовком каждый кадр).
+    #[test]
+    fn terminal_title_is_set_once_per_change() {
+        let mut app = footer_app();
+        app.chat_title_custom = true;
+        app.chat_title = "Мой чат".to_string();
+        let mut renderer = LiveRenderer::new();
+
+        let out = frame(&mut renderer, &mut app, 80, 24);
+
+        assert!(
+            out.starts_with("\u{1b}]0;Мой чат\u{7}"),
+            "заголовок выставлен: {out:?}"
+        );
+        assert_eq!(
+            frame(&mut renderer, &mut app, 80, 24),
+            "",
+            "повтор ничего не пишет"
+        );
+        assert_eq!(terminal_window_title(&app), "Мой чат");
+
+        let plain = footer_app();
+        assert_eq!(
+            terminal_window_title(&plain),
+            "",
+            "безымянный чат заголовок не трогает"
+        );
+    }
+
+    /// `leave_below_to`: на непроинициализированном рендерере молчит, после кадра — стирает
+    /// живой блок с его верхней строки и возвращает курсор.
+    #[test]
+    fn leave_below_erases_the_block_only_when_started() {
+        let mut renderer = LiveRenderer::new();
+        let mut buf: Vec<u8> = Vec::new();
+        renderer.leave_below_to(&mut buf).expect("уход вниз");
+        assert!(buf.is_empty(), "без кадра писать нечего: {buf:?}");
+
+        let mut app = footer_app();
+        frame(&mut renderer, &mut app, 80, 24);
+        let mut buf: Vec<u8> = Vec::new();
+        renderer.leave_below_to(&mut buf).expect("уход вниз");
+        let out = String::from_utf8_lossy(&buf);
+
+        assert_eq!(out, "\u{1b}[2B\u{1b}[1G\u{1b}[4A\u{1b}[J\u{1b}[?25h");
+
+        // блок стёрт и забыт: повторный уход уже ничего не пишет
+        let mut again: Vec<u8> = Vec::new();
+        renderer.leave_below_to(&mut again).expect("уход вниз");
+        assert!(again.is_empty(), "второй раз стирать нечего: {again:?}");
+    }
+
+    /// Выход из приложения: экран И нативный скроллбэк чистые, курсор показан.
+    #[test]
+    fn clear_for_exit_wipes_screen_and_scrollback() {
+        let mut app = footer_app();
+        let mut renderer = LiveRenderer::new();
+        frame(&mut renderer, &mut app, 80, 24);
+
+        let mut buf: Vec<u8> = Vec::new();
+        renderer.clear_for_exit_to(&mut buf, &app).expect("выход");
+        let out = String::from_utf8_lossy(&buf);
+
+        assert_eq!(out, "\u{1b}[1G\u{1b}[2J\u{1b}[3J\u{1b}[1;1H\u{1b}[?25h");
+
+        let mut after: Vec<u8> = Vec::new();
+        renderer.leave_below_to(&mut after).expect("уход вниз");
+        assert!(after.is_empty(), "живого блока больше нет: {after:?}");
+    }
+
+    /// Стиль спана уходит в терминал: цвет, жирность — и сброс после каждого спана.
+    #[test]
+    fn queue_line_writes_colors_and_attributes() {
+        let line = Line::from(vec![
+            Span::styled(
+                "жирный",
+                Style::default()
+                    .fg(Color::LightMagenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" обычный"),
+        ]);
+
+        let mut buf: Vec<u8> = Vec::new();
+        queue_line(&mut buf, &line).expect("строка в память");
+        let out = String::from_utf8_lossy(&buf);
+
+        assert!(out.contains("\u{1b}[38;5;13m"), "цвет спана: {out:?}");
+        assert!(out.contains("\u{1b}[1m"), "жирность: {out:?}");
+        assert!(out.contains("жирный"), "текст: {out:?}");
+        assert!(
+            out.ends_with("\u{1b}[0m\u{1b}[0m"),
+            "стиль сброшен: {out:?}"
+        );
+    }
+
     #[test]
     fn sanitize_strips_escape_and_control_keeps_text() {
         // ESC/OSC/цвет/CR/BEL — вырезаются (инъекция в терминал невозможна).
@@ -746,13 +1300,15 @@ mod tests {
         queue_rich_line(&mut buf, &rich).unwrap();
         let out = String::from_utf8_lossy(&buf);
 
-        // OSC 8 обрамляет путь доверенным URL.
+        // OSC 8 обрамляет ИМЕННО свой спан: открытие вплотную перед путём, а не перед соседом.
         assert!(
-            out.contains("\u{1b}]8;;vscode://file/x:1:1\u{1b}\\"),
-            "OSC8 open с URL: {out:?}"
+            out.contains("\u{1b}]8;;vscode://file/x:1:1\u{1b}\\src/app.rs\u{1b}]8;;\u{1b}\\"),
+            "OSC8 обрамляет путь доверенным URL: {out:?}"
         );
-        assert!(out.contains("src/app.rs"), "текст ссылки на месте");
-        assert!(out.contains("\u{1b}]8;;\u{1b}\\"), "OSC8 close");
+        assert!(
+            !out.contains("\u{1b}]8;;vscode://file/x:1:1\u{1b}\\see "),
+            "ссылка не на соседе"
+        );
         // Контентный OSC (инъекция) вырезан — ESC-форма отсутствует.
         assert!(
             !out.contains("\u{1b}]0;PWNED"),
@@ -776,5 +1332,95 @@ mod tests {
             terminal_title_for(true, "ok\u{1b}]0;pwn\u{7}\rtitle"),
             "ok]0;pwntitle"
         );
+    }
+
+    // ─────────────────── ЗАПИСЬ В НАСТОЯЩИЙ ТЕРМИНАЛ ───────────────────
+    //
+    // `render`, `leave_below` и `clear_for_exit` — тонкие обёртки: лочат `io::stdout()` и
+    // делегируют в `*_to`. Их можно было заменить на `Ok(())`, и НИ ОДИН тест не заметил бы —
+    // всё покрытие живёт на `*_to`, куда мы подсовываем `Vec<u8>`. А значит, приложение могло
+    // бы не рисовать НИЧЕГО (пустой экран), не стирать живой блок перед внешней командой
+    // (вывод команды налез бы на блок) и не убирать беседу с экрана при выходе.
+    //
+    // Проверить факт записи в НАСТОЯЩИЙ stdout изнутри теста нельзя: он уходит мимо перехвата
+    // харнесса, а перенаправлять fd 1 на лету — значит гонять глобальное состояние процесса и
+    // ломать соседние тесты. Поэтому смотрим со стороны: запускаем случай в ДОЧЕРНЕМ процессе
+    // и ловим его вывод.
+
+    const RENDER_CASE: &str = "CLAVE_TEST_RENDER_CASE";
+    const RENDER_SELF: &str = "render::tests::the_wrappers_really_write_to_the_terminal";
+
+    fn run_render_case(case: &str) -> String {
+        let exe = std::env::current_exe().expect("путь к тестовому бинарю");
+        let out = std::process::Command::new(exe)
+            .args([RENDER_SELF, "--exact", "--nocapture", "--test-threads=1"])
+            .env(RENDER_CASE, case)
+            .output()
+            .expect("дочерний тест не запустился");
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
+    }
+
+    #[test]
+    fn the_wrappers_really_write_to_the_terminal() {
+        match std::env::var(RENDER_CASE).ok().as_deref() {
+            // Ребёнок: рисуем кадр по-настоящему. В stdout обязана уйти реплика из ленты.
+            Some("render") => {
+                let mut app = render_app();
+                app.transcript.push("◆ МАРКЕР_ЛЕНТЫ".to_string());
+                let mut renderer = LiveRenderer::new();
+                renderer.render(&mut app, 80, 24).expect("рендер");
+            }
+            // Ребёнок: стираем живой блок. Состояние ставим руками — важен ФАКТ записи.
+            Some("leave") => {
+                let mut renderer = LiveRenderer::new();
+                renderer.started = true;
+                renderer.prev_height = 4;
+                renderer.cursor_above = 1;
+                renderer.leave_below().expect("leave_below");
+            }
+            // Ребёнок: чистый выход — экран И нативный скроллбэк.
+            Some("exit") => {
+                let app = render_app();
+                let mut renderer = LiveRenderer::new();
+                renderer.clear_for_exit(&app).expect("clear_for_exit");
+            }
+            _ => {
+                let drawn = run_render_case("render");
+                assert!(
+                    drawn.contains("1 passed"),
+                    "дочерний случай «render» обязан РЕАЛЬНО прогнаться; коду возврата тут верить \
+                     нельзя — с опечаткой в фильтре ребёнок гоняет ноль тестов и выходит нулём:\n{drawn}"
+                );
+                assert!(
+                    drawn.contains("МАРКЕР_ЛЕНТЫ"),
+                    "render не написал в НАСТОЯЩИЙ stdout ничего — значит его можно заменить \
+                     пустышкой, и приложение будет показывать пустой экран:\n{drawn:?}"
+                );
+
+                let left = run_render_case("leave");
+                assert!(
+                    left.contains("1 passed"),
+                    "случай «leave» не прогнался:\n{left}"
+                );
+                assert!(
+                    left.contains("\u{1b}[J") && left.contains("\u{1b}[?25h"),
+                    "leave_below не стёр живой блок и не вернул курсор — вывод внешней команды \
+                     налез бы на блок:\n{left:?}"
+                );
+
+                let exited = run_render_case("exit");
+                assert!(
+                    exited.contains("1 passed"),
+                    "случай «exit» не прогнался:\n{exited}"
+                );
+                assert!(
+                    // Purge — стирание НАТИВНОГО скроллбэка терминала. Его шлёт только выход:
+                    // обычный кадр этой последовательности не выдаёт.
+                    exited.contains("\u{1b}[3J"),
+                    "clear_for_exit не стёр скроллбэк — беседа осталась бы в терминале после \
+                     закрытия приложения:\n{exited:?}"
+                );
+            }
+        }
     }
 }
