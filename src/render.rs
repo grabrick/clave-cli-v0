@@ -58,26 +58,33 @@ impl LiveRenderer {
     /// лишь изменившиеся (цвет/текст), не трогая остальные → нет мерцания футера, а
     /// анимация появления палитры (меняется цвет) проигрывается.
     pub(crate) fn render(&mut self, app: &mut App, width: u16, full_h: u16) -> io::Result<()> {
-        self.sync_terminal_title(app)?;
+        let mut out = io::stdout().lock();
+        self.render_to(&mut out, app, width, full_h)
+    }
+
+    /// То же, но в ЛЮБОЙ приёмник.
+    ///
+    /// Шов ради тестов. Рендерер писал прямо в `io::stdout()`, и проверить его было нечем:
+    /// мутационный прогон показал 46 выживших мутантов в одном этом методе — то есть живой блок
+    /// мог дублироваться, курсор уезжать, история печататься дважды, и НИ ОДИН тест этого бы не
+    /// заметил. Единственным способом убедиться, что экран не рассыпался, оставались глаза.
+    ///
+    /// Приём не новый: `queue_line` и `queue_rich_line` в этом же файле давно берут приёмник
+    /// параметром. Тут замысел просто доведён до конца.
+    pub(crate) fn render_to(
+        &mut self,
+        out: &mut impl Write,
+        app: &mut App,
+        width: u16,
+        full_h: u16,
+    ) -> io::Result<()> {
+        self.sync_terminal_title_to(out, app)?;
 
         // Полная очистка терминала по запросу (/clear, /new, /resume): стираем
         // экран И нативный скроллбэк, иначе старая напечатанная история остаётся.
         if app.pending_clear_screen {
             app.pending_clear_screen = false;
-            {
-                let mut out = io::stdout().lock();
-                queue!(
-                    out,
-                    Clear(ClearType::All),
-                    Clear(ClearType::Purge),
-                    MoveTo(0, 0)
-                )?;
-                out.flush()?;
-            }
-            self.started = false;
-            self.prev_height = 0;
-            self.cursor_above = 0;
-            self.prev_lines.clear();
+            self.wipe_screen(out)?;
         }
 
         // Полная перерисовка после ресайза: терминал перелил историю под новую
@@ -87,20 +94,7 @@ impl LiveRenderer {
         // состояние подсветки, чтобы структурный путь ниже перепечатал всё заново.
         if app.pending_full_redraw {
             app.pending_full_redraw = false;
-            {
-                let mut out = io::stdout().lock();
-                queue!(
-                    out,
-                    Clear(ClearType::All),
-                    Clear(ClearType::Purge),
-                    MoveTo(0, 0)
-                )?;
-                out.flush()?;
-            }
-            self.started = false;
-            self.prev_height = 0;
-            self.cursor_above = 0;
-            self.prev_lines.clear();
+            self.wipe_screen(out)?;
             app.scrollback_count = 0;
             app.flush_state = TranscriptRenderState::default();
         }
@@ -115,7 +109,6 @@ impl LiveRenderer {
 
         let height = lines.len() as u16;
         let last = height.saturating_sub(1);
-        let mut out = io::stdout().lock();
         queue!(out, Hide)?;
 
         if structural {
@@ -146,14 +139,14 @@ impl LiveRenderer {
                     &cwd,
                 );
                 for row in &rows {
-                    queue_rich_line(&mut out, row)?;
+                    queue_rich_line(out, row)?;
                     queue!(out, Clear(ClearType::UntilNewLine), Print("\r\n"))?;
                 }
                 app.scrollback_count += 1;
             }
 
             for (index, line) in lines.iter().enumerate() {
-                queue_line(&mut out, line)?;
+                queue_line(out, line)?;
                 queue!(out, Clear(ClearType::UntilNewLine))?;
                 if index + 1 < lines.len() {
                     queue!(out, Print("\r\n"))?;
@@ -171,7 +164,7 @@ impl LiveRenderer {
             for (index, line) in lines.iter().enumerate() {
                 queue!(out, MoveToColumn(0))?;
                 if self.prev_lines.get(index) != Some(line) {
-                    queue_line(&mut out, line)?;
+                    queue_line(out, line)?;
                     queue!(out, Clear(ClearType::UntilNewLine))?;
                 }
                 if index + 1 < lines.len() {
@@ -199,12 +192,31 @@ impl LiveRenderer {
         Ok(())
     }
 
-    fn sync_terminal_title(&mut self, app: &App) -> io::Result<()> {
+    /// Стереть экран И нативный скроллбэк, сбросив кэш позиций живого блока.
+    ///
+    /// Один код на два повода (`/clear` и ресайз): раньше он был скопирован дважды, и правка в
+    /// одном месте молча расходилась бы со вторым.
+    fn wipe_screen(&mut self, out: &mut impl Write) -> io::Result<()> {
+        queue!(
+            out,
+            Clear(ClearType::All),
+            Clear(ClearType::Purge),
+            MoveTo(0, 0)
+        )?;
+        out.flush()?;
+        self.started = false;
+        self.prev_height = 0;
+        self.cursor_above = 0;
+        self.prev_lines.clear();
+        Ok(())
+    }
+
+    fn sync_terminal_title_to(&mut self, out: &mut impl Write, app: &App) -> io::Result<()> {
         let title = terminal_window_title(app);
         if title == self.prev_terminal_title {
             return Ok(());
         }
-        execute!(io::stdout(), SetTitle(&title))?;
+        execute!(out, SetTitle(&title))?;
         self.prev_terminal_title = title;
         Ok(())
     }
@@ -213,10 +225,14 @@ impl LiveRenderer {
     /// историю диалога. Вывод команды печатается на месте блока, а блок потом
     /// перерисуется (invalidate). Для выхода из приложения см. `clear_for_exit`.
     pub(crate) fn leave_below(&mut self) -> io::Result<()> {
+        let mut out = io::stdout().lock();
+        self.leave_below_to(&mut out)
+    }
+
+    pub(crate) fn leave_below_to(&mut self, out: &mut impl Write) -> io::Result<()> {
         if !self.started {
             return Ok(());
         }
-        let mut out = io::stdout().lock();
         // встать на нижнюю строку блока → на верх блока → стереть от курсора вниз
         if self.cursor_above > 0 {
             queue!(out, MoveDown(self.cursor_above))?;
@@ -237,8 +253,12 @@ impl LiveRenderer {
     /// При выходе из приложения: ЧИСТЫЙ выход — стираем экран И нативный скроллбэк,
     /// чтобы беседа не оставалась в терминале после закрытия (как `/clear`). Сама
     /// беседа сохранена в файле чата — вернуть можно через `/chats`.
-    pub(crate) fn clear_for_exit(&mut self, _app: &App) -> io::Result<()> {
+    pub(crate) fn clear_for_exit(&mut self, app: &App) -> io::Result<()> {
         let mut out = io::stdout().lock();
+        self.clear_for_exit_to(&mut out, app)
+    }
+
+    pub(crate) fn clear_for_exit_to(&mut self, out: &mut impl Write, _app: &App) -> io::Result<()> {
         queue!(
             out,
             MoveToColumn(0),
