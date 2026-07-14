@@ -155,7 +155,6 @@ pub(crate) struct App {
 
 impl App {
     pub(crate) fn new() -> Self {
-        let (tx, rx) = mpsc::channel();
         let config_path = config_path();
         let history_path = history_path();
         let chats_dir = chats_dir();
@@ -163,6 +162,20 @@ impl App {
         if env::var("CLAVE_SKIP_ONBOARDING").ok().as_deref() == Some("1") {
             config.onboarding_done = true;
         }
+        Self::from_config(config, config_path, history_path, chats_dir)
+    }
+
+    /// Сборка из готового конфига и путей. Вынесено из `new`, чтобы тест мог собрать App на
+    /// своих временных путях с `onboarding_done = true` — тогда `Onboarding::new` (а с ним и
+    /// настоящие auth-probe процессы codex/claude) не запускается, и не нужна гонка за
+    /// глобальной переменной окружения.
+    pub(crate) fn from_config(
+        mut config: AppConfig,
+        config_path: PathBuf,
+        history_path: PathBuf,
+        chats_dir: PathBuf,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel();
         config.effort_index = normalize_common_effort_index(config.effort_index);
         config.codex_effort_index =
             normalize_provider_effort_index("codex", config.codex_effort_index);

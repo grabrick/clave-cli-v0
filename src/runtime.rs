@@ -235,10 +235,20 @@ pub(crate) fn welcome_lines(app: &App) -> Vec<String> {
 
 /// Сокращает `$HOME` до `~` в начале пути (как cwd в welcome у Claude).
 fn abbreviate_home(path: &Path) -> String {
+    abbreviate_with_home(path, std::env::var("HOME").ok().as_deref())
+}
+
+/// То же, но `$HOME` — ПАРАМЕТР. Шов ради тестов: иначе проверить пустой и отсутствующий HOME
+/// можно было бы только правкой глобальной переменной окружения — то есть гонкой со всеми
+/// соседними тестами, которые её читают.
+///
+/// Пустой HOME обязан отсекаться: без этого `strip_prefix("")` срабатывает на ЛЮБОМ пути, и
+/// каждый путь превратился бы в «~/…» — включая `/usr/local/bin`.
+fn abbreviate_with_home(path: &Path, home: Option<&str>) -> String {
     let shown = path.display().to_string();
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() => shown
-            .strip_prefix(&home)
+    match home {
+        Some(home) if !home.is_empty() => shown
+            .strip_prefix(home)
             .map(|rest| format!("~{rest}"))
             .unwrap_or(shown),
         _ => shown,
@@ -907,9 +917,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// App для тестов клавиатуры: `App::new()` читает конфиг/историю с диска, поэтому
-    /// фиксируем поля, которые читает `handle_input_key`, а запись истории и чата уводим
-    /// во временную папку — тесты не трогают пользовательские файлы.
+    /// App для тестов клавиатуры. Собираем через `App::from_config` на своих временных путях
+    /// и с `onboarding_done = true`: `App::new()` читал бы пользовательский конфиг и при
+    /// невыполненном онбординге поднимал `Onboarding::new` — то есть настоящие auth-probe
+    /// процессы codex/claude. Дальше фиксируем поля, которые читают обработчики клавиш.
     fn app_for_keys() -> App {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -921,10 +932,16 @@ mod tests {
         ));
         let _ = fs::create_dir_all(&dir);
 
-        let mut app = App::new();
-        app.config_path = dir.join("config.json");
-        app.history_path = dir.join("history");
-        app.chats_dir = dir.clone();
+        let config = AppConfig {
+            onboarding_done: true,
+            ..AppConfig::default()
+        };
+        let mut app = App::from_config(
+            config,
+            dir.join("config.json"),
+            dir.join("history"),
+            dir.clone(),
+        );
         app.chat_path = dir.join("chat.md");
         app.lang = Language::Ru;
         app.onboarding = None;
@@ -1464,6 +1481,15 @@ mod tests {
             // целиком заменяли пустышкой: `clave --help` мог печатать пустоту, а CI бы это
             // пропустил. Проверить факт печати можно только со стороны.
             Some("usage") => print_usage(),
+            // Ребёнок: роняем RAII-стража. Он обязан вернуть терминал при ОБЫЧНОМ выходе — не
+            // только при панике. Его `drop` тоже заменялся пустышкой бесследно.
+            //
+            // Создаём напрямую, минуя `new()`: тот включает raw-режим, а у дочернего процесса
+            // stdout — не терминал, и `new()` вернул бы ошибку. Нам нужен именно `drop`.
+            Some("guard") => {
+                let guard = TerminalGuard;
+                drop(guard);
+            }
             // Ребёнок: ставим хук и роняем поток, НАЗВАННЫЙ `main`. Восстановление обязано
             // случиться САМО — иначе после любой паники clave оставляет пользователю сломанный
             // терминал.
@@ -1520,8 +1546,89 @@ mod tests {
                     "print_usage не напечатал НИЧЕГО — то есть `clave --help` может молча \
                      показывать пустоту:\n{on_usage}"
                 );
+
+                let on_guard = run_terminal_case("guard");
+                assert!(
+                    on_guard.contains("1 passed"),
+                    "дочерний случай «guard» обязан РЕАЛЬНО прогнаться:\n{on_guard}"
+                );
+                assert!(
+                    on_guard.contains(SHOW_CURSOR),
+                    "RAII-страж не вернул терминал при выходе из области видимости — значит его \
+                     Drop можно заменить пустышкой, и терминал останется сломанным даже при \
+                     ОБЫЧНОМ завершении, без всякой паники:\n{on_guard}"
+                );
             }
         }
+    }
+
+    #[test]
+    fn abbreviate_home_shortens_only_a_real_home() {
+        let path = Path::new("/Users/кто-то/проект/файл.rs");
+
+        assert_eq!(
+            abbreviate_with_home(path, Some("/Users/кто-то")),
+            "~/проект/файл.rs",
+            "домашний каталог обязан сократиться до тильды"
+        );
+        // Чужой путь не трогаем.
+        assert_eq!(
+            abbreviate_with_home(Path::new("/usr/local/bin"), Some("/Users/кто-то")),
+            "/usr/local/bin"
+        );
+        // ПУСТОЙ HOME — ловушка: `strip_prefix("")` срабатывает на любом пути, и без отсечки
+        // каждый путь превратился бы в «~/…», включая системные.
+        assert_eq!(
+            abbreviate_with_home(Path::new("/usr/local/bin"), Some("")),
+            "/usr/local/bin",
+            "пустой HOME не смеет сокращать вообще всё"
+        );
+        assert_eq!(
+            abbreviate_with_home(Path::new("/usr/local/bin"), None),
+            "/usr/local/bin",
+            "без HOME путь показывается как есть"
+        );
+    }
+
+    #[test]
+    fn abbreviate_home_reads_the_real_home() {
+        // Обёртка обязана и правда лезть в окружение, а не возвращать константу.
+        let home = std::env::var("HOME").expect("HOME задан в любом окружении");
+        let path = Path::new(&home).join("клаве-проект");
+        assert_eq!(abbreviate_home(&path), "~/клаве-проект");
+    }
+
+    #[test]
+    fn a_gap_of_exactly_the_limit_is_not_yet_a_sleep() {
+        // Граница СТРОГАЯ: ровно три секунды — это ещё не сон, а четыре уже сон. Подмена `>` на
+        // `>=` двигает её на шаг и заставляла бы перерисовывать экран на ровном месте.
+        assert!(!resumed_after_gap(Duration::from_secs(3)));
+        assert!(resumed_after_gap(Duration::from_millis(3001)));
+    }
+
+    #[test]
+    fn welcome_greets_by_name_version_and_working_dir() {
+        // Приветствие целиком заменялось на пустой список — новое окно встречало бы человека
+        // голым экраном, и никто бы не заметил.
+        let app = app_for_keys();
+        let lines = welcome_lines(&app);
+
+        assert!(!lines.is_empty(), "приветствие не может быть пустым");
+        let all = lines.join("\n");
+        assert!(
+            all.contains("clave"),
+            "приветствие обязано назвать себя: {all:?}"
+        );
+        assert!(
+            all.contains(env!("CARGO_PKG_VERSION")),
+            "приветствие обязано показать версию: {all:?}"
+        );
+        assert!(
+            all.contains("/help"),
+            "приветствие обязано подсказать, где искать команды: {all:?}"
+        );
+        // Логотип — не украшение: без него строки схлопнутся и вёрстка поедет.
+        assert!(all.contains('█'), "логотип на месте: {all:?}");
     }
 
     // ─────────────────────────── ПРИВЕТСТВИЕ И ЛОГИН ───────────────────────────
@@ -1573,45 +1680,34 @@ mod tests {
     }
 
     // ─────────────────────────── СЕЛЕКТОР И ДИСПЕТЧЕР ───────────────────────────
-
-    /// App с открытым inline-селектором (один вопрос, два варианта).
-    fn app_with_ask() -> App {
-        let mut app = app_for_keys();
-        app.ask_prompt_pending = Some(AskPrompt {
-            questions: vec![AskQuestion {
-                question: "Что делаем?".to_string(),
-                multi: false,
-                options: vec![
-                    AskOption {
-                        label: "первый".to_string(),
-                        note: None,
-                    },
-                    AskOption {
-                        label: "второй".to_string(),
-                        note: None,
-                    },
-                ],
-                allow_custom: false,
-            }],
-        });
-        app.open_pending_ask();
-        assert!(app.ask_active(), "селектор обязан открыться");
-        app
-    }
+    //
+    // Хелперы селектора (`ask_question`, `app_with_ask`, `ask_state`) лежат ниже, рядом с
+    // тестами `handle_ask_key`.
 
     #[test]
     fn an_open_selector_still_receives_keys() {
         // Условие «клавиша до-печатала прозу И открыла селектор → съесть её» держится на И.
         // С ИЛИ оно срабатывало бы от одного лишь открытого селектора — и тот перестал бы
         // отвечать на клавиши ВООБЩЕ: стрелки не двигают выбор, Enter не подтверждает.
-        let mut app = app_with_ask();
-        let before = app.ask.as_ref().expect("селектор").step;
+        //
+        // Идём через `handle_key` (диспетчер), а не через `handle_ask_key` напрямую: проверяется
+        // именно МАРШРУТ до селектора.
+        let mut app = app_with_ask(vec![ask_question(
+            "Что делаем?",
+            false,
+            &["первый", "второй"],
+        )]);
+        assert_eq!(
+            ask_state(&app).answers[0].cursor,
+            0,
+            "старт на первом варианте"
+        );
 
         handle_key(&mut app, key(KeyCode::Down));
 
-        let after = app.ask.as_ref().expect("селектор жив");
-        assert!(
-            after.answers[0].cursor != 0 || after.step != before,
+        assert_ne!(
+            ask_state(&app).answers[0].cursor,
+            0,
             "открытый селектор обязан отвечать на клавиши — иначе выбрать в нём нельзя ничего"
         );
     }
@@ -1840,5 +1936,810 @@ mod tests {
             "справка обязана показать запуск задачи"
         );
         assert!(text.contains("Open TUI"), "справка обязана упомянуть TUI");
+    }
+
+    // ─────────────────── хелперы экранов и оверлеев ───────────────────
+
+    /// `Onboarding::new` зондирует codex/claude настоящими процессами CLI — в юнит-тесте
+    /// это флейк, а в CI реальный запуск. Поэтому состояние экрана собираем полями.
+    fn onboarding_at(step: OnboardingStep, provider_index: usize) -> Onboarding {
+        Onboarding {
+            step,
+            provider_index,
+            setting_index: 0,
+            codex_installed: true,
+            claude_installed: true,
+            codex_authenticated: true,
+            claude_authenticated: true,
+            codex_status: String::new(),
+            claude_status: String::new(),
+            message: String::new(),
+        }
+    }
+
+    fn app_with_onboarding(step: OnboardingStep, provider_index: usize) -> App {
+        let mut app = app_for_keys();
+        app.set_mode(provider_mode(provider_index));
+        app.rounds = 5;
+        app.onboarding = Some(onboarding_at(step, provider_index));
+        app
+    }
+
+    fn onboarding_of(app: &App) -> &Onboarding {
+        app.onboarding.as_ref().expect("онбординг открыт")
+    }
+
+    /// Режим задаём явно: от него зависят и число строк пикера, и что двигают ←/→.
+    fn app_for_effort(mode: Mode) -> App {
+        let mut app = app_for_keys();
+        app.overlay = Overlay::Effort;
+        app.mode = mode;
+        app.linked_effort_split = false;
+        app.effort_focus = 0;
+        app.effort_index = effort_index_for("high");
+        app.codex_effort_index = effort_index_for("high");
+        app.claude_effort_index = effort_index_for("high");
+        app.effort_original = Some(app.effort_snapshot());
+        app
+    }
+
+    fn app_for_settings() -> App {
+        let mut app = app_for_keys();
+        app.overlay = Overlay::Settings;
+        app.settings_focus = 0;
+        app.rounds = 5;
+        app.theme = Theme::Purple;
+        app.settings_original = Some(app.settings_snapshot());
+        app
+    }
+
+    fn app_for_chats() -> App {
+        let mut app = app_for_keys();
+        app.overlay = Overlay::Chats;
+        app.chats_index = 0;
+        app.chats_picker = ["chat-one", "chat-two"]
+            .iter()
+            .map(|id| ChatSummary {
+                id: (*id).to_string(),
+                title: (*id).to_string(),
+                lines: 3,
+                modified: SystemTime::UNIX_EPOCH,
+            })
+            .collect();
+        app
+    }
+
+    /// Три совпадения: на двух ↑ и ↓ давали бы один индекс, и тест не отличил бы
+    /// шаг назад от шага вперёд.
+    fn app_for_search() -> App {
+        let mut app = app_for_keys();
+        app.overlay = Overlay::Search;
+        app.transcript = vec!["a1".into(), "a2".into(), "a3".into()];
+        app.search_query = "a".to_string();
+        app.search_index = 0;
+        app
+    }
+
+    fn ask_question(question: &str, multi: bool, labels: &[&str]) -> AskQuestion {
+        AskQuestion {
+            question: question.to_string(),
+            multi,
+            options: labels
+                .iter()
+                .map(|label| AskOption {
+                    label: (*label).to_string(),
+                    note: None,
+                })
+                .collect(),
+            allow_custom: true,
+        }
+    }
+
+    /// running = true: `ask_submit` уходит в `start_chat`, который в этом состоянии кладёт
+    /// сообщение в очередь и НЕ поднимает провайдер.
+    fn app_with_ask(questions: Vec<AskQuestion>) -> App {
+        let mut app = app_for_keys();
+        app.running = true;
+        app.ask_prompt_pending = Some(AskPrompt { questions });
+        app.open_pending_ask();
+        app
+    }
+
+    fn ask_state(app: &App) -> &AskState {
+        app.ask.as_ref().expect("селектор открыт")
+    }
+
+    fn transcript_has(app: &App, needle: &str) -> bool {
+        app.transcript.iter().any(|line| line.contains(needle))
+    }
+
+    // ───────────────────────── handle_effort_key ─────────────────────────
+
+    #[test]
+    fn effort_down_stops_at_last_row() {
+        // ClaudeCodex без раздельного усилия — ровно две строки пикера.
+        let mut app = app_for_effort(Mode::ClaudeCodex);
+        handle_effort_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.effort_focus, 1, "↓ переводит фокус на вторую строку");
+        handle_effort_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.effort_focus, 1, "ниже последней строки фокус не уходит");
+    }
+
+    #[test]
+    fn effort_up_moves_focus_back() {
+        let mut app = app_for_effort(Mode::ClaudeCodex);
+        app.effort_focus = 1;
+        handle_effort_key(&mut app, key(KeyCode::Up));
+        assert_eq!(app.effort_focus, 0);
+        handle_effort_key(&mut app, key(KeyCode::Up));
+        assert_eq!(app.effort_focus, 0, "выше первой строки фокус не уходит");
+    }
+
+    #[test]
+    fn effort_left_and_right_change_effort() {
+        let mut down = app_for_effort(Mode::ClaudeOnly);
+        handle_effort_key(&mut down, key(KeyCode::Left));
+        assert_eq!(
+            effort_label(down.claude_effort_index),
+            "medium",
+            "← ослабляет"
+        );
+
+        let mut up = app_for_effort(Mode::ClaudeOnly);
+        handle_effort_key(&mut up, key(KeyCode::Right));
+        assert_eq!(effort_label(up.claude_effort_index), "max", "→ усиливает");
+    }
+
+    #[test]
+    fn effort_enter_saves_and_closes() {
+        let mut app = app_for_effort(Mode::ClaudeOnly);
+        handle_effort_key(&mut app, key(KeyCode::Right));
+        handle_effort_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(
+            app.effort_original.is_none(),
+            "снимок отпущен — правка принята"
+        );
+        assert_eq!(app.status, "готов");
+        assert_eq!(
+            effort_label(app.claude_effort_index),
+            "max",
+            "Enter не откатывает"
+        );
+        assert!(
+            transcript_has(&app, "Set to"),
+            "лента: {:?}",
+            app.transcript
+        );
+        assert!(app.config_path.exists(), "Enter сохраняет конфиг");
+    }
+
+    #[test]
+    fn effort_esc_restores_snapshot() {
+        let mut app = app_for_effort(Mode::ClaudeOnly);
+        app.claude_effort_index = effort_index_for("low");
+        handle_effort_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(
+            effort_label(app.claude_effort_index),
+            "high",
+            "Esc возвращает усилие из снимка"
+        );
+        assert!(app.effort_original.is_none());
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.status, "готов");
+        assert!(
+            transcript_has(&app, "Cancelled"),
+            "лента: {:?}",
+            app.transcript
+        );
+    }
+
+    #[test]
+    fn effort_quits_only_on_double_ctrl_c() {
+        let mut app = app_for_effort(Mode::ClaudeOnly);
+        handle_effort_key(&mut app, ctrl(KeyCode::Char('c')));
+        assert!(!app.should_quit, "одиночный Ctrl+C не выходит");
+        handle_effort_key(&mut app, ctrl(KeyCode::Char('c')));
+        assert!(app.should_quit, "двойной Ctrl+C выходит");
+
+        let mut plain = app_for_effort(Mode::ClaudeOnly);
+        handle_effort_key(&mut plain, key(KeyCode::Char('c')));
+        handle_effort_key(&mut plain, key(KeyCode::Char('c')));
+        assert!(!plain.should_quit, "простая «c» — не Ctrl+C");
+        assert!(
+            plain.last_ctrl_c_at.is_none(),
+            "простая «c» не считается за Ctrl+C"
+        );
+    }
+
+    // ─────────────────── handle_onboarding_settings_key ───────────────────
+
+    #[test]
+    fn onboarding_settings_down_stops_at_last_row() {
+        let mut app = app_with_onboarding(OnboardingStep::Settings, 0);
+        handle_onboarding_settings_key(&mut app, key(KeyCode::Down));
+        assert_eq!(onboarding_of(&app).setting_index, 1);
+        handle_onboarding_settings_key(&mut app, key(KeyCode::Down));
+        assert_eq!(onboarding_of(&app).setting_index, 2);
+        handle_onboarding_settings_key(&mut app, key(KeyCode::Down));
+        assert_eq!(
+            onboarding_of(&app).setting_index,
+            2,
+            "ниже третьей строки не уходит"
+        );
+    }
+
+    #[test]
+    fn onboarding_settings_up_moves_back() {
+        let mut app = app_with_onboarding(OnboardingStep::Settings, 0);
+        app.onboarding.as_mut().expect("онбординг").setting_index = 2;
+        handle_onboarding_settings_key(&mut app, key(KeyCode::Up));
+        assert_eq!(onboarding_of(&app).setting_index, 1);
+    }
+
+    #[test]
+    fn onboarding_settings_left_right_change_rounds() {
+        let mut less = app_with_onboarding(OnboardingStep::Settings, 0);
+        handle_onboarding_settings_key(&mut less, key(KeyCode::Left));
+        assert_eq!(less.rounds, 4, "← уменьшает раунды");
+
+        let mut more = app_with_onboarding(OnboardingStep::Settings, 0);
+        handle_onboarding_settings_key(&mut more, key(KeyCode::Right));
+        assert_eq!(more.rounds, 6, "→ увеличивает раунды");
+    }
+
+    #[test]
+    fn onboarding_settings_l_toggles_language() {
+        let mut app = app_with_onboarding(OnboardingStep::Settings, 0);
+        handle_onboarding_settings_key(&mut app, key(KeyCode::Char('l')));
+        assert_eq!(app.lang, Language::En);
+
+        let mut upper = app_with_onboarding(OnboardingStep::Settings, 0);
+        upper.lang = Language::En;
+        handle_onboarding_settings_key(&mut upper, key(KeyCode::Char('L')));
+        assert_eq!(
+            upper.lang,
+            Language::Ru,
+            "переключатель работает в обе стороны"
+        );
+    }
+
+    #[test]
+    fn onboarding_settings_enter_finishes_onboarding() {
+        let mut app = app_with_onboarding(OnboardingStep::Settings, 0);
+        handle_onboarding_settings_key(&mut app, key(KeyCode::Enter));
+        assert!(app.onboarding.is_none(), "Enter закрывает онбординг");
+        assert_eq!(app.status, "готов");
+        assert!(app.config_path.exists(), "Enter сохраняет конфиг");
+    }
+
+    #[test]
+    fn onboarding_settings_backspace_and_esc_return_to_auth() {
+        for code in [KeyCode::Backspace, KeyCode::Esc] {
+            let mut app = app_with_onboarding(OnboardingStep::Settings, 0);
+            handle_onboarding_settings_key(&mut app, key(code));
+            assert_eq!(
+                onboarding_of(&app).step,
+                OnboardingStep::Auth,
+                "{code:?} возвращает на шаг авторизации"
+            );
+        }
+    }
+
+    // ───────────────────────── handle_ask_key ─────────────────────────
+
+    #[test]
+    fn ask_down_and_up_wrap_over_rows() {
+        let mut app = app_with_ask(vec![ask_question(
+            "Продолжить?",
+            false,
+            &["Да", "Нет", "Позже"],
+        )]);
+        handle_ask_key(&mut app, key(KeyCode::Down));
+        assert_eq!(ask_state(&app).answers[0].cursor, 1, "↓ идёт вниз");
+
+        let mut up = app_with_ask(vec![ask_question(
+            "Продолжить?",
+            false,
+            &["Да", "Нет", "Позже"],
+        )]);
+        handle_ask_key(&mut up, key(KeyCode::Up));
+        assert_eq!(
+            ask_state(&up).answers[0].cursor,
+            3,
+            "↑ с первой строки заворачивает на «свой ответ»"
+        );
+    }
+
+    #[test]
+    fn ask_tab_and_right_go_to_next_question() {
+        for code in [KeyCode::Tab, KeyCode::Right] {
+            let mut app = app_with_ask(vec![
+                ask_question("Первый?", false, &["Да"]),
+                ask_question("Второй?", false, &["Да"]),
+            ]);
+            handle_ask_key(&mut app, key(code));
+            assert_eq!(
+                ask_state(&app).step,
+                1,
+                "{code:?} ведёт к следующему вопросу"
+            );
+        }
+    }
+
+    #[test]
+    fn ask_backtab_and_left_go_back() {
+        for code in [KeyCode::BackTab, KeyCode::Left] {
+            let mut app = app_with_ask(vec![
+                ask_question("Первый?", false, &["Да"]),
+                ask_question("Второй?", false, &["Да"]),
+            ]);
+            handle_ask_key(&mut app, key(KeyCode::Tab));
+            handle_ask_key(&mut app, key(code));
+            assert_eq!(
+                ask_state(&app).step,
+                0,
+                "{code:?} возвращает к прошлому вопросу"
+            );
+        }
+    }
+
+    #[test]
+    fn ask_enter_submits_single_question() {
+        let mut app = app_with_ask(vec![ask_question("Продолжить?", false, &["Да", "Нет"])]);
+        handle_ask_key(&mut app, key(KeyCode::Enter));
+        assert!(app.ask.is_none(), "Enter закрывает селектор");
+        let queued = app.pending_messages.front().expect("сообщение в очереди");
+        assert!(
+            queued.contains("«Да»"),
+            "отправлен выбранный вариант: {queued}"
+        );
+    }
+
+    #[test]
+    fn ask_esc_closes_without_sending() {
+        let mut app = app_with_ask(vec![ask_question("Продолжить?", false, &["Да", "Нет"])]);
+        handle_ask_key(&mut app, key(KeyCode::Esc));
+        assert!(app.ask.is_none());
+        assert_eq!(app.status, "закрыто");
+        assert!(app.pending_messages.is_empty(), "Esc ничего не отправляет");
+    }
+
+    #[test]
+    fn ask_backspace_edits_custom_answer() {
+        let mut app = app_with_ask(vec![ask_question("Продолжить?", false, &["Да", "Нет"])]);
+        {
+            let state = app.ask.as_mut().expect("селектор открыт");
+            state.answers[0].cursor = 2; // строка «свой ответ»
+            state.answers[0].custom = "ab".to_string();
+        }
+        handle_ask_key(&mut app, key(KeyCode::Backspace));
+        assert_eq!(ask_state(&app).answers[0].custom, "a");
+    }
+
+    #[test]
+    fn ask_plain_char_types_into_custom_answer() {
+        // Именно 'c': мутант `&&` → `||` увёл бы её в ветку Ctrl+C с ранним return.
+        let mut app = app_with_ask(vec![ask_question("Продолжить?", false, &["Да", "Нет"])]);
+        app.ask.as_mut().expect("селектор открыт").answers[0].cursor = 2;
+        handle_ask_key(&mut app, key(KeyCode::Char('c')));
+        assert_eq!(ask_state(&app).answers[0].custom, "c");
+        assert!(app.last_ctrl_c_at.is_none(), "простая «c» — не Ctrl+C");
+    }
+
+    #[test]
+    fn ask_space_toggles_option_but_other_chars_do_not() {
+        let mut space = app_with_ask(vec![ask_question("Что взять?", true, &["Да", "Нет"])]);
+        handle_ask_key(&mut space, key(KeyCode::Char(' ')));
+        assert!(
+            ask_state(&space).answers[0].checked[0],
+            "Space отмечает вариант"
+        );
+
+        let mut other = app_with_ask(vec![ask_question("Что взять?", true, &["Да", "Нет"])]);
+        handle_ask_key(&mut other, key(KeyCode::Char('x')));
+        assert!(
+            !ask_state(&other).answers[0].checked[0],
+            "любой другой символ на варианте отметку не ставит"
+        );
+    }
+
+    #[test]
+    fn ask_quits_on_double_ctrl_c() {
+        let mut app = app_with_ask(vec![ask_question("Продолжить?", false, &["Да"])]);
+        handle_ask_key(&mut app, ctrl(KeyCode::Char('c')));
+        assert!(!app.should_quit);
+        handle_ask_key(&mut app, ctrl(KeyCode::Char('c')));
+        assert!(app.should_quit, "двойной Ctrl+C выходит");
+    }
+
+    // ───────────────────────── handle_settings_key ─────────────────────────
+
+    #[test]
+    fn settings_up_and_down_move_focus() {
+        let mut app = app_for_settings();
+        handle_settings_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.settings_focus, 1, "↓ идёт вниз по строкам");
+
+        app.settings_focus = 3;
+        handle_settings_key(&mut app, key(KeyCode::Up));
+        assert_eq!(app.settings_focus, 2, "↑ идёт вверх");
+    }
+
+    #[test]
+    fn settings_left_and_right_change_rounds() {
+        let mut less = app_for_settings();
+        less.settings_focus = 4; // строка раундов
+        handle_settings_key(&mut less, key(KeyCode::Left));
+        assert_eq!(less.rounds, 4, "← уменьшает раунды");
+
+        let mut more = app_for_settings();
+        more.settings_focus = 4;
+        handle_settings_key(&mut more, key(KeyCode::Right));
+        assert_eq!(more.rounds, 6, "→ увеличивает раунды");
+    }
+
+    #[test]
+    fn settings_enter_saves_and_closes() {
+        let mut app = app_for_settings();
+        app.settings_focus = 4;
+        handle_settings_key(&mut app, key(KeyCode::Right));
+        handle_settings_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(
+            app.settings_original.is_none(),
+            "снимок отпущен — правка принята"
+        );
+        assert_eq!(app.rounds, 6, "Enter не откатывает значение");
+        assert_eq!(app.status, "готов");
+        assert!(transcript_has(&app, "Saved"), "лента: {:?}", app.transcript);
+        assert!(app.config_path.exists(), "Enter сохраняет конфиг");
+    }
+
+    #[test]
+    fn settings_esc_restores_snapshot() {
+        let mut app = app_for_settings();
+        app.theme = Theme::Amber;
+        app.rounds = 9;
+        handle_settings_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.theme, Theme::Purple, "Esc возвращает тему из снимка");
+        assert_eq!(app.rounds, 5, "Esc возвращает раунды из снимка");
+        assert!(app.settings_original.is_none());
+        assert_eq!(app.overlay, Overlay::None);
+        assert_eq!(app.status, "готов");
+        assert!(
+            transcript_has(&app, "Cancelled"),
+            "лента: {:?}",
+            app.transcript
+        );
+    }
+
+    #[test]
+    fn settings_quits_only_on_double_ctrl_c() {
+        let mut app = app_for_settings();
+        handle_settings_key(&mut app, ctrl(KeyCode::Char('c')));
+        assert!(!app.should_quit, "одиночный Ctrl+C не выходит");
+        handle_settings_key(&mut app, ctrl(KeyCode::Char('c')));
+        assert!(app.should_quit, "двойной Ctrl+C выходит");
+
+        let mut plain = app_for_settings();
+        handle_settings_key(&mut plain, key(KeyCode::Char('c')));
+        handle_settings_key(&mut plain, key(KeyCode::Char('c')));
+        assert!(!plain.should_quit, "простая «c» — не Ctrl+C");
+        assert!(plain.last_ctrl_c_at.is_none());
+    }
+
+    // ─────────────────── adjust_onboarding_setting ───────────────────
+
+    #[test]
+    fn adjust_onboarding_rounds_by_direction() {
+        let mut back = app_with_onboarding(OnboardingStep::Settings, 0);
+        adjust_onboarding_setting(&mut back, 0, -1);
+        assert_eq!(back.rounds, 4, "отрицательное направление уменьшает");
+
+        let mut forward = app_with_onboarding(OnboardingStep::Settings, 0);
+        adjust_onboarding_setting(&mut forward, 0, 1);
+        assert_eq!(forward.rounds, 6, "положительное направление увеличивает");
+
+        // Нулевое направление — «вперёд»: единственный вход, различающий `<` и `<=`.
+        let mut zero = app_with_onboarding(OnboardingStep::Settings, 0);
+        adjust_onboarding_setting(&mut zero, 0, 0);
+        assert_eq!(zero.rounds, 6, "направление 0 считается движением вперёд");
+    }
+
+    #[test]
+    fn adjust_onboarding_rounds_are_clamped() {
+        let mut low = app_with_onboarding(OnboardingStep::Settings, 0);
+        low.rounds = 1;
+        adjust_onboarding_setting(&mut low, 0, -1);
+        assert_eq!(low.rounds, 1, "меньше одного раунда не бывает");
+
+        let mut high = app_with_onboarding(OnboardingStep::Settings, 0);
+        high.rounds = 9;
+        adjust_onboarding_setting(&mut high, 0, 1);
+        assert_eq!(high.rounds, 9, "больше девяти раундов не бывает");
+    }
+
+    #[test]
+    fn adjust_onboarding_startup_effort() {
+        let mut less = app_with_onboarding(OnboardingStep::Settings, 3); // ClaudeOnly
+        less.claude_effort_index = effort_index_for("high");
+        adjust_onboarding_setting(&mut less, 1, -1);
+        assert_eq!(effort_label(less.claude_effort_index), "medium");
+
+        let mut more = app_with_onboarding(OnboardingStep::Settings, 3);
+        more.claude_effort_index = effort_index_for("high");
+        adjust_onboarding_setting(&mut more, 1, 1);
+        assert_eq!(effort_label(more.claude_effort_index), "max");
+    }
+
+    #[test]
+    fn adjust_onboarding_language_toggles() {
+        let mut app = app_with_onboarding(OnboardingStep::Settings, 0);
+        adjust_onboarding_setting(&mut app, 2, 1);
+        assert_eq!(app.lang, Language::En);
+        adjust_onboarding_setting(&mut app, 2, 1);
+        assert_eq!(
+            app.lang,
+            Language::Ru,
+            "переключатель работает в обе стороны"
+        );
+    }
+
+    // ───────────────────────── handle_search_key ─────────────────────────
+
+    #[test]
+    fn search_esc_closes_and_clears_query() {
+        let mut app = app_for_search();
+        handle_search_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.search_query.is_empty(), "запрос очищен");
+    }
+
+    #[test]
+    fn search_enter_and_down_step_forward() {
+        for code in [KeyCode::Enter, KeyCode::Down] {
+            let mut app = app_for_search();
+            handle_search_key(&mut app, key(code));
+            assert_eq!(app.search_index, 1, "{code:?} идёт к следующему совпадению");
+        }
+    }
+
+    #[test]
+    fn search_up_steps_backward() {
+        let mut app = app_for_search();
+        handle_search_key(&mut app, key(KeyCode::Up));
+        assert_eq!(
+            app.search_index, 2,
+            "↑ с первого совпадения заворачивает на последнее"
+        );
+    }
+
+    #[test]
+    fn search_backspace_trims_query() {
+        let mut app = app_for_search();
+        app.search_query = "ab".to_string();
+        handle_search_key(&mut app, key(KeyCode::Backspace));
+        assert_eq!(app.search_query, "a");
+    }
+
+    #[test]
+    fn search_types_printable_but_ignores_control_chars() {
+        let mut app = app_for_search();
+        handle_search_key(&mut app, key(KeyCode::Char('x')));
+        assert_eq!(app.search_query, "ax", "печатный символ попадает в запрос");
+
+        let mut control = app_for_search();
+        handle_search_key(&mut control, key(KeyCode::Char('\u{1}')));
+        assert_eq!(
+            control.search_query, "a",
+            "управляющий символ в запрос не попадает"
+        );
+    }
+
+    // ───────────────────────── handle_chats_key ─────────────────────────
+
+    #[test]
+    fn chats_down_stops_at_last_chat() {
+        let mut app = app_for_chats();
+        handle_chats_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.chats_index, 1);
+        handle_chats_key(&mut app, key(KeyCode::Down));
+        assert_eq!(app.chats_index, 1, "ниже последнего чата не уходит");
+    }
+
+    #[test]
+    fn chats_up_moves_back() {
+        let mut app = app_for_chats();
+        app.chats_index = 1;
+        handle_chats_key(&mut app, key(KeyCode::Up));
+        assert_eq!(app.chats_index, 0);
+    }
+
+    #[test]
+    fn chats_enter_closes_and_resumes_selected() {
+        // Файла чата нет — resume_chat отвечает «Чат не найден.». Это и доказывает,
+        // что Enter действительно позвал resume_chat, ничего при этом не запуская.
+        let mut app = app_for_chats();
+        handle_chats_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(
+            transcript_has(&app, "Чат не найден."),
+            "Enter восстанавливает выбранный чат: {:?}",
+            app.transcript
+        );
+    }
+
+    #[test]
+    fn chats_esc_closes_without_resume() {
+        let mut app = app_for_chats();
+        handle_chats_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.transcript.is_empty(), "Esc чат не восстанавливает");
+    }
+
+    #[test]
+    fn chats_quits_only_on_double_ctrl_c() {
+        let mut app = app_for_chats();
+        handle_chats_key(&mut app, ctrl(KeyCode::Char('c')));
+        assert!(!app.should_quit, "одиночный Ctrl+C не выходит");
+        handle_chats_key(&mut app, ctrl(KeyCode::Char('c')));
+        assert!(app.should_quit, "двойной Ctrl+C выходит");
+
+        let mut plain = app_for_chats();
+        handle_chats_key(&mut plain, key(KeyCode::Char('c')));
+        handle_chats_key(&mut plain, key(KeyCode::Char('c')));
+        assert!(!plain.should_quit, "простая «c» — не Ctrl+C");
+        assert!(plain.last_ctrl_c_at.is_none());
+    }
+
+    // ─────────────────── handle_onboarding_provider_key ───────────────────
+
+    #[test]
+    fn onboarding_provider_down_selects_next_and_stops_at_last() {
+        let mut app = app_with_onboarding(OnboardingStep::Provider, 0);
+        handle_onboarding_provider_key(&mut app, key(KeyCode::Down));
+        assert_eq!(onboarding_of(&app).provider_index, 1);
+        assert_eq!(app.mode, Mode::ClaudeCodex, "режим следует за выбором");
+
+        let mut last = app_with_onboarding(OnboardingStep::Provider, 3);
+        handle_onboarding_provider_key(&mut last, key(KeyCode::Down));
+        assert_eq!(
+            onboarding_of(&last).provider_index,
+            3,
+            "ниже последнего провайдера не уходит"
+        );
+        assert_eq!(last.mode, Mode::ClaudeOnly);
+    }
+
+    #[test]
+    fn onboarding_provider_up_selects_previous() {
+        let mut app = app_with_onboarding(OnboardingStep::Provider, 2);
+        handle_onboarding_provider_key(&mut app, key(KeyCode::Up));
+        assert_eq!(onboarding_of(&app).provider_index, 1);
+        assert_eq!(app.mode, Mode::ClaudeCodex);
+    }
+
+    #[test]
+    fn onboarding_provider_enter_goes_to_auth() {
+        let mut app = app_with_onboarding(OnboardingStep::Provider, 3);
+        handle_onboarding_provider_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            app.mode,
+            Mode::ClaudeOnly,
+            "Enter фиксирует выбранный режим"
+        );
+        let onboarding = onboarding_of(&app);
+        assert_eq!(onboarding.step, OnboardingStep::Auth);
+        assert!(
+            onboarding.message.contains("авторизацию"),
+            "подсказка шага авторизации: {}",
+            onboarding.message
+        );
+    }
+
+    // ─────────────────── handle_onboarding_auth_key ───────────────────
+
+    #[test]
+    fn onboarding_auth_c_prepares_codex_login() {
+        // Команда только кладётся в поле; запускает её позже сам runtime — тест ничего не спавнит.
+        for code in [KeyCode::Char('c'), KeyCode::Char('C')] {
+            let mut app = app_with_onboarding(OnboardingStep::Auth, 0);
+            handle_onboarding_auth_key(&mut app, key(code));
+            let command = app.pending_external.as_ref().expect("команда логина");
+            assert_eq!(command.program, "codex");
+            assert_eq!(command.args, &["login"]);
+        }
+    }
+
+    #[test]
+    fn onboarding_auth_l_prepares_claude_login() {
+        for code in [KeyCode::Char('l'), KeyCode::Char('L')] {
+            let mut app = app_with_onboarding(OnboardingStep::Auth, 0);
+            handle_onboarding_auth_key(&mut app, key(code));
+            let command = app.pending_external.as_ref().expect("команда логина");
+            assert_eq!(command.program, "claude");
+            assert_eq!(command.args, &["auth", "login"]);
+        }
+    }
+
+    #[test]
+    fn onboarding_auth_enter_goes_to_settings() {
+        let mut app = app_with_onboarding(OnboardingStep::Auth, 0);
+        handle_onboarding_auth_key(&mut app, key(KeyCode::Enter));
+        let onboarding = onboarding_of(&app);
+        assert_eq!(onboarding.step, OnboardingStep::Settings);
+        assert!(
+            !onboarding.message.is_empty(),
+            "шаг настроек объясняет себя"
+        );
+    }
+
+    #[test]
+    fn onboarding_auth_backspace_and_esc_return_to_provider() {
+        for code in [KeyCode::Backspace, KeyCode::Esc] {
+            let mut app = app_with_onboarding(OnboardingStep::Auth, 0);
+            handle_onboarding_auth_key(&mut app, key(code));
+            assert_eq!(
+                onboarding_of(&app).step,
+                OnboardingStep::Provider,
+                "{code:?} возвращает к выбору провайдера"
+            );
+        }
+    }
+
+    // ───────────────────────── handle_shortcuts_key ─────────────────────────
+
+    #[test]
+    fn shortcuts_ctrl_c_stays_open() {
+        let mut app = app_for_keys();
+        app.overlay = Overlay::Shortcuts;
+        handle_shortcuts_key(&mut app, ctrl(KeyCode::Char('c')));
+        assert_eq!(
+            app.overlay,
+            Overlay::Shortcuts,
+            "Ctrl+C не закрывает подсказку"
+        );
+        assert!(app.last_ctrl_c_at.is_some(), "Ctrl+C учтён");
+    }
+
+    #[test]
+    fn shortcuts_any_other_key_closes() {
+        // Ctrl+X и простая «c» — обе половины условия: любая из них закрывает оверлей.
+        for event in [ctrl(KeyCode::Char('x')), key(KeyCode::Char('c'))] {
+            let mut app = app_for_keys();
+            app.overlay = Overlay::Shortcuts;
+            handle_shortcuts_key(&mut app, event);
+            assert_eq!(app.overlay, Overlay::None, "{event:?} закрывает подсказку");
+            assert!(app.last_ctrl_c_at.is_none(), "{event:?} — не Ctrl+C");
+        }
+    }
+
+    // ───────────────────────── handle_onboarding_key ─────────────────────────
+
+    #[test]
+    fn onboarding_dispatches_plain_key_to_current_step() {
+        let mut app = app_with_onboarding(OnboardingStep::Auth, 0);
+        handle_onboarding_key(&mut app, key(KeyCode::Char('c')));
+        let command = app
+            .pending_external
+            .as_ref()
+            .expect("клавиша дошла до шага авторизации");
+        assert_eq!(command.program, "codex");
+        assert!(app.last_ctrl_c_at.is_none(), "простая «c» — не Ctrl+C");
+    }
+
+    #[test]
+    fn onboarding_quits_on_double_ctrl_c() {
+        let mut app = app_with_onboarding(OnboardingStep::Provider, 1);
+        handle_onboarding_key(&mut app, ctrl(KeyCode::Char('c')));
+        assert!(!app.should_quit);
+        handle_onboarding_key(&mut app, ctrl(KeyCode::Char('c')));
+        assert!(app.should_quit, "двойной Ctrl+C выходит");
+        assert_eq!(
+            onboarding_of(&app).provider_index,
+            1,
+            "Ctrl+C до навигации по шагу не доходит"
+        );
     }
 }
