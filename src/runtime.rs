@@ -1,47 +1,98 @@
 use crate::prelude::*;
 use crate::*;
 
+/// Куда уходит запуск по аргументам командной строки.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Launch {
+    Usage,
+    Version,
+    /// Неинтерактивный прогон для супервайзера: `--run <режим> ...`.
+    Headless,
+    /// Неизвестный флаг — с его именем, чтобы назвать пользователю.
+    UnknownFlag(String),
+    /// Задача натуральным языком → встроенный движок.
+    Engine,
+    Tui,
+}
+
+/// Разбор аргументов в РЕШЕНИЕ — отдельно от его исполнения.
+///
+/// Шов ради тестов: `main_entry` дальше запускает TUI, движок или headless, и проверить разбор
+/// на живом процессе значило бы на каждый флаг поднимать настоящий clave. Мутационный прогон
+/// показал, что этого не делает никто: восемь подмен в условиях (`==` → `!=`, `||` → `&&`,
+/// удалённый `!`) проходили бесследно. Цена — `--help` перестаёт работать, а задача уходит не
+/// туда: неизвестный флаг молча уехал бы в движок «задачей» и запустил ПЛАТНЫЙ цикл планирования.
+pub(crate) fn launch_for(args: &[String]) -> Launch {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        return Launch::Usage;
+    }
+    // Идентификация бинаря (clave-dev снимает её как known-good: первая строка `--version`).
+    if args.iter().any(|arg| arg == "-V" || arg == "--version") {
+        return Launch::Version;
+    }
+    if args.first().map(String::as_str) == Some("--run") {
+        return Launch::Headless;
+    }
+    // Неизвестный флаг (например, удалённый `--serve`) не должен молча уходить в движок как
+    // «задача»: задачи натуральным языком с дефиса не начинаются.
+    if let Some(first) = args.first() {
+        if first.starts_with('-') {
+            return Launch::UnknownFlag(first.clone());
+        }
+    }
+    if !args.is_empty() {
+        return Launch::Engine;
+    }
+    Launch::Tui
+}
+
 pub(crate) fn main_entry() -> AnyResult<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
 
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
-        print_usage();
-        return Ok(());
-    }
-
-    // Идентификация бинаря (clave-dev снимает её как known-good: первая строка `--version`).
-    if args.iter().any(|arg| arg == "-V" || arg == "--version") {
-        println!("{APP_COMMAND} v{}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
-
-    // Неинтерактивный запуск агента (для внешнего супервайзера clave-dev).
-    if args.first().map(String::as_str) == Some("--run") {
-        return crate::headless::run_headless(&args[1..]);
-    }
-
-    // Неизвестный флаг (например, удалённый `--serve`) не должен молча уходить в движок
-    // как «задача» — это запустило бы платный цикл планирования. Задачи натуральным
-    // языком с дефиса не начинаются, поэтому показываем справку.
-    if let Some(first) = args.first() {
-        if first.starts_with('-') {
-            eprintln!("clave: unknown option '{first}'\n");
+    match launch_for(&args) {
+        Launch::Usage => {
             print_usage();
-            return Ok(());
+            Ok(())
         }
+        Launch::Version => {
+            println!("{APP_COMMAND} v{}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Launch::Headless => crate::headless::run_headless(&args[1..]),
+        Launch::UnknownFlag(flag) => {
+            eprintln!("clave: unknown option '{flag}'\n");
+            print_usage();
+            Ok(())
+        }
+        Launch::Engine => run_engine_direct(args),
+        Launch::Tui => run_tui(),
     }
-
-    if !args.is_empty() {
-        return run_engine_direct(args);
-    }
-
-    run_tui()
 }
 
 pub(crate) fn print_usage() {
-    println!(
+    println!("{}", usage_text());
+}
+
+/// Нужно ли встретить пользователя приветствием: в ленте нет ни одной реплики («◆ …»).
+///
+/// Пустой старт ИЛИ восстановленный чат без диалога (после `/clear` там остаётся только
+/// системная строка) — новое окно обязано показать приветствие, а не огрызок прошлого чата.
+///
+/// Отрицание тут несущее, а не косметическое: без него приветствие ЗАТЁРЛО БЫ живой диалог при
+/// восстановлении чата, а пустой старт остался бы с голым экраном. Мутационный прогон показал,
+/// что удаление `!` не замечает никто.
+fn needs_welcome(transcript: &[String]) -> bool {
+    !transcript
+        .iter()
+        .any(|line| line.trim_start().starts_with('◆'))
+}
+
+/// Текст справки. Отдельно от печати: `print_usage` целиком заменялась пустышкой, и никто не
+/// замечал — то есть `clave --help` мог начать печатать пустоту, а CI бы это пропустил.
+pub(crate) fn usage_text() -> String {
+    format!(
         "{APP_COMMAND}\n\nUsage:\n  {APP_COMMAND}                 Open TUI\n  {APP_COMMAND} <task...>       Run task directly through {ENGINE_NAME}\n  {APP_COMMAND} --help          Show help\n"
-    );
+    )
 }
 
 pub(crate) fn run_engine_direct(args: Vec<String>) -> AnyResult<()> {
@@ -60,14 +111,7 @@ pub(crate) fn run_tui() -> AnyResult<()> {
     let _guard = TerminalGuard::new()?;
     let mut app = App::new();
     app.refresh_git_ref();
-    // Welcome — при пустом старте ИЛИ когда в восстановленном чате нет реального
-    // диалога (ни одной реплики «◆ …», напр. после /clear осталась лишь системная
-    // строка): новое окно должно встречать приветствием, а не огрызком прошлого чата.
-    let has_conversation = app
-        .transcript
-        .iter()
-        .any(|line| line.trim_start().starts_with('◆'));
-    if !has_conversation {
+    if needs_welcome(&app.transcript) {
         // В файл не пишется (не через push_system) — живёт только в живом блоке.
         app.transcript = welcome_lines(&app);
     }
@@ -102,13 +146,28 @@ impl Drop for TerminalGuard {
 /// бы невидимым после аварийного выхода или паники.
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(
-        io::stdout(),
+    let _ = restore_screen(&mut io::stdout());
+}
+
+/// Escape-последовательности возврата экрана в норму. Шов ради тестов: пишем в ЛЮБОЙ приёмник,
+/// а не только в настоящий stdout. Иначе проверить, что мы вообще что-то шлём — и, главное, что
+/// среди этого есть Show курсора, — можно было бы только глазами на живом терминале. То есть
+/// никак: мутационный прогон показал, что вся эта функция заменяется пустышкой, и ни один тест
+/// не замечает. А цена такой поломки — сломанный терминал у пользователя после каждой аварии.
+fn restore_screen(out: &mut impl Write) -> io::Result<()> {
+    execute!(
+        out,
         DisableBracketedPaste,
         LeaveAlternateScreen,
         DisableMouseCapture,
         crossterm::cursor::Show
-    );
+    )
+}
+
+/// Кто имеет право трогать терминал при панике. Только ГЛАВНЫЙ (UI) поток: рабочий поток пишет
+/// в живой TUI, и его бэктрейс изуродовал бы экран, а лоадер завис бы навсегда.
+fn panic_touches_terminal(thread_name: Option<&str>) -> bool {
+    thread_name == Some("main")
 }
 
 /// Глобальный panic-hook: при панике ГЛАВНОГО (UI) потока сначала возвращает терминал в
@@ -119,7 +178,7 @@ fn restore_terminal() {
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if thread::current().name() == Some("main") {
+        if panic_touches_terminal(thread::current().name()) {
             restore_terminal();
             previous(info);
         }
@@ -230,25 +289,14 @@ pub(crate) fn run_app(app: &mut App, renderer: &mut LiveRenderer) -> AnyResult<(
             return Ok(());
         }
 
-        if app.onboarding.is_some() || app.overlay.is_modal() {
+        if wants_modal(app) {
             run_modal(app)?;
             renderer.invalidate(); // экран мог измениться — перерисуем блок целиком
             continue;
         }
 
         if event::poll(poll_timeout(app.is_animating()))? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(app, key),
-                // Вставка целиком (с переносами) идёт в инпут, а не дробится на отправки.
-                Event::Paste(text) => {
-                    app.finish_reveal_now();
-                    app.paste_into_input(&text);
-                }
-                // Ресайз (в т.ч. после сна ПК / смены монитора): терминал перелил
-                // содержимое, кэш позиций живого блока устарел → перерисовать с нуля.
-                Event::Resize(_, _) => app.pending_full_redraw = true,
-                _ => {}
-            }
+            apply_event(app, event::read()?);
         }
 
         if let Some(command) = app.pending_external.take() {
@@ -259,23 +307,68 @@ pub(crate) fn run_app(app: &mut App, renderer: &mut LiveRenderer) -> AnyResult<(
     }
 }
 
+/// Экран рисуется полноэкранной модалкой, а не живым блоком. Условие ИЛИ, а не И: онбординг и
+/// оверлей — независимые причины уйти в alt-screen, и любой из них хватает. С «И» онбординг без
+/// оверлея (то есть первый запуск!) рисовался бы живым блоком поверх ленты.
+fn wants_modal(app: &App) -> bool {
+    app.onboarding.is_some() || app.overlay.is_modal()
+}
+
+/// Нажатие клавиши из события: `None` — это не клавиатура ИЛИ это ОТПУСКАНИЕ.
+///
+/// Фильтр по `kind` обязателен: Windows шлёт и Press, и Release, и без него каждая клавиша
+/// сработала бы ДВАЖДЫ — напечатал «а», получил «аа».
+fn key_press(event: Event) -> Option<KeyEvent> {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => Some(key),
+        _ => None,
+    }
+}
+
+/// Что одно событие терминала делает с состоянием ОСНОВНОГО экрана. Вынесено из петли отдельно от
+/// `event::read()`: иначе проверить, что вставка попадает в инпут ЦЕЛИКОМ (а не дробится на
+/// отправки по переносам) и что отпускание клавиши не печатает второй раз, можно было бы только
+/// настоящим терминалом. Мутационный прогон показал цену: обе ветки — Paste и Resize — удалялись
+/// бесследно.
+///
+/// В МОДАЛКЕ этого делать нельзя, и потому она зовёт `key_press` напрямую: там нет инпута, и
+/// вставка молча накапливалась бы в буфере главного экрана, чтобы вывалиться при закрытии.
+fn apply_event(app: &mut App, event: Event) {
+    match event {
+        Event::Paste(text) => {
+            // Вставка целиком (с переносами) идёт в инпут, а не дробится на отправки.
+            app.finish_reveal_now();
+            app.paste_into_input(&text);
+        }
+        // Ресайз (в т.ч. после сна ПК / смены монитора): терминал перелил содержимое,
+        // кэш позиций живого блока устарел → перерисовать с нуля.
+        Event::Resize(_, _) => app.pending_full_redraw = true,
+        other => {
+            if let Some(key) = key_press(other) {
+                handle_key(app, key);
+            }
+        }
+    }
+}
+
 /// Полноэкранная модалка (effort/settings/chats/onboarding) во временном alt-screen
 /// со своим Fullscreen-терминалом; живой блок основного экрана сохраняется alt-screen'ом.
 fn run_modal(app: &mut App) -> AnyResult<()> {
     execute!(io::stdout(), EnterAlternateScreen)?;
     let result = (|| -> AnyResult<()> {
         let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-        while app.onboarding.is_some() || app.overlay.is_modal() {
+        while wants_modal(app) {
             app.drain_worker_events();
             terminal.draw(|frame| draw_modal(frame, app))?;
             if app.should_quit {
                 break;
             }
             if event::poll(poll_timeout(app.is_animating()))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        handle_key(app, key);
-                    }
+                // ТОЛЬКО клавиши. Не `apply_event`: в модалке нет инпута, и вставка молча
+                // накапливалась бы в буфере главного экрана, чтобы вывалиться при закрытии.
+                // Фильтр Press/Release общий с основной петлёй — чтобы они не разъехались.
+                if let Some(key) = key_press(event::read()?) {
+                    handle_key(app, key);
                 }
             }
             if let Some(command) = app.pending_external.take() {
@@ -286,6 +379,31 @@ fn run_modal(app: &mut App) -> AnyResult<()> {
     })();
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
     result
+}
+
+/// Что сказать человеку после внешней команды логина. `code` — её код возврата.
+///
+/// Исходов ТРИ, и путать их нельзя: всё готово / логин прошёл, но нужных аккаунтов ещё не все /
+/// сама команда упала. Подмена `code == 0` на `!=` меняет два последних местами — человек пошёл
+/// бы чинить упавшую команду, которая на самом деле отработала, и наоборот. Мутационный прогон
+/// показал, что эту подмену не замечал никто.
+fn login_message(ready: bool, code: i32, lang: Language) -> &'static str {
+    if ready {
+        return lang.choose(
+            "Авторизация готова. Проверь стартовые настройки и нажми Enter.",
+            "Authentication is ready. Review startup settings and press Enter.",
+        );
+    }
+    if code == 0 {
+        return lang.choose(
+            "Логин завершился. Статус обновлен, но нужные аккаунты еще не все готовы.",
+            "Login finished. Status updated, but not every required account is ready yet.",
+        );
+    }
+    lang.choose(
+        "Команда логина завершилась с ошибкой. Проверь текст выше и повтори.",
+        "Login command failed. Check the text above and try again.",
+    )
 }
 
 fn run_external_inline(app: &mut App, command: ExternalCommand) -> AnyResult<()> {
@@ -300,25 +418,10 @@ fn run_external_inline(app: &mut App, command: ExternalCommand) -> AnyResult<()>
             if let Some(onboarding) = app.onboarding.as_mut() {
                 onboarding.refresh_auth();
                 let ready = auth_requirements_ready(mode, onboarding);
-                onboarding.message = if ready {
+                if ready {
                     onboarding.step = OnboardingStep::Settings;
-                    lang.choose(
-                        "Авторизация готова. Проверь стартовые настройки и нажми Enter.",
-                        "Authentication is ready. Review startup settings and press Enter.",
-                    )
-                    .to_string()
-                } else if code == 0 {
-                    lang.choose(
-                        "Логин завершился. Статус обновлен, но нужные аккаунты еще не все готовы.",
-                        "Login finished. Status updated, but not every required account is ready yet.",
-                    ).to_string()
-                } else {
-                    lang.choose(
-                        "Команда логина завершилась с ошибкой. Проверь текст выше и повтори.",
-                        "Login command failed. Check the text above and try again.",
-                    )
-                    .to_string()
-                };
+                }
+                onboarding.message = login_message(ready, code, lang).to_string();
             }
             app.push_system(format!("{label}: exit {code}"));
         }
@@ -1281,5 +1384,461 @@ mod tests {
             control.input.is_empty(),
             "управляющий символ в ввод не попадает"
         );
+    }
+
+    // ─────────────────────────── ВОЗВРАТ ТЕРМИНАЛА ───────────────────────────
+    //
+    // Мутационный прогон показал, что `restore_terminal` целиком заменяется пустышкой, и этого
+    // не замечает НИ ОДИН тест. Цена такой поломки — не косметика: рендер прячет курсор через
+    // Hide, и без явного Show после аварии пользователь остаётся с невидимым курсором в
+    // raw-режиме. Печатаешь — не видно, Ctrl+C не работает; спасает только `reset` или закрыть
+    // окно. И CI пропустил бы это молча.
+
+    /// Байты, которые обязаны уйти в терминал. Замерены на живом crossterm, а не выдуманы.
+    const SHOW_CURSOR: &str = "\u{1b}[?25h";
+    const LEAVE_ALT_SCREEN: &str = "\u{1b}[?1049l";
+    const DISABLE_PASTE: &str = "\u{1b}[?2004l";
+    const DISABLE_MOUSE: &str = "\u{1b}[?1000l";
+
+    #[test]
+    fn restoring_the_screen_shows_the_cursor_and_leaves_the_alt_screen() {
+        let mut out = Vec::new();
+        restore_screen(&mut out).expect("восстановление пишет в приёмник");
+        let seq = String::from_utf8_lossy(&out);
+
+        assert!(
+            seq.contains(SHOW_CURSOR),
+            "курсор ОБЯЗАН вернуться: рендер прятал его через Hide, и без Show пользователь \
+             остался бы с невидимым курсором. Ушло: {seq:?}"
+        );
+        assert!(
+            seq.contains(LEAVE_ALT_SCREEN),
+            "не вышли из alt-screen: {seq:?}"
+        );
+        assert!(
+            seq.contains(DISABLE_PASTE),
+            "bracketed paste не выключен: {seq:?}"
+        );
+        assert!(
+            seq.contains(DISABLE_MOUSE),
+            "захват мыши не выключен: {seq:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_panic_of_the_main_thread_touches_the_terminal() {
+        // Рабочий поток пишет в ЖИВОЙ TUI: его бэктрейс изуродовал бы экран, а лоадер завис бы
+        // навсегда. Поэтому терминал трогает только паника главного (UI) потока.
+        assert!(panic_touches_terminal(Some("main")));
+        assert!(!panic_touches_terminal(Some("clave-worker")));
+        assert!(!panic_touches_terminal(None));
+    }
+
+    const TERM_CASE: &str = "CLAVE_TEST_TERMINAL_CASE";
+    const TERM_SELF: &str = "runtime::tests::the_terminal_is_really_restored_on_exit_and_on_panic";
+
+    /// Прогнать один случай в ДОЧЕРНЕМ процессе и вернуть весь его вывод.
+    ///
+    /// Иначе никак: `restore_terminal` пишет в НАСТОЯЩИЙ `io::stdout()`, мимо перехвата
+    /// тестового харнесса. Проверить, что вызов вообще состоялся, можно только со стороны —
+    /// поймав вывод отдельного процесса.
+    ///
+    /// `--test-threads=1` обязателен: только так libtest гоняет тест на потоке `main`, а
+    /// panic-hook именно по имени потока и решает, трогать ли терминал.
+    fn run_terminal_case(case: &str) -> String {
+        let exe = std::env::current_exe().expect("путь к тестовому бинарю");
+        let out = std::process::Command::new(exe)
+            .args([TERM_SELF, "--exact", "--nocapture", "--test-threads=1"])
+            .env(TERM_CASE, case)
+            .output()
+            .expect("дочерний тест не запустился");
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr)
+    }
+
+    #[test]
+    fn the_terminal_is_really_restored_on_exit_and_on_panic() {
+        match std::env::var(TERM_CASE).ok().as_deref() {
+            // Ребёнок: зовём восстановление по-настоящему. Родитель поймает его stdout.
+            Some("exit") => restore_terminal(),
+            // Ребёнок: печатаем справку. `print_usage` — тонкая обёртка над println!, и её
+            // целиком заменяли пустышкой: `clave --help` мог печатать пустоту, а CI бы это
+            // пропустил. Проверить факт печати можно только со стороны.
+            Some("usage") => print_usage(),
+            // Ребёнок: ставим хук и роняем поток, НАЗВАННЫЙ `main`. Восстановление обязано
+            // случиться САМО — иначе после любой паники clave оставляет пользователю сломанный
+            // терминал.
+            //
+            // Почему не паниковать прямо тут: libtest гоняет тело теста в отдельном потоке,
+            // названном ПО ИМЕНИ ТЕСТА, — и даже `--test-threads=1` этого не меняет (замерено:
+            // хук отработал как «не главный поток» и не сделал ничего). А хук решает именно по
+            // имени потока. Поэтому воспроизводим ровно то условие, которое он стережёт.
+            Some("panic") => {
+                install_panic_hook();
+                let dying = std::thread::Builder::new()
+                    .name("main".to_string())
+                    .spawn(|| panic!("нарочная паника: терминал обязан вернуться сам"))
+                    .expect("поток запущен");
+                assert!(dying.join().is_err(), "поток обязан был упасть");
+            }
+            _ => {
+                let on_exit = run_terminal_case("exit");
+                assert!(
+                    on_exit.contains("1 passed"),
+                    "дочерний тест обязан РЕАЛЬНО прогнаться; коду возврата тут верить нельзя — \
+                     с опечаткой в фильтре ребёнок гоняет ноль тестов и выходит нулём:\n{on_exit}"
+                );
+                assert!(
+                    on_exit.contains(SHOW_CURSOR),
+                    "restore_terminal не написал в терминал НИЧЕГО — то есть его можно заменить \
+                     пустышкой, и после аварийного выхода курсор останется невидимым:\n{on_exit}"
+                );
+
+                let on_panic = run_terminal_case("panic");
+                assert!(
+                    on_panic.contains("1 passed"),
+                    "дочерний случай «panic» обязан РЕАЛЬНО прогнаться:\n{on_panic}"
+                );
+                assert!(
+                    on_panic.contains("нарочная паника"),
+                    "паника обязана быть напечатана: хук цепляет предыдущий обработчик, и без \
+                     этого бэктрейс терялся бы молча:\n{on_panic}"
+                );
+                assert!(
+                    on_panic.contains(SHOW_CURSOR),
+                    "после паники главного потока терминал НЕ восстановлен — значит panic-hook \
+                     не ставится или не зовёт восстановление, и пользователь остаётся со \
+                     сломанным терминалом:\n{on_panic}"
+                );
+
+                let on_usage = run_terminal_case("usage");
+                assert!(
+                    on_usage.contains("1 passed"),
+                    "дочерний случай «usage» обязан РЕАЛЬНО прогнаться:\n{on_usage}"
+                );
+                assert!(
+                    on_usage.contains("Open TUI") && on_usage.contains("--help"),
+                    "print_usage не напечатал НИЧЕГО — то есть `clave --help` может молча \
+                     показывать пустоту:\n{on_usage}"
+                );
+            }
+        }
+    }
+
+    // ─────────────────────────── ПРИВЕТСТВИЕ И ЛОГИН ───────────────────────────
+
+    #[test]
+    fn welcome_greets_an_empty_start_but_never_overwrites_a_live_chat() {
+        // Отрицание тут несущее: без него приветствие ЗАТЁРЛО БЫ восстановленный диалог, а
+        // пустой старт остался бы с голым экраном.
+        assert!(
+            needs_welcome(&[]),
+            "пустой старт обязан встречать приветствием"
+        );
+        assert!(
+            needs_welcome(&["система: чат очищен".to_string()]),
+            "после /clear остаётся только системная строка — это ещё не диалог"
+        );
+        assert!(
+            !needs_welcome(&["◆ привет".to_string()]),
+            "в восстановленном чате есть реплика — приветствие затёрло бы её"
+        );
+        assert!(
+            !needs_welcome(&["  ◆ реплика с отступом".to_string()]),
+            "отступ перед репликой ничего не меняет"
+        );
+    }
+
+    #[test]
+    fn login_message_tells_the_three_outcomes_apart() {
+        // Исходов три, и путать их нельзя: человек пойдёт чинить не то.
+        let ok = login_message(true, 0, Language::Ru);
+        assert!(ok.contains("готова"), "всё готово: {ok}");
+
+        // Команда отработала (код 0), но нужных аккаунтов ещё не все.
+        let partial = login_message(false, 0, Language::Ru);
+        assert!(
+            partial.contains("не все готовы"),
+            "логин прошёл, но не всё: {partial}"
+        );
+
+        // Сама команда упала — это ДРУГОЕ, и текст обязан отличаться.
+        let failed = login_message(false, 1, Language::Ru);
+        assert!(failed.contains("ошибкой"), "команда упала: {failed}");
+        assert_ne!(
+            partial, failed,
+            "«логин прошёл, но не всё» и «команда упала» — разные беды, и путать их нельзя"
+        );
+
+        assert!(login_message(true, 0, Language::En).contains("ready"));
+    }
+
+    // ─────────────────────────── СЕЛЕКТОР И ДИСПЕТЧЕР ───────────────────────────
+
+    /// App с открытым inline-селектором (один вопрос, два варианта).
+    fn app_with_ask() -> App {
+        let mut app = app_for_keys();
+        app.ask_prompt_pending = Some(AskPrompt {
+            questions: vec![AskQuestion {
+                question: "Что делаем?".to_string(),
+                multi: false,
+                options: vec![
+                    AskOption {
+                        label: "первый".to_string(),
+                        note: None,
+                    },
+                    AskOption {
+                        label: "второй".to_string(),
+                        note: None,
+                    },
+                ],
+                allow_custom: false,
+            }],
+        });
+        app.open_pending_ask();
+        assert!(app.ask_active(), "селектор обязан открыться");
+        app
+    }
+
+    #[test]
+    fn an_open_selector_still_receives_keys() {
+        // Условие «клавиша до-печатала прозу И открыла селектор → съесть её» держится на И.
+        // С ИЛИ оно срабатывало бы от одного лишь открытого селектора — и тот перестал бы
+        // отвечать на клавиши ВООБЩЕ: стрелки не двигают выбор, Enter не подтверждает.
+        let mut app = app_with_ask();
+        let before = app.ask.as_ref().expect("селектор").step;
+
+        handle_key(&mut app, key(KeyCode::Down));
+
+        let after = app.ask.as_ref().expect("селектор жив");
+        assert!(
+            after.answers[0].cursor != 0 || after.step != before,
+            "открытый селектор обязан отвечать на клавиши — иначе выбрать в нём нельзя ничего"
+        );
+    }
+
+    // ─────────────────────────── ПЕТЛЯ СОБЫТИЙ ───────────────────────────
+
+    #[test]
+    fn onboarding_and_a_modal_overlay_each_call_the_modal_on_their_own() {
+        // Условие ИЛИ, а не И, и это не придирка: с «И» онбординг без оверлея — то есть ПЕРВЫЙ
+        // ЗАПУСК — рисовался бы живым блоком поверх ленты вместо полноэкранной модалки.
+        let mut only_overlay = app_for_keys();
+        only_overlay.overlay = Overlay::Effort;
+        assert!(
+            wants_modal(&only_overlay),
+            "оверлей сам по себе требует модалку"
+        );
+
+        let mut only_onboarding = app_for_keys();
+        only_onboarding.onboarding = Some(Onboarding::new(only_onboarding.mode));
+        only_onboarding.overlay = Overlay::None;
+        assert!(
+            wants_modal(&only_onboarding),
+            "онбординг сам по себе требует модалку — это первый запуск"
+        );
+
+        let plain = app_for_keys();
+        assert!(
+            !wants_modal(&plain),
+            "без онбординга и оверлея модалка не нужна"
+        );
+    }
+
+    #[test]
+    fn a_key_release_is_not_a_key_press() {
+        // Windows шлёт и Press, и Release. Без фильтра по kind каждая клавиша срабатывала бы
+        // ДВАЖДЫ: напечатал «а» — получил «аа».
+        let mut app = app_for_keys();
+        apply_event(
+            &mut app,
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('а'),
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            )),
+        );
+        assert_eq!(app.input, "а", "нажатие обязано печатать");
+
+        apply_event(
+            &mut app,
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('а'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )),
+        );
+        assert_eq!(app.input, "а", "отпускание клавиши НЕ печатает второй раз");
+    }
+
+    #[test]
+    fn a_paste_lands_in_the_input_whole_and_is_not_split_into_sends() {
+        // Вставка с переносами — не серия нажатий Enter. Иначе каждый перенос улетел бы
+        // отправкой, и вместо одного сообщения ушло бы три.
+        let mut app = app_for_keys();
+        apply_event(&mut app, Event::Paste("первая\nвторая\nтретья".to_string()));
+
+        assert!(
+            app.input.contains("первая"),
+            "вставка не дошла: {:?}",
+            app.input
+        );
+        assert!(
+            app.input.contains("третья"),
+            "вставка обрезана: {:?}",
+            app.input
+        );
+        assert!(
+            app.pending_messages.is_empty(),
+            "переносы во вставке НЕ должны отправлять сообщения: {:?}",
+            app.pending_messages
+        );
+    }
+
+    #[test]
+    fn a_resize_forces_a_full_redraw() {
+        // После сна ПК или смены монитора терминал переливает содержимое, и кэш позиций живого
+        // блока устаревает. Без полной перерисовки экран остаётся с обрывками.
+        let mut app = app_for_keys();
+        app.pending_full_redraw = false;
+        apply_event(&mut app, Event::Resize(100, 40));
+        assert!(
+            app.pending_full_redraw,
+            "ресайз обязан требовать перерисовку"
+        );
+    }
+
+    #[test]
+    fn an_unhandled_event_changes_nothing() {
+        let mut app = app_for_keys();
+        app.pending_full_redraw = false;
+        apply_event(&mut app, Event::FocusGained);
+        assert!(app.input.is_empty());
+        assert!(!app.pending_full_redraw);
+    }
+
+    #[test]
+    fn key_press_lets_through_a_press_and_stops_a_release() {
+        // Общий фильтр основной петли и модалки. Разъедься они — на Windows клавиши начали бы
+        // срабатывать дважды в одном месте и нормально в другом.
+        let press =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press);
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release);
+
+        assert_eq!(key_press(Event::Key(press)), Some(press));
+        assert_eq!(
+            key_press(Event::Key(release)),
+            None,
+            "отпускание — не нажатие"
+        );
+        assert_eq!(key_press(Event::Resize(80, 24)), None);
+        assert_eq!(key_press(Event::Paste("текст".to_string())), None);
+    }
+
+    // Модалка (effort/settings/chats/онбординг) обрабатывает ТОЛЬКО клавиши. Я сам чуть не завёз
+    // тут регрессию: подсунул модалке общий `apply_event` ради красоты, и вставка начала бы молча
+    // копиться в буфере главного экрана, чтобы вывалиться при её закрытии. Тест стережёт границу.
+    #[test]
+    fn a_paste_never_leaks_into_the_input_from_behind_a_modal() {
+        let mut app = app_for_keys();
+        app.overlay = Overlay::Settings;
+        assert!(wants_modal(&app), "экран настроек — модалка");
+
+        // То, что делает модалка со своим событием.
+        let pasted = Event::Paste("сюда нельзя".to_string());
+        assert!(
+            key_press(pasted).is_none(),
+            "модалка видит во вставке НЕ клавишу — значит, в инпут она не уйдёт"
+        );
+        assert!(
+            app.input.is_empty(),
+            "инпут главного экрана обязан остаться пустым: {:?}",
+            app.input
+        );
+    }
+
+    // ─────────────────────────── ДИСПЕТЧЕР КЛАВИШ ───────────────────────────
+
+    #[test]
+    fn handle_key_routes_to_the_screen_that_is_open() {
+        // Весь диспетчер клавиатуры можно было заменить пустышкой, и ни один тест не замечал:
+        // пользователь жмёт клавиши, не происходит НИЧЕГО, а CI зелёный.
+        let mut typing = app_for_keys();
+        handle_key(&mut typing, key(KeyCode::Char('ф')));
+        assert_eq!(typing.input, "ф", "без оверлея клавиша идёт в инпут");
+
+        let mut on_effort = app_for_keys();
+        on_effort.overlay = Overlay::Effort;
+        handle_key(&mut on_effort, key(KeyCode::Char('ф')));
+        assert!(
+            on_effort.input.is_empty(),
+            "на экране effort буква НЕ должна проваливаться в инпут — иначе экраны перепутаны"
+        );
+
+        let mut on_effort_esc = app_for_keys();
+        on_effort_esc.overlay = Overlay::Effort;
+        handle_key(&mut on_effort_esc, key(KeyCode::Esc));
+        assert_eq!(
+            on_effort_esc.overlay,
+            Overlay::None,
+            "Esc на экране effort обязан его закрыть — значит клавиша дошла до нужного обработчика"
+        );
+    }
+
+    // ─────────────────────────── РАЗБОР АРГУМЕНТОВ ───────────────────────────
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn launch_for_sends_each_form_of_the_command_line_where_it_belongs() {
+        assert_eq!(launch_for(&argv(&[])), Launch::Tui);
+        assert_eq!(launch_for(&argv(&["-h"])), Launch::Usage);
+        assert_eq!(launch_for(&argv(&["--help"])), Launch::Usage);
+        assert_eq!(launch_for(&argv(&["-V"])), Launch::Version);
+        assert_eq!(launch_for(&argv(&["--version"])), Launch::Version);
+        assert_eq!(launch_for(&argv(&["--run", "tandem"])), Launch::Headless);
+        assert_eq!(launch_for(&argv(&["напиши тест"])), Launch::Engine);
+
+        // Справка перекрывает всё: `clave задача --help` — это просьба о справке.
+        assert_eq!(launch_for(&argv(&["задача", "--help"])), Launch::Usage);
+        // ...а версия перекрывает запуск задачи, но не справку.
+        assert_eq!(launch_for(&argv(&["задача", "-V"])), Launch::Version);
+    }
+
+    #[test]
+    fn an_unknown_flag_never_becomes_a_task() {
+        // Ключевое: неизвестный флаг НЕ должен молча уехать в движок «задачей» — это запустило
+        // бы платный цикл планирования там, где человек просто опечатался.
+        assert_eq!(
+            launch_for(&argv(&["--serve"])),
+            Launch::UnknownFlag("--serve".to_string())
+        );
+        assert_eq!(
+            launch_for(&argv(&["--serve", "8080"])),
+            Launch::UnknownFlag("--serve".to_string())
+        );
+        // А вот дефис ВНУТРИ задачи — это просто текст, а не флаг.
+        assert_eq!(
+            launch_for(&argv(&["почини", "--flag", "в", "коде"])),
+            Launch::Engine
+        );
+    }
+
+    #[test]
+    fn usage_text_names_the_command_and_the_ways_to_run_it() {
+        // print_usage целиком заменялась пустышкой: `clave --help` мог печатать пустоту.
+        let text = usage_text();
+        assert!(
+            text.contains(APP_COMMAND),
+            "справка обязана назвать команду"
+        );
+        assert!(text.contains("--help"), "справка обязана упомянуть --help");
+        assert!(
+            text.contains("<task...>"),
+            "справка обязана показать запуск задачи"
+        );
+        assert!(text.contains("Open TUI"), "справка обязана упомянуть TUI");
     }
 }
