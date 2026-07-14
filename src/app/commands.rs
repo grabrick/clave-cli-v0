@@ -744,17 +744,375 @@ mod tests {
         Some("stub".to_string())
     }
 
+    /// Каталог уникален на процесс И на вызов: иначе параллельные прогоны затирают
+    /// файлы друг друга и тест начинает падать вразброс.
+    fn temp_commands_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+        let dir = env::temp_dir().join(format!(
+            "clave-cmd-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// App на временных путях. `App::new()` брать нельзя: она читает настоящий конфиг
+    /// и при непройденном онбординге поднимает auth-probe процессы провайдеров.
+    ///
+    /// `running = true` — намеренно: запускающие команды (`/plan`, `/dev`, `/advisor`, …)
+    /// на busy-преflight отвечают сообщением и НЕ поднимают CLI провайдера.
+    fn app_for_commands() -> (App, PathBuf) {
+        let dir = temp_commands_dir();
+        let config = AppConfig {
+            onboarding_done: true,
+            ..AppConfig::default()
+        };
+        let mut app = App::from_config(
+            config,
+            dir.join("config.json"),
+            dir.join("history"),
+            dir.clone(),
+        );
+        app.lang = Language::Ru;
+        app.onboarding = None;
+        app.overlay = Overlay::None;
+        app.git_ref_detector = stub_git_ref;
+        app.work_dir = dir.to_string_lossy().to_string();
+        app.running = true;
+        (app, dir)
+    }
+
+    /// Строки, которые команда добавила в ленту (эхо + результат). Команды вроде `/new`
+    /// и `/resume` ленту сбрасывают — тогда новой считается вся лента целиком.
+    fn run(app: &mut App, line: &str) -> Vec<String> {
+        let before = app.transcript.len();
+        app.handle_command(line);
+        let from = if app.transcript.len() < before {
+            0
+        } else {
+            before
+        };
+        app.transcript[from..].to_vec()
+    }
+
+    fn joined(app: &mut App, line: &str) -> String {
+        run(app, line).join("\n")
+    }
+
+    const BUSY: &str = "Clave уже выполняется.";
+
+    /// Эхо «❯ команда» печатается для обычных команд и подавляется для запускающих:
+    /// у тех свой заголовок «◆ …», два заголовка подряд выглядели бы как дубль.
+    #[test]
+    fn command_echo_is_suppressed_only_for_launching_commands() {
+        let (mut app, dir) = app_for_commands();
+
+        let help = run(&mut app, "/help");
+        assert_eq!(help[0], "❯ /help");
+
+        let plan = run(&mut app, "/plan задача");
+        assert!(
+            !plan[0].starts_with("❯ "),
+            "у запускающей команды эха быть не должно: {plan:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Каждая ветка диспетчера обязана оставлять свой отличимый след: если ветку
+    /// выкинуть, команда провалится в «Неизвестная команда».
+    #[test]
+    fn handle_command_dispatches_every_branch() {
+        let (mut app, dir) = app_for_commands();
+
+        assert!(joined(&mut app, "/help").contains("⏺ Команды"));
+        assert_eq!(app.status, "помощь");
+
+        assert!(joined(&mut app, "/lang en").contains("Interface language changed to English."));
+        assert_eq!(app.lang, Language::En);
+        assert!(joined(&mut app, "/language ru").contains("Язык интерфейса изменён на русский."));
+        assert_eq!(app.lang, Language::Ru);
+        assert!(joined(&mut app, "/lang xx").contains("Использование: /lang ru|en"));
+        assert_eq!(app.lang, Language::Ru);
+
+        // Валидные /mode и /roles тут не гоняем: они уходят в auth-probe (спавн CLI).
+        assert!(joined(&mut app, "/mode bogus").contains("Использование: /mode codex-only"));
+        assert!(joined(&mut app, "/roles codex").contains("Использование: /roles <исполнитель>"));
+        assert!(
+            joined(&mut app, "/roles alpha beta")
+                .contains("Использование: /roles codex|claude codex|claude"),
+            "два аргумента разбираются как пара ролей, даже если провайдеры неизвестны"
+        );
+
+        app.overlay = Overlay::None;
+        assert!(!joined(&mut app, "/settings").contains("Неизвестная"));
+        assert_eq!(app.overlay, Overlay::Settings);
+        app.overlay = Overlay::None;
+        assert!(!joined(&mut app, "/agents").contains("Неизвестная"));
+        assert_eq!(app.overlay, Overlay::Settings);
+        app.overlay = Overlay::None;
+        assert!(!joined(&mut app, "/search").contains("Неизвестная"));
+        assert_eq!(app.overlay, Overlay::Search);
+        app.overlay = Overlay::None;
+        assert!(!joined(&mut app, "/effort").contains("Неизвестная"));
+        assert_eq!(app.overlay, Overlay::Effort);
+        assert_eq!(app.status, "effort");
+        app.overlay = Overlay::None;
+
+        // /logout, /auth и /setup здесь не гоняем: обе ветки строят Onboarding::new,
+        // а он безусловно поднимает auth-probe процессы codex и claude. В юнит-тесте
+        // это живой спавн провайдера — запрещено. Мутанты на этих match-arm остаются
+        // непокрытыми осознанно; закрыть их можно только вынеся probe за App.
+
+        assert!(joined(&mut app, "/chat-model claude").contains("Модель для простых сообщений:"));
+        assert_eq!(app.direct_provider, Provider::Claude);
+        assert!(
+            joined(&mut app, "/chat-model x").contains("Использование: /chat-model codex|claude")
+        );
+
+        assert!(joined(&mut app, "/theme cyan").contains("Цветовая гамма:"));
+        assert_eq!(app.theme, Theme::Cyan);
+        assert!(joined(&mut app, "/theme x").contains("Использование: /theme purple"));
+        assert!(joined(&mut app, "/color rose").contains("Цветовая гамма:"));
+        assert_eq!(app.theme, Theme::Rose);
+        assert!(joined(&mut app, "/color x").contains("Использование: /color purple"));
+
+        assert!(joined(&mut app, "/background").contains("Чат уже сохраняется на диск."));
+        assert_eq!(app.status, "сессия сохранена");
+
+        assert!(joined(&mut app, &format!("/add-dir {}", dir.display()))
+            .contains("Рабочая директория:"));
+
+        assert!(joined(&mut app, "/rounds 3").contains("Количество раундов: 3."));
+        assert_eq!(app.rounds, 3);
+        assert!(joined(&mut app, "/rounds 0").contains("Использование: /rounds"));
+        assert_eq!(app.rounds, 3, "ноль раундов — не режим работы, а поломка");
+        assert!(joined(&mut app, "/rounds -1").contains("Использование: /rounds"));
+        assert_eq!(app.rounds, 3);
+
+        assert!(joined(&mut app, "/out artifacts").contains("Папка артефактов: artifacts."));
+        assert_eq!(app.out_dir, "artifacts");
+        assert!(joined(&mut app, "/out").contains("Использование: /out <папка>"));
+
+        assert!(joined(&mut app, "/quit").is_empty());
+        assert!(app.should_quit);
+        app.should_quit = false;
+        assert!(joined(&mut app, "/exit").is_empty());
+        assert!(app.should_quit);
+
+        assert!(joined(&mut app, "/bogus").contains("Неизвестная команда: /bogus"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Запускающие команды при занятом приложении отвечают busy-преflight, а не
+    /// «неизвестная команда»: так каждая ветка проверяется без спавна провайдера.
+    #[test]
+    fn launching_commands_reach_their_runners() {
+        let (mut app, dir) = app_for_commands();
+
+        for command in [
+            "/plan задача",
+            "/clave задача",
+            "/dev задача",
+            "/brainstorm",
+            "/blueprint",
+            "/finish-branch",
+            "/split-work",
+            "/worktrees",
+            "/autofix-pr",
+            "/advisor",
+            "/advisor как быть",
+            "/btw вопрос",
+        ] {
+            let out = joined(&mut app, command);
+            assert!(
+                out.contains(BUSY),
+                "{command} обязана дойти до запуска (busy-преflight), получено: {out}"
+            );
+        }
+
+        assert!(joined(&mut app, "/plan").contains("Использование: /plan <задача>"));
+        assert!(joined(&mut app, "/dev").contains("Использование: /dev <задача>"));
+        assert!(joined(&mut app, "/btw").contains("Использование: /btw <вопрос>"));
+
+        assert!(joined(&mut app, "/retry").contains("Нет последнего запроса для повтора."));
+        app.last_chat_message = Some("прошлый запрос".to_string());
+        assert!(
+            joined(&mut app, "/retry").contains("в очереди: прошлый запрос"),
+            "повтор обязан отправить прошлое сообщение"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Чатовые ветки диспетчера: аргумент решает, что именно произойдёт с файлами.
+    #[test]
+    fn chat_commands_route_by_argument() {
+        let (mut app, dir) = app_for_commands();
+        let other = chat_path_for_id(&dir, "chat-other");
+        save_chat_transcript(&other, "chat-other", &["строка".to_string()]).expect("save");
+
+        assert!(joined(&mut app, "/name Мой чат").contains("Чат назван: Мой чат"));
+        assert!(joined(&mut app, "/rename Другой").contains("Чат назван: Другой"));
+
+        // /chats открывает пикер, /chats clear — чистит мелочь.
+        app.overlay = Overlay::None;
+        run(&mut app, "/chats");
+        assert_eq!(app.overlay, Overlay::Chats);
+        app.overlay = Overlay::None;
+        assert!(joined(&mut app, "/chats clear").contains("Удалено мелких чатов: 1"));
+        assert!(!other.exists());
+        assert_eq!(
+            app.overlay,
+            Overlay::None,
+            "/chats clear не открывает пикер"
+        );
+
+        // /resume без аргумента — тот же пикер, с аргументом — открытие чата.
+        let full = chat_path_for_id(&dir, "chat-full");
+        save_chat_transcript(&full, "chat-full", &["a".to_string(), "b".to_string()])
+            .expect("save");
+        run(&mut app, "/resume");
+        assert_eq!(app.overlay, Overlay::Chats);
+        app.overlay = Overlay::None;
+        assert!(joined(&mut app, "/resume chat-full").contains("Чат открыт: chat-full"));
+        assert_eq!(app.chat_id, "chat-full");
+
+        // /branch — копия чата под новым id, исходный на месте.
+        let source = app.chat_path.clone();
+        assert!(joined(&mut app, "/branch").contains("Создана ветка чата: chat-full →"));
+        assert_ne!(app.chat_id, "chat-full");
+        assert!(source.exists() && app.chat_path.exists());
+        assert_eq!(app.transcript.iter().filter(|l| *l == "a").count(), 1);
+
+        // /new — свежий чат, старый остаётся; /clear — текущий чат уходит с диска.
+        let before_new = app.chat_path.clone();
+        assert!(joined(&mut app, "/new").contains("Новый чат:"));
+        assert!(before_new.exists());
+        let cleared = app.chat_path.clone();
+        run(&mut app, "/clear");
+        assert!(!cleared.exists(), "/clear удаляет текущий чат");
+        assert!(full.exists(), "/clear не трогает остальную историю");
+
+        // /clear history — наоборот: сносит всю прошлую историю, щадит текущий чат.
+        let current = app.chat_path.clone();
+        assert!(joined(&mut app, "/clear history").contains("Удалено чатов:"));
+        assert!(!full.exists(), "/clear history обязан стереть старые чаты");
+        assert!(current.exists(), "/clear history не трогает текущий чат");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// /status, /version, /uptime и /export печатают конкретные строки — молчаливая
+    /// заглушка вместо них означала бы «команда есть, а ответа нет».
+    #[test]
+    fn info_commands_report_session_facts() {
+        let (mut app, dir) = app_for_commands();
+
+        let status = joined(&mut app, "/status");
+        assert!(status.contains("⏺ Статус сессии"));
+        assert!(status.contains(&format!("  ⎿ Режим: {}", app.mode.as_str())));
+        assert!(status.contains(&format!("  ⎿ Раунды: {}", app.rounds)));
+        assert!(status.contains(&format!("  ⎿ Чат: {}", app.chat_id)));
+        assert_eq!(app.status, "статус");
+
+        let version = joined(&mut app, "/version");
+        assert!(version.contains(&format!("⏺ {APP_COMMAND} v{}", env!("CARGO_PKG_VERSION"))));
+        assert!(version.contains("claude "));
+        assert_eq!(app.status, "версия");
+
+        let uptime = joined(&mut app, "/uptime");
+        assert!(uptime.contains("⏺ Время работы сессии"));
+        assert!(uptime.contains("  ⎿ Работает: "));
+        assert_eq!(app.status, "аптайм");
+
+        let export = joined(&mut app, "/export");
+        assert!(export.contains("Чат экспортирован:"));
+        let exported = dir.join(format!("clave-{}.md", app.chat_id));
+        let content = fs::read_to_string(&exported).expect("экспорт обязан лечь на диск");
+        assert!(content.contains(&app.chat_id));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// /cost: без запросов — честное «пока нет запросов»; с запросами — только те
+    /// провайдеры, что реально работали, и минуты сессии (а не секунды и не остаток).
+    #[test]
+    fn cost_reports_only_providers_that_ran() {
+        let (mut app, dir) = app_for_commands();
+
+        let empty = joined(&mut app, "/cost");
+        assert!(empty.contains("⏺ Расход сессии"));
+        assert!(empty.contains("  ⎿ Данные: пока нет запросов"));
+        assert!(!empty.contains("Claude:") && !empty.contains("Codex:"));
+        assert_eq!(app.status, "расход");
+
+        app.usage.started_at = Instant::now() - Duration::from_secs(300);
+        app.usage.claude.requests = 2;
+        app.usage.claude.total = RunUsage {
+            input: 1000,
+            output: 500,
+            cost_usd: 0.25,
+            ..RunUsage::default()
+        };
+        let claude_only = joined(&mut app, "/cost");
+        assert!(claude_only.contains("  ⎿ Claude: 2 запр."));
+        assert!(claude_only.contains("$0.2500"));
+        assert!(
+            !claude_only.contains("  ⎿ Codex:"),
+            "Codex без запросов показывать нельзя: {claude_only}"
+        );
+        assert!(claude_only.contains("  ⎿ Итого: "));
+        assert!(
+            claude_only.contains("  ⎿ Сессия: 5 мин"),
+            "минуты сессии считаются как секунды/60: {claude_only}"
+        );
+        assert!(!claude_only.contains("пока нет запросов"));
+
+        let (mut app, _) = app_for_commands();
+        app.usage.codex.requests = 3;
+        app.usage.codex.total = RunUsage {
+            input: 700,
+            output: 300,
+            ..RunUsage::default()
+        };
+        let codex_only = joined(&mut app, "/cost");
+        assert!(codex_only.contains("  ⎿ Codex: 3 запр."));
+        assert!(
+            !codex_only.contains("  ⎿ Claude:"),
+            "Claude без запросов показывать нельзя: {codex_only}"
+        );
+        assert!(!codex_only.contains("пока нет запросов"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Tab-дополнение подставляет команду, даже если курсор подсказок «уехал» дальше
+    /// их числа: индекс обязан прижиматься к последней подсказке.
+    #[test]
+    fn complete_command_clamps_the_selection_to_the_last_suggestion() {
+        let (mut app, dir) = app_for_commands();
+        app.input = "/uptim".to_string();
+        assert_eq!(app.suggestions().len(), 1);
+        app.selected_suggestion = 5;
+
+        app.complete_command();
+
+        assert_eq!(app.input, "/uptime");
+        assert_eq!(app.cursor, app.input.len());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Смена рабочего каталога обязана обновить индикатор футера в ЭТОМ же кадре: иначе
     /// футер продолжал бы показывать ветку прошлого каталога.
     #[test]
     fn set_work_dir_moves_the_cwd_and_refreshes_the_git_indicator() {
-        let dir = env::temp_dir().join(format!("clave-setdir-{}", std::process::id()));
-        fs::create_dir_all(&dir).expect("mkdir");
-
-        let mut app = App::new();
-        // Конфиг сохраняется на диск — пишем во временный, а не в настоящий файл пользователя.
-        app.config_path = dir.join("config.json");
-        app.git_ref_detector = stub_git_ref;
+        let (mut app, dir) = app_for_commands();
         app.git_ref = None;
 
         app.set_work_dir_command(&dir.to_string_lossy());
@@ -769,4 +1127,104 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    // ─────────────────────────── /mode и /roles ───────────────────────────
+    //
+    // Их не покрыли, решив, что они «уходят в auth-probe (спавн CLI)». Это не так: путь
+    // `/mode` → `apply_mode` → `set_mode` только присваивает поля, а `save_current_config`
+    // пишет во временный конфиг теста. Живых проб на нём нет — проверено. Освобождение от
+    // проверки всегда обосновано и всегда выходит боком: тут за ним прятались ШЕСТЬ мутантов,
+    // включая «apply_mode целиком заменяется пустышкой» — то есть `/mode` молча не переключает
+    // режим, а рапортует «Режим изменён».
+
+    #[test]
+    fn mode_command_switches_every_mode_and_persists_it() {
+        let (mut app, dir) = app_for_commands();
+
+        for (arg, expected) in [
+            ("codex-only", Mode::CodexOnly),
+            ("claude-only", Mode::ClaudeOnly),
+            ("claude-codex", Mode::ClaudeCodex),
+            ("codex-claude", Mode::CodexClaude),
+        ] {
+            let out = joined(&mut app, &format!("/mode {arg}"));
+            assert_eq!(
+                app.mode, expected,
+                "«/mode {arg}» обязан ПЕРЕКЛЮЧИТЬ режим, а не только отрапортовать: {out}"
+            );
+            assert_eq!(app.status, format!("mode:{}", expected.as_str()));
+            assert!(out.contains("Режим изменён"), "нет подтверждения: {out}");
+        }
+
+        // Режим уехал на диск: следующий запуск обязан его помнить.
+        let saved = load_config(&app.config_path);
+        assert_eq!(
+            saved.mode,
+            Mode::CodexClaude,
+            "последний выбранный режим обязан сохраниться в конфиг"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roles_command_sets_the_mode_from_the_pair() {
+        let (mut app, dir) = app_for_commands();
+        app.mode = Mode::CodexOnly;
+
+        let out = joined(&mut app, "/roles claude codex");
+        assert_eq!(
+            app.mode,
+            Mode::from_roles(Provider::Claude, Provider::Codex),
+            "пара «архитектор ревьюер» обязана превратиться в режим: {out}"
+        );
+        assert!(
+            out.contains("Роли планирования"),
+            "нет подтверждения: {out}"
+        );
+
+        // Обратный порядок — ДРУГОЙ режим. Иначе роли можно было бы перепутать местами
+        // и не заметить.
+        let out = joined(&mut app, "/roles codex claude");
+        assert_eq!(
+            app.mode,
+            Mode::from_roles(Provider::Codex, Provider::Claude)
+        );
+        assert_ne!(
+            Mode::from_roles(Provider::Claude, Provider::Codex),
+            Mode::from_roles(Provider::Codex, Provider::Claude),
+            "порядок ролей обязан различаться — иначе тест выше ничего не проверяет"
+        );
+        assert!(
+            out.contains("Роли планирования"),
+            "нет подтверждения: {out}"
+        );
+
+        // Мусор вместо провайдера — режим не трогаем.
+        let before = app.mode;
+        let out = joined(&mut app, "/roles codex сосед");
+        assert_eq!(
+            app.mode, before,
+            "неизвестный провайдер не смеет менять режим"
+        );
+        assert!(
+            out.contains("Использование: /roles"),
+            "нет подсказки: {out}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ГРАНИЦА, ОБЪЯВЛЕННАЯ ЧЕСТНО. Мутант `|| → &&` в `App::suggestions` (фильтр по `usage` и
+    // `insert`) убить НЕЛЬЗЯ, и это не лень: `normalized_command_query` возвращает None, если
+    // после команды есть пробел, — значит, needle пробела не содержит НИКОГДА. А у всех команд
+    // в таблице `usage` и `insert` начинаются с одного токена, и для любого needle без пробела
+    // оба `starts_with` дают ОДНО И ТО ЖЕ. Проверено перебором всей таблицы: ни одной команды,
+    // где они расходятся, нет. Мутант эквивалентный; `||` тут — задел на алиас, которого пока
+    // не существует.
+    //
+    // Ещё три мутанта оставлены сознательно: `/logout`, `/auth` и `/setup` идут в
+    // `open_auth_screen` → `Onboarding::new`, а тот поднимает ЖИВЫЕ auth-пробы `claude` и
+    // `codex`. Тест с настоящим CLI — это флейк в наборе и платный вызов в CI. Закрывать их
+    // надо иначе, отдельно.
 }
