@@ -54,46 +54,117 @@ pub(crate) fn provider_binary_present(provider: &str) -> bool {
 }
 
 pub(crate) fn codex_auth_probe() -> AuthProbe {
-    match Command::new(codex_binary())
-        .args(["login", "status"])
-        .output()
-    {
-        Ok(output) => {
-            let text = command_output_text(&output.stdout, &output.stderr);
-            AuthProbe {
-                installed: true,
-                authenticated: auth_output_looks_ready(output.status.success(), &text),
-                status: first_nonempty_line(&text)
-                    .unwrap_or_else(|| "status unavailable".to_string()),
-            }
-        }
-        Err(err) => AuthProbe {
-            installed: false,
-            authenticated: false,
-            status: err.to_string(),
-        },
-    }
+    auth_probe(&codex_binary(), &["login", "status"], auth_timeout())
 }
 
 pub(crate) fn claude_auth_probe() -> AuthProbe {
-    match Command::new(claude_binary())
-        .args(["auth", "status", "--text"])
-        .output()
-    {
-        Ok(output) => {
-            let text = command_output_text(&output.stdout, &output.stderr);
-            AuthProbe {
-                installed: true,
-                authenticated: auth_output_looks_ready(output.status.success(), &text),
-                status: first_nonempty_line(&text)
-                    .unwrap_or_else(|| "status unavailable".to_string()),
+    auth_probe(
+        &claude_binary(),
+        &["auth", "status", "--text"],
+        auth_timeout(),
+    )
+}
+
+/// Потолок ожидания пробы логина. Пробу зовут СИНХРОННО: из `App::new()` — ещё до того,
+/// как нарисован хоть один кадр, — и из обработчика клавиш, когда терминал уже в raw-режиме.
+/// Раньше тут стоял `Command::output()`, который ждёт выхода процесса и EOF на его потоках,
+/// то есть буквально вечно: подвисший на сети `claude`/`codex` морозил Clave насмерть — без
+/// экрана, без вывода, без объяснения. Переопределяется `CLAVE_AUTH_TIMEOUT_SECS`.
+fn auth_timeout() -> Duration {
+    auth_timeout_from(env::var("CLAVE_AUTH_TIMEOUT_SECS").ok().as_deref())
+}
+
+/// Разбор потолка из значения переменной. Мусор и ноль → дефолт: нулевой потолок убивал бы
+/// пробу сразу после спавна, нечисловой — просто опечатка. Десяти секунд хватает даже
+/// провайдеру, который лезет за токеном в сеть.
+fn auth_timeout_from(value: Option<&str>) -> Duration {
+    let secs = value
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(10);
+    Duration::from_secs(secs)
+}
+
+/// Статус немого провайдера. Обязан назвать причину: иначе в онбординге он выглядит как
+/// «не залогинен», и пользователь идёт чинить логин, с которым всё в порядке.
+fn auth_timeout_status(timeout: Duration) -> String {
+    format!("no response in {}s", timeout.as_secs())
+}
+
+/// Проба логина с потолком по времени. Бинарь и потолок — ПАРАМЕТРЫ, а не окружение: иначе
+/// «зависший CLI нас не морозит» проверялось бы только настоящим зависшим CLI, то есть никак.
+fn auth_probe(binary: &str, args: &[&str], timeout: Duration) -> AuthProbe {
+    let mut command = Command::new(binary);
+    command
+        .args(args)
+        // Как делал `output()`: проба не смеет воровать ввод у TUI.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Лидерство в группе тут не украшение: `kill_process_tree` шлёт сигнал ГРУППЕ (`-pid`),
+    // и без него сигнал не дошёл бы ни до кого, а `wait` внутри повис бы навсегда — починка
+    // обернулась бы новым зависанием.
+    configure_process_group(&mut command);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            return AuthProbe {
+                installed: false,
+                authenticated: false,
+                status: err.to_string(),
             }
         }
-        Err(err) => AuthProbe {
-            installed: false,
-            authenticated: false,
-            status: err.to_string(),
-        },
+    };
+
+    // Потоки читаем в тредах: молчаливый CLI не забьёт пайп, а болтливый не упрётся в его
+    // буфер (`output()` делал ровно это, только без потолка).
+    let stdout = child.stdout.take().map(spawn_capture_reader);
+    let stderr = child.stderr.take().map(spawn_capture_reader);
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let out = stdout
+                    .map(|h| h.join().unwrap_or_default())
+                    .unwrap_or_default();
+                let err = stderr
+                    .map(|h| h.join().unwrap_or_default())
+                    .unwrap_or_default();
+                let text = command_output_text(out.as_bytes(), err.as_bytes());
+                return AuthProbe {
+                    installed: true,
+                    authenticated: auth_output_looks_ready(status.success(), &text),
+                    status: first_nonempty_line(&text)
+                        .unwrap_or_else(|| "status unavailable".to_string()),
+                };
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Убиваем группу целиком: внук, унаследовавший stdout, держал бы пайп
+                    // открытым — тогда ридеры не дождались бы EOF, и join завис бы.
+                    // Поэтому их не join-им, а роняем: их результат нам уже не нужен.
+                    kill_process_tree(&mut child);
+                    drop(stdout);
+                    drop(stderr);
+                    return AuthProbe {
+                        installed: true,
+                        authenticated: false,
+                        status: auth_timeout_status(timeout),
+                    };
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => {
+                kill_process_tree(&mut child);
+                return AuthProbe {
+                    installed: true,
+                    authenticated: false,
+                    status: err.to_string(),
+                };
+            }
+        }
     }
 }
 
@@ -340,6 +411,189 @@ mod tests {
         assert_eq!(first_nonempty_line("  \n\n"), None);
         assert_eq!(first_nonempty_line("WARNING: only"), None);
         assert_eq!(first_nonempty_line(""), None);
+    }
+
+    #[cfg(unix)]
+    fn write_script(name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = env::temp_dir().join(format!("clave-auth-{}-{name}.sh", std::process::id()));
+        fs::write(&path, body).expect("скрипт записан");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        path
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: i32) -> bool {
+        // kill(pid, 0) сигнал не шлёт — только проверяет, существует ли процесс.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Пробу гоняем в отдельном потоке и ждём с запасом. Смысл в том, что при откате
+    /// починки тест ОБЯЗАН УПАСТЬ, а не повиснуть: набор, висящий вечно, ничего не
+    /// сообщает — он просто вешает CI.
+    #[cfg(unix)]
+    fn probe_in_thread(binary: PathBuf, timeout: Duration) -> Receiver<AuthProbe> {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(auth_probe(&binary.to_string_lossy(), &[], timeout));
+        });
+        rx
+    }
+
+    // Провайдер, который замолчал и не выходит. Раньше `.output()` ждал бы его вечно — а
+    // пробу зовут из `App::new()` ещё до первого кадра, так что подвисший CLI морозил всю
+    // Clave на старте: пустой экран и никаких объяснений.
+    #[cfg(unix)]
+    #[test]
+    fn a_mute_provider_does_not_freeze_the_probe() {
+        let script = write_script("mute", "#!/bin/sh\nsleep 30\n");
+        let rx = probe_in_thread(script.clone(), Duration::from_secs(1));
+
+        let probe = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("проба обязана вернуться по потолку, а не ждать немого провайдера вечно");
+        let _ = fs::remove_file(&script);
+
+        assert!(probe.installed, "бинарь запустился — значит, установлен");
+        assert!(
+            !probe.authenticated,
+            "немой провайдер не может считаться залогиненным"
+        );
+        assert_eq!(
+            probe.status, "no response in 1s",
+            "статус обязан назвать причину: иначе это выглядит как «не залогинен», \
+             и пользователь пойдёт чинить логин, с которым всё в порядке"
+        );
+    }
+
+    // Внук наследует stdout пробы. Убей мы только сам CLI — внук держал бы пайп открытым,
+    // ридер не дождался бы EOF. Поэтому бьём по ГРУППЕ, и этот тест стережёт лидерство в
+    // ней: без `configure_process_group` сигнал по `-pid` не дойдёт ни до кого.
+    #[cfg(unix)]
+    #[test]
+    fn a_mute_provider_leaves_no_grandchildren() {
+        let marker = env::temp_dir().join(format!("clave-auth-pgrp-{}.pid", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let script = write_script(
+            "grandchild",
+            &format!(
+                "#!/bin/sh\nsleep 30 & echo $! > {}\nwait\n",
+                marker.to_string_lossy()
+            ),
+        );
+        let rx = probe_in_thread(script.clone(), Duration::from_secs(2));
+
+        let mut grandchild = 0;
+        for _ in 0..300 {
+            if let Some(pid) = fs::read_to_string(&marker)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+                .filter(|&pid| pid > 0)
+            {
+                grandchild = pid;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            grandchild > 0,
+            "внук должен был родиться и назвать свой pid"
+        );
+        assert!(process_alive(grandchild), "внук жив, пока проба его ждёт");
+
+        let probe = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("проба вернулась по потолку");
+        assert!(!probe.authenticated);
+
+        let mut dead = false;
+        for _ in 0..300 {
+            if !process_alive(grandchild) {
+                dead = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = fs::remove_file(&script);
+        let _ = fs::remove_file(&marker);
+        assert!(
+            dead,
+            "внук обязан умереть вместе с группой — иначе он держит пайп пробы и течёт наружу"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_takes_the_answer_of_a_live_provider() {
+        let script = write_script("ready", "#!/bin/sh\necho 'Logged in as user@example.com'\n");
+        let probe = auth_probe(&script.to_string_lossy(), &[], Duration::from_secs(10));
+        let _ = fs::remove_file(&script);
+
+        assert!(probe.installed);
+        assert!(
+            probe.authenticated,
+            "явный маркер логина обязан приниматься"
+        );
+        assert_eq!(probe.status, "Logged in as user@example.com");
+    }
+
+    // stderr и ненулевой код: провайдер ругается не в stdout, и потолок тут ни при чём —
+    // ответ обязан дойти целиком.
+    #[cfg(unix)]
+    #[test]
+    fn probe_takes_stderr_and_the_exit_code() {
+        let script = write_script(
+            "denied",
+            "#!/bin/sh\necho 'You are not logged in.' >&2\nexit 1\n",
+        );
+        let probe = auth_probe(&script.to_string_lossy(), &[], Duration::from_secs(10));
+        let _ = fs::remove_file(&script);
+
+        assert!(probe.installed, "процесс запустился — бинарь на месте");
+        assert!(!probe.authenticated);
+        assert_eq!(probe.status, "You are not logged in.");
+    }
+
+    #[test]
+    fn probe_reports_a_missing_binary() {
+        let probe = auth_probe(
+            "/nonexistent/clave-no-such-provider",
+            &[],
+            Duration::from_secs(1),
+        );
+        assert!(!probe.installed, "несуществующий бинарь — не установлен");
+        assert!(!probe.authenticated);
+        assert!(!probe.status.is_empty(), "причина обязана быть названа");
+    }
+
+    // Потолок, схлопнувшийся в ноль, — это не «строгая проверка», а поломка: пробу убивало бы
+    // сразу после спавна, и КАЖДЫЙ провайдер выглядел бы немым. Ловушка не гипотетическая:
+    // `Duration::default()` и есть ноль, и мутационный гейт показал, что без этого теста
+    // такую подмену не замечает никто.
+    #[test]
+    fn auth_timeout_is_never_zero() {
+        assert!(
+            auth_timeout() > Duration::ZERO,
+            "нулевой потолок объявил бы немым любого провайдера, даже здорового"
+        );
+    }
+
+    #[test]
+    fn auth_timeout_falls_back_on_zero_and_garbage() {
+        assert_eq!(auth_timeout_from(Some("30")), Duration::from_secs(30));
+        // Ноль убивал бы пробу сразу после спавна — провайдер не успел бы и слова сказать.
+        assert_eq!(auth_timeout_from(Some("0")), Duration::from_secs(10));
+        assert_eq!(auth_timeout_from(Some("-5")), Duration::from_secs(10));
+        assert_eq!(auth_timeout_from(Some("вечность")), Duration::from_secs(10));
+        assert_eq!(auth_timeout_from(None), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn auth_timeout_status_names_the_limit() {
+        assert_eq!(
+            auth_timeout_status(Duration::from_secs(7)),
+            "no response in 7s"
+        );
     }
 
     #[test]
