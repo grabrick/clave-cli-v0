@@ -1156,22 +1156,143 @@ mod tests {
 
     // ─────────────────────────── /mode и /roles ───────────────────────────
     //
-    // `/mode` НЕ ПОКРЫТ, и это осознанно. Здесь стоял мой тест, и он был ошибкой.
+    // `/mode` покрыт — но ПОСЛЕ шва раннера, и историю стоит помнить. Раньше `/mode` был НЕ
+    // покрыт, и это стоило CI: здесь стоял мой тест, и он падал на машине без провайдеров.
+    // Причина — последним вызовом `apply_mode` идёт `ensure_auth_ready_for_current_mode()`, а тот
+    // делал `Onboarding::new(mode)`, то есть поднимал НАСТОЯЩИЕ `claude` и `codex`. Я проверил
+    // цепочку `apply_mode` → `set_mode` → `save_current_config`, объявил путь чистым и ОСТАНОВИЛСЯ
+    // ЗА СТРОКУ ДО КОНЦА. Урок остаётся: проверять цепочку надо ДО КОНЦА, а не до места, где она
+    // подтверждает удобное мнение.
     //
-    // Мутанты `/mode` пропустили с объяснением «уходят в auth-probe (спавн CLI)». Я перепроверил
-    // цепочку — `apply_mode` → `set_mode` (только присваивание) → `save_current_config` (пишет во
-    // временный конфиг теста), — объявил путь чистым и дописал тест. И ОСТАНОВИЛСЯ ЗА ОДНУ СТРОКУ
-    // ДО КОНЦА: последним вызовом `apply_mode` идёт `ensure_auth_ready_for_current_mode()`, а он
-    // делает `Onboarding::new(mode)` — то есть поднимает НАСТОЯЩИЕ `claude` и `codex`.
-    //
-    // Цена ошибки замерена, а не предположена. На машине, где провайдеры установлены и
-    // залогинены, тест зеленел. На машине без них (то есть на CI) экран авторизации открывается
-    // ВСЕГДА, `status` становится «авторизация» вместо «mode:…», и тест падает. Он уехал в main
-    // и, скорее всего, положил там сборку.
-    //
-    // Урок не про `/mode`. Проверять цепочку надо ДО КОНЦА, а не до того места, где она
-    // подтверждает уже сложившееся мнение.
-    //
+    // Что изменилось: шов раннера провёл готовность логина через `run_hooks.authenticated`. Теперь
+    // `ensure_auth_ready_for_current_mode` на пути «залогинен» возвращается ДО `Onboarding::new`
+    // (см. app/onboarding.rs). Значит с фейком `authenticated = |_| true` вся цепочка `/mode` идёт
+    // без единого спавна процесса — путь чист в ЛЮБОМ окружении, включая CI без провайдеров.
+    // Каждый тест ниже стартует с ДРУГОГО режима и убивает delete-arm своего плеча диспетча:
+    // при удалении плеча команда ушла бы в catch-all и режим остался бы прежним.
+
+    #[test]
+    fn mode_codex_only_switches_the_running_mode() {
+        let (mut app, dir) = app_for_commands();
+        app.run_hooks.authenticated = |_| true; // логин готов → ensure_auth без Onboarding::new
+        app.mode = Mode::ClaudeOnly; // старт ОТЛИЧАЕТСЯ от цели
+
+        let out = joined(&mut app, "/mode codex-only");
+
+        assert_eq!(
+            app.mode,
+            Mode::CodexOnly,
+            "плечо codex-only обязано сменить режим; delete-arm увёл бы в catch-all: {out}"
+        );
+        assert!(
+            out.contains("Режим изменён"),
+            "нет подтверждения смены: {out}"
+        );
+        assert!(
+            app.onboarding.is_none(),
+            "готовый логин не должен открывать экран авторизации"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mode_claude_only_switches_the_running_mode() {
+        let (mut app, dir) = app_for_commands();
+        app.run_hooks.authenticated = |_| true;
+        app.mode = Mode::CodexOnly;
+
+        let out = joined(&mut app, "/mode claude-only");
+
+        assert_eq!(
+            app.mode,
+            Mode::ClaudeOnly,
+            "плечо claude-only обязано сменить режим; delete-arm увёл бы в catch-all: {out}"
+        );
+        assert!(
+            out.contains("Режим изменён"),
+            "нет подтверждения смены: {out}"
+        );
+        assert!(
+            app.onboarding.is_none(),
+            "готовый логин не должен открывать экран авторизации"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mode_claude_codex_switches_the_running_mode() {
+        let (mut app, dir) = app_for_commands();
+        app.run_hooks.authenticated = |_| true;
+        app.mode = Mode::CodexOnly;
+
+        let out = joined(&mut app, "/mode claude-codex");
+
+        assert_eq!(
+            app.mode,
+            Mode::ClaudeCodex,
+            "плечо claude-codex обязано сменить режим; delete-arm увёл бы в catch-all: {out}"
+        );
+        assert!(
+            out.contains("Режим изменён"),
+            "нет подтверждения смены: {out}"
+        );
+        assert!(
+            app.onboarding.is_none(),
+            "готовый логин не должен открывать экран авторизации"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mode_codex_claude_switches_the_running_mode() {
+        let (mut app, dir) = app_for_commands();
+        app.run_hooks.authenticated = |_| true;
+        app.mode = Mode::ClaudeOnly;
+
+        let out = joined(&mut app, "/mode codex-claude");
+
+        assert_eq!(
+            app.mode,
+            Mode::CodexClaude,
+            "плечо codex-claude обязано сменить режим; delete-arm увёл бы в catch-all: {out}"
+        );
+        assert!(
+            out.contains("Режим изменён"),
+            "нет подтверждения смены: {out}"
+        );
+        assert!(
+            app.onboarding.is_none(),
+            "готовый логин не должен открывать экран авторизации"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Мусорный аргумент /mode не трогает режим и подсказывает синтаксис (catch-all плечо).
+    #[test]
+    fn mode_with_an_unknown_argument_keeps_the_mode() {
+        let (mut app, dir) = app_for_commands();
+        app.run_hooks.authenticated = |_| true;
+        app.mode = Mode::ClaudeCodex;
+
+        let out = joined(&mut app, "/mode сосед");
+
+        assert_eq!(
+            app.mode,
+            Mode::ClaudeCodex,
+            "неизвестный режим не смеет менять mode: {out}"
+        );
+        assert!(
+            out.contains("Использование"),
+            "нет подсказки по синтаксису: {out}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // `/roles` покрыт: `set_roles` заканчивается на `push_command_result` и проверки авторизации
     // не зовёт — проверено прогоном с `CLAVE_CLAUDE=/nonexistent`.
 
