@@ -3074,13 +3074,44 @@ mod tests {
 
     // Единственный тест, который реально запускает «провайдера»: жизненный цикл процесса
     // (спавн → чтение stdout → код выхода → разбор ответа) нечем проверить иначе. Бинарь
-    // подменяем штатным env-override (он и заведён для моков); других читателей
-    // CLAVE_CLAUDE в тестах нет.
+    // подменяем штатным env-override (он и заведён для моков).
+    //
+    // Но `CLAVE_CLAUDE` — глобальная на процесс переменная, и `claude_binary()` читают многие
+    // (auth-проба, `App::new`, `provider_binaries_default_to_cli_names`). Выставь её здесь через
+    // `set_var` — и параллельный читатель в том же `cargo test` поймает путь к скрипту вместо
+    // дефолта «claude». Ровно эта гонка мигала под нагрузкой. Поэтому — как в `ui::footer` — тест
+    // перезапускает СЕБЯ дочерним процессом, где `CLAVE_CLAUDE` задана снаружи только ему; env
+    // самого `cargo test` не трогаем ни на миг.
     #[cfg(unix)]
     #[test]
     fn run_provider_once_runs_the_cli_and_maps_its_answer() {
         use std::os::unix::fs::PermissionsExt;
 
+        // Дочерний процесс: `CLAVE_CLAUDE` уже указывает на фейковый бинарь — просто гоняем.
+        if env::var(PROVIDER_CHILD).is_ok() {
+            let (tx, _rx) = mpsc::channel();
+            let (_cancel_tx, cancel_rx) = mpsc::channel();
+            let outcome = run_provider_once(
+                "claude",
+                "max",
+                "промт",
+                &env::temp_dir(),
+                RunAccess::PlanReadonly,
+                Language::Ru,
+                &tx,
+                &cancel_rx,
+            );
+
+            let step = outcome
+                .expect("провайдер запустился")
+                .expect("шаг не отменён");
+            assert_eq!(step.text, "готово");
+            assert_eq!(step.code, 0);
+            assert_eq!(step.usage.expect("usage разобран").input, 5);
+            return;
+        }
+
+        // Родитель: создаём фейковый бинарь и запускаем себя ребёнком с `CLAVE_CLAUDE` только у него.
         let script = private_temp_dir().join("fake-claude.sh");
         fs::write(
             &script,
@@ -3089,31 +3120,35 @@ mod tests {
         )
         .expect("скрипт записан");
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
-        env::set_var("CLAVE_CLAUDE", &script);
 
-        let (tx, _rx) = mpsc::channel();
-        let (_cancel_tx, cancel_rx) = mpsc::channel();
-        let outcome = run_provider_once(
-            "claude",
-            "max",
-            "промт",
-            &env::temp_dir(),
-            RunAccess::PlanReadonly,
-            Language::Ru,
-            &tx,
-            &cancel_rx,
-        );
-
-        env::remove_var("CLAVE_CLAUDE");
+        let exe = env::current_exe().expect("путь к тестовому бинарю");
+        let out = Command::new(exe)
+            .args([PROVIDER_SELF, "--exact", "--nocapture"])
+            .env(PROVIDER_CHILD, "1")
+            .env("CLAVE_CLAUDE", &script)
+            .output()
+            .expect("дочерний тест не запустился");
         let _ = fs::remove_file(&script);
 
-        let step = outcome
-            .expect("провайдер запустился")
-            .expect("шаг не отменён");
-        assert_eq!(step.text, "готово");
-        assert_eq!(step.code, 0);
-        assert_eq!(step.usage.expect("usage разобран").input, 5);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "дочерний прогон провалился:\n{stdout}{}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        // Коду возврата тут верить нельзя: с опечаткой в фильтре ребёнок гоняет НОЛЬ тестов и
+        // выходит нулём («0 passed; N filtered out») — успех из ничего. Требуем предъявить прогнанное.
+        assert!(
+            stdout.contains("1 passed"),
+            "дочерний прогон не состоялся: фильтр не нашёл тест, а ноль тестов читаются как успех. \
+             Вывод:\n{stdout}"
+        );
     }
+
+    /// Родитель говорит ребёнку взять свою ветку этого теста (и не крутить всё заново).
+    const PROVIDER_CHILD: &str = "CLAVE_TEST_RUN_PROVIDER_CHILD";
+    /// Полный путь теста — им фильтруется дочерний прогон.
+    const PROVIDER_SELF: &str = "worker::tests::run_provider_once_runs_the_cli_and_maps_its_answer";
 
     // Критично: при отмене/таймауте мы убиваем ВСЮ группу процессов, а не только сам
     // CLI. Модель «процесс → под-процесс в той же группе»: внук должен умереть вместе с
