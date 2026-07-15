@@ -209,6 +209,19 @@ impl App {
         }
     }
 
+    /// Возвращает неотправленный текст (текущий запрос + ОЧЕРЕДЬ pending) в пустой инпут.
+    /// Общее для отмены и «не залогинен»: набранное — включая поставленное в очередь —
+    /// не должно молча теряться.
+    fn restore_unsent_to_input(&mut self) {
+        let mut restore: Vec<String> = self.restore_on_cancel.take().into_iter().collect();
+        restore.extend(self.pending_messages.drain(..));
+        if !restore.is_empty() && self.input.trim().is_empty() {
+            self.input = restore.join("\n");
+            self.cursor = self.input.len();
+            self.history_index = None;
+        }
+    }
+
     pub(crate) fn drain_worker_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             // Ран кончился — агент мог закоммитить или переключить ветку. Читаем ref ДО
@@ -365,14 +378,7 @@ impl App {
                     }
                     // Возвращаем неотправленный текст (текущий запрос + очередь) в инпут,
                     // чтобы случайную отмену можно было поправить и отправить заново.
-                    let mut restore: Vec<String> =
-                        self.restore_on_cancel.take().into_iter().collect();
-                    restore.extend(self.pending_messages.drain(..));
-                    if !restore.is_empty() && self.input.trim().is_empty() {
-                        self.input = restore.join("\n");
-                        self.cursor = self.input.len();
-                        self.history_index = None;
-                    }
+                    self.restore_unsent_to_input();
                 }
                 WorkerEvent::Failed(message) => {
                     self.running = false;
@@ -404,17 +410,12 @@ impl App {
                     self.live_answer.clear();
                     self.live_reasoning.clear();
                     self.reset_ask();
-                    self.pending_messages.clear();
                     // Не залогинены — реплику не отправили: убираем из живого блока и
-                    // возвращаем текст в инпут, чтобы повторить после логина.
+                    // возвращаем неотправленный текст (текущий запрос + ОЧЕРЕДЬ) в инпут,
+                    // чтобы после логина ничего не пришлось набирать заново. Раньше здесь
+                    // pending_messages молча очищались — набранное в очередь терялось.
                     self.live_turn = None;
-                    if let Some(text) = self.restore_on_cancel.take() {
-                        if self.input.trim().is_empty() {
-                            self.input = text;
-                            self.cursor = self.input.len();
-                            self.history_index = None;
-                        }
-                    }
+                    self.restore_unsent_to_input();
                     self.prompt_provider_login(provider);
                 }
             }
@@ -503,6 +504,27 @@ mod tests {
                 allow_custom: true,
             }],
         }
+    }
+
+    /// И отмена, и «не залогинен» обязаны вернуть в инпут не только текущий запрос, но и
+    /// ВСЮ очередь pending. Раньше AuthMissing очищал очередь молча — введённое терялось.
+    #[test]
+    fn restore_unsent_returns_current_message_and_the_queue() {
+        let (mut app, _dir) = app_for_events();
+        app.restore_on_cancel = Some("первое".to_string());
+        app.pending_messages.push_back("второе".to_string());
+        app.pending_messages.push_back("третье".to_string());
+
+        app.restore_unsent_to_input();
+
+        assert_eq!(
+            app.input, "первое\nвторое\nтретье",
+            "и текущий запрос, и вся очередь вернулись в инпут"
+        );
+        assert!(
+            app.pending_messages.is_empty(),
+            "очередь опустошена переносом в инпут, а не потеряна"
+        );
     }
 
     /// Главный контракт ответа: то, что прислал провайдер, обязано ОКАЗАТЬСЯ В ЛЕНТЕ —

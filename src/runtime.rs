@@ -346,9 +346,30 @@ fn key_press(event: Event) -> Option<KeyEvent> {
 fn apply_event(app: &mut App, event: Event) {
     match event {
         Event::Paste(text) => {
-            // Вставка целиком (с переносами) идёт в инпут, а не дробится на отправки.
             app.finish_reveal_now();
-            app.paste_into_input(&text);
+            // Вставка идёт в тот буфер, что СЕЙЧАС владеет вводом, а не всегда в главный
+            // композер: иначе поверх открытого поиска/inline-селектора текст молча уходил
+            // не туда и всплывал в композере при закрытии оверлея. Управляющие символы
+            // (переносы) в однострочные поля не тащим — как и обычный ввод клавишами.
+            if app.ask_active() {
+                if app.ask_on_custom_row() {
+                    for ch in text.chars().filter(|c| !c.is_control()) {
+                        app.ask_custom_push(ch);
+                    }
+                }
+            } else {
+                match app.overlay {
+                    // Главный композер: вставка целиком (с переносами), не дробится на отправки.
+                    Overlay::None => app.paste_into_input(&text),
+                    Overlay::Search => {
+                        for ch in text.chars().filter(|c| !c.is_control()) {
+                            app.search_input(ch);
+                        }
+                    }
+                    // Оверлеи без текстового ввода (подсказки и пр.) вставку игнорируют.
+                    _ => {}
+                }
+            }
         }
         // Ресайз (в т.ч. после сна ПК / смены монитора): терминал перелил содержимое,
         // кэш позиций живого блока устарел → перерисовать с нуля.
@@ -1764,6 +1785,27 @@ mod tests {
             )),
         );
         assert_eq!(app.input, "а", "отпускание клавиши НЕ печатает второй раз");
+    }
+
+    #[test]
+    fn a_paste_while_search_is_open_goes_to_the_query_not_the_composer() {
+        // Поиск открыт (не модалка → обрабатывается в главном цикле). Вставка обязана
+        // уйти в поисковый запрос, а не молча в скрытый главный композер, откуда потом
+        // всплыла бы при закрытии поиска.
+        let mut app = app_for_keys();
+        app.open_search();
+        assert_eq!(app.overlay, Overlay::Search);
+
+        apply_event(&mut app, Event::Paste("иголка".to_string()));
+
+        assert_eq!(
+            app.search_query, "иголка",
+            "вставка ушла в поисковый запрос"
+        );
+        assert!(
+            app.input.is_empty(),
+            "и НЕ в главный композер (раньше уходила туда молча)"
+        );
     }
 
     #[test]
