@@ -66,6 +66,12 @@ impl ChatMode {
         }
     }
 
+    /// Режим не меняет файлы и не запускает команды (нет Edit/Write/Bash, песочница
+    /// read-only). Plan и FullAccess правят рабочую директорию, поэтому не read-only.
+    pub(crate) fn is_read_only(self) -> bool {
+        matches!(self, ChatMode::Discussion | ChatMode::Tandem)
+    }
+
     pub(crate) fn prompt_hint(self, lang: Language) -> &'static str {
         match self {
             ChatMode::Discussion => lang.choose(
@@ -118,5 +124,11 @@ mod tests {
 
         // Tandem существует в цикле и имеет метку
         assert!(ChatMode::Tandem.label(Language::En).contains("Tandem"));
+
+        // Read-only: Discussion и Tandem не правят ФС; Plan и FullAccess — правят.
+        assert!(ChatMode::Discussion.is_read_only());
+        assert!(ChatMode::Tandem.is_read_only());
+        assert!(!ChatMode::Plan.is_read_only());
+        assert!(!ChatMode::FullAccess.is_read_only());
     }
 }
