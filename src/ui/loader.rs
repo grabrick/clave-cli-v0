@@ -304,4 +304,97 @@ mod tests {
         assert!(en.contains(&en_verb), "en verb из своего набора");
         assert!(!ru.contains(&en_verb), "en не из ru-набора");
     }
+
+    // ЧАСТЬ 1 — 15:44 `delete !` в loader_line.
+    // Активность включается ТОЛЬКО через run_activity (существующий тест бьёт
+    // активность через live_answer — потому мутант и выжил).
+    #[test]
+    fn loader_shimmers_on_tool_activity_alone() {
+        let mut app = App::new();
+        app.run_started_at = Some(Instant::now());
+        // reasoning/answer пусты, активности нет → статичная фраза (мало спанов).
+        let idle = loader_line(&app);
+        // Только активность инструментов → active=true → шиммер (спан на символ).
+        app.run_activity = vec!["reading file".to_string()].into();
+        let active = loader_line(&app);
+        assert!(
+            active.spans.len() > idle.spans.len(),
+            "активность инструментов зажигает шиммер: idle={} active={}",
+            idle.spans.len(),
+            active.spans.len()
+        );
+    }
+
+    // ЧАСТЬ 2 — 117:20 `> → ==` и `> → >=` в reasoning_snippet.
+    #[test]
+    fn reasoning_snippet_truncates_when_over_cap() {
+        // width=20 ⇒ cap=15. Строка длиннее cap → префикс '…' и обрезка.
+        // Мутант `==` (20==15 ложь) вернёт полную строку без '…'.
+        let snippet = reasoning_snippet(&"a".repeat(20), 20).unwrap();
+        assert!(
+            snippet.starts_with('…'),
+            "длинную мысль обрезаем: {snippet}"
+        );
+    }
+
+    #[test]
+    fn reasoning_snippet_keeps_exact_cap_length() {
+        // width=21 ⇒ cap=16. Строка РОВНО cap → отдаём как есть (16>16 ложь).
+        // Мутант `>=` (16>=16 истина) обрежет и добавит '…'.
+        let snippet = reasoning_snippet(&"b".repeat(16), 21).unwrap();
+        assert_eq!(
+            snippet,
+            "b".repeat(16),
+            "ровно по cap — без обрезки: {snippet}"
+        );
+    }
+
+    // ЧАСТЬ 3 — 128:5 замена тела на vec![] / vec![Default::default()].
+    #[test]
+    fn loader_activity_lines_render_each_activity() {
+        let mut app = App::new();
+        app.run_activity = vec!["reading main.rs".to_string()].into();
+        let lines = loader_activity_lines(&app, 80);
+        assert!(
+            lines
+                .iter()
+                .any(|l| line_text(l).contains("reading main.rs")),
+            "активность видна отдельной строкой ⎿"
+        );
+    }
+
+    // ЧАСТЬ 4 — 173:55 `% → /` и 173:46 `- → +` в theme_shimmer_color.
+    #[test]
+    fn theme_shimmer_color_wraps_by_modulo() {
+        // (index=2, tick=0): (2+5-0)%5 = 2 → accent_soft. Мутант `/`: 7/5=1 → accent.
+        assert_eq!(
+            theme_shimmer_color(Theme::Amber, 2, 0),
+            Theme::Amber.accent_soft()
+        );
+    }
+
+    #[test]
+    fn theme_shimmer_color_shifts_phase_backwards() {
+        // (index=0, tick=1): phase=1, (0+5-1)%5 = 4 → accent_dim.
+        // Мутант `+`: (0+5+1)%5 = 1 → accent.
+        assert_eq!(
+            theme_shimmer_color(Theme::Amber, 0, 1),
+            Theme::Amber.accent_dim()
+        );
+    }
+
+    // ЧАСТЬ 5 — format_elapsed, 7 мутантов на границах.
+    #[test]
+    fn format_elapsed_covers_all_boundaries() {
+        // 179:14 `< → ==`: 30 секунд остаётся секундами.
+        assert_eq!(format_elapsed(Duration::from_secs(30)), "30s");
+        // 179:14 `< → <=`: ровно минута переходит в «Nm».
+        assert_eq!(format_elapsed(Duration::from_secs(60)), "1m 00s");
+        // 185:16 `< → <=`: ровно час переходит в «Nh».
+        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1h 00m");
+        // 189:25 `/ → *` и 190:27 `% → +`: час и одна минута.
+        assert_eq!(format_elapsed(Duration::from_secs(3660)), "1h 01m");
+        // 189:25 `/ → %` и 190:27 `% → /`: ровно два часа.
+        assert_eq!(format_elapsed(Duration::from_secs(7200)), "2h 00m");
+    }
 }
