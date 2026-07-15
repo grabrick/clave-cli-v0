@@ -217,6 +217,11 @@ pub(crate) fn wrap_chars(text: &str, max_chars: usize) -> Vec<String> {
     if !current.is_empty() {
         rows.push(current);
     }
+    if rows.is_empty() {
+        // Непустой вход (например, строка из одних пробелов) не дал ни одной строки:
+        // возвращаем пустую строку, чтобы строка-разделитель сохранила вертикальное место.
+        rows.push(String::new());
+    }
     rows
 }
 
@@ -317,6 +322,13 @@ mod tests {
     #[test]
     fn wrap_chars_keeps_a_combining_mark_attached_to_its_base() {
         assert_eq!(wrap_chars("e\u{0301}", 1), vec!["e\u{0301}"]);
+    }
+
+    /// Строка из одних пробелов не должна ИСЧЕЗАТЬ: непустой вход обязан дать хотя бы
+    /// одну (пустую) строку, иначе строка-разделитель теряет вертикальное место в ленте.
+    #[test]
+    fn wrap_chars_keeps_a_whitespace_only_line_as_one_empty_row() {
+        assert_eq!(wrap_chars("   ", 6), vec![""]);
     }
 
     // ── input_cursor_position_wrapped: (визуальная строка, колонка) ──────────

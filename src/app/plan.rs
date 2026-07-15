@@ -104,6 +104,8 @@ impl App {
         self.input.clear();
         self.cursor = 0;
         self.push_system(self.lang.choose("⏹ План отменён.", "⏹ Plan cancelled."));
+        // Гейт закрыт — если в очереди ждут сообщения, возобновляем, а не морозим их.
+        self.process_pending_messages();
     }
 
     /// Решение на гейте: Enter с пустым инпутом — выполнить, с текстом — доработать.

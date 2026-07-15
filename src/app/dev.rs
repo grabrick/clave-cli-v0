@@ -100,7 +100,10 @@ fn resolve_clave_dev(git_root: &Path) -> Option<(String, Vec<String>, Option<Str
 
 /// Читатель stdout супервайзера: каждую обрамлённую строку прогоняем через
 /// `format_dev_lines` перед показом (спека §5). stderr читается обычным `spawn_reader`.
-fn spawn_dev_reader<R: std::io::Read + Send + 'static>(reader: R, tx: Sender<WorkerEvent>) {
+fn spawn_dev_reader<R: std::io::Read + Send + 'static>(
+    reader: R,
+    tx: Sender<WorkerEvent>,
+) -> thread::JoinHandle<()> {
     use std::io::BufRead;
     thread::spawn(move || {
         let reader = std::io::BufReader::new(reader);
@@ -111,7 +114,7 @@ fn spawn_dev_reader<R: std::io::Read + Send + 'static>(reader: R, tx: Sender<Wor
                 let _ = tx.send(WorkerEvent::Line(shown));
             }
         }
-    });
+    })
 }
 
 impl App {
@@ -311,9 +314,10 @@ impl App {
                     return;
                 }
             };
-            if let Some(out) = child.stdout.take() {
-                spawn_dev_reader(out, tx.clone());
-            }
+            let mut report_reader = child
+                .stdout
+                .take()
+                .map(|out| spawn_dev_reader(out, tx.clone()));
             if let Some(err) = child.stderr.take() {
                 spawn_reader(err, tx.clone()); // сырьё stderr — как Line (raw)
             }
@@ -325,6 +329,12 @@ impl App {
                 }
                 match child.try_wait() {
                     Ok(Some(status)) => {
+                        // Дожидаемся, пока ридер сольёт последние строки ОТЧЁТА, прежде чем
+                        // слать Done — иначе «finished — см. отчёт выше» мог напечататься
+                        // раньше хвоста самого отчёта.
+                        if let Some(reader) = report_reader.take() {
+                            let _ = reader.join();
+                        }
                         let _ = tx.send(WorkerEvent::Done(status.code().unwrap_or(1)));
                         return;
                     }

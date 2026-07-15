@@ -1578,10 +1578,13 @@ where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
+        // read_to_end + lossy, а НЕ read_to_string: один невалидный UTF-8 байт заставил бы
+        // read_to_string вернуть Err и не дописать прочитанное — весь вывод обнулился бы,
+        // что может перевернуть вердикт авторизации. Лоссовое декодирование сохраняет текст.
         let mut reader = BufReader::new(reader);
-        let mut text = String::new();
-        let _ = reader.read_to_string(&mut text);
-        text
+        let mut bytes = Vec::new();
+        let _ = reader.read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
     })
 }
 
@@ -2705,6 +2708,20 @@ mod tests {
         .expect("прогон не падает");
         assert_eq!(calls, 1, "мутирующий ран не повторяется");
         assert!(matches!(result, ChatRunResult::Completed(1, ..)));
+    }
+
+    #[test]
+    fn capture_reader_keeps_output_despite_invalid_utf8() {
+        // Один невалидный UTF-8 байт (0xFF) между валидными: read_to_string вернул бы Err
+        // и обнулил ВЕСЬ вывод (мог перевернуть вердикт авторизации). Лоссовое чтение спасает.
+        let data = b"ok\xFFmore".to_vec();
+        let out = spawn_capture_reader(std::io::Cursor::new(data))
+            .join()
+            .expect("ридер завершился");
+        assert!(
+            out.contains("ok") && out.contains("more"),
+            "текст вокруг битого байта не потерян: {out:?}"
+        );
     }
 
     #[test]

@@ -247,10 +247,12 @@ fn abbreviate_home(path: &Path) -> String {
 fn abbreviate_with_home(path: &Path, home: Option<&str>) -> String {
     let shown = path.display().to_string();
     match home {
-        Some(home) if !home.is_empty() => shown
-            .strip_prefix(home)
-            .map(|rest| format!("~{rest}"))
-            .unwrap_or(shown),
+        Some(home) if !home.is_empty() => match shown.strip_prefix(home) {
+            // «~» только если HOME — ЦЕЛЫЙ компонент пути: дальше либо конец, либо '/'.
+            // Иначе при HOME=/home/bob путь /home/bobby/project стал бы «~by/project».
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
+            _ => shown,
+        },
         _ => shown,
     }
 }
@@ -466,9 +468,15 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     let was_revealing = app.reveal.is_some();
     app.finish_reveal_now();
     // Если эта клавиша только что до-печатала прозу и открыла селектор — не даём ей
-    // же дёрнуть его (иначе Enter мог бы случайно подтвердить первый вариант).
+    // же дёрнуть его (иначе Enter мог бы случайно подтвердить первый вариант). Но
+    // Ctrl+C пропускаем: пользователь обязан мочь прервать/выйти этой же клавишей,
+    // иначе нажатие, открывшее селектор, глотало бы и попытку остановиться.
     if was_revealing && app.ask_active() {
-        return;
+        let is_ctrl_c =
+            key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c'));
+        if !is_ctrl_c {
+            return;
+        }
     }
 
     if app.onboarding.is_some() {
@@ -1596,6 +1604,18 @@ mod tests {
         assert_eq!(
             abbreviate_with_home(Path::new("/usr/local/bin"), Some("/Users/кто-то")),
             "/usr/local/bin"
+        );
+        // Совпадение по СТРОКЕ, но не по компоненту пути: чужой каталог с общим префиксом
+        // не смеет маскироваться под домашний (HOME=/Users/кто-то, путь /Users/кто-тоXX/…).
+        assert_eq!(
+            abbreviate_with_home(Path::new("/Users/кто-тоXX/проект"), Some("/Users/кто-то")),
+            "/Users/кто-тоXX/проект",
+            "префикс без границы компонента не даёт тильду"
+        );
+        // Сам HOME без хвоста → просто тильда.
+        assert_eq!(
+            abbreviate_with_home(Path::new("/Users/кто-то"), Some("/Users/кто-то")),
+            "~"
         );
         // ПУСТОЙ HOME — ловушка: `strip_prefix("")` срабатывает на любом пути, и без отсечки
         // каждый путь превратился бы в «~/…», включая системные.

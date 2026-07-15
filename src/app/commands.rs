@@ -328,11 +328,19 @@ impl App {
                 }
             }
             "/clear" => {
-                if rest.trim() == "history" {
-                    self.clear_all_chats();
-                } else {
+                let arg = rest.trim();
+                if arg.is_empty() {
                     // Как /clear в Claude: контекст И текущий именованный чат уходят.
                     self.clear_current_chat();
+                } else if arg == "history" {
+                    self.clear_all_chats();
+                } else {
+                    // Неизвестный аргумент НЕ трактуем как «удалить»: показываем подсказку.
+                    // Иначе опечатка (/clear all, /clear histor) молча стёрла бы текущий чат.
+                    self.push_system(self.lang.choose(
+                        "Использование: /clear (текущий чат) · /clear history (все чаты)",
+                        "Usage: /clear (current chat) · /clear history (all chats)",
+                    ));
                 }
             }
             "/quit" | "/exit" => self.should_quit = true,
@@ -800,6 +808,24 @@ mod tests {
 
     fn joined(app: &mut App, line: &str) -> String {
         run(app, line).join("\n")
+    }
+
+    #[test]
+    fn clear_with_an_unknown_argument_keeps_the_current_chat() {
+        let (mut app, _dir) = app_for_commands();
+        app.push_system("важное сообщение"); // создаёт файл текущего чата
+        assert!(app.chat_path.exists(), "файл текущего чата создан");
+
+        let echoed = run(&mut app, "/clear all"); // опечатка / неизвестный аргумент
+
+        assert!(
+            app.chat_path.exists(),
+            "неизвестный аргумент /clear НЕ должен молча удалять текущий чат"
+        );
+        assert!(
+            echoed.iter().any(|l| l.contains("Использование")),
+            "вместо удаления показана подсказка: {echoed:?}"
+        );
     }
 
     const BUSY: &str = "Clave уже выполняется.";
