@@ -1176,6 +1176,12 @@ where
             lang.choose("финальная правка", "final fix"),
             &step.text,
         );
+        // Фаза правки — мутирующая (PlanExecute). Её ошибку/таймаут НЕ глотаем, как и
+        // фазы дебатов/исполнения: иначе провалившийся прогон отдал бы код 0 (успех).
+        if step.code != 0 {
+            dirty_notice(tx);
+            return Ok(TandemResult::Completed(step.code, opt_usage(total)));
+        }
 
         let confirm = tandem_confirm_prompt(task, &transcript.render(), lang);
         let step = match run_step(critic, critic_effort, &confirm, RunAccess::PlanReadonly)? {
@@ -1197,6 +1203,11 @@ where
             ),
             &step.text,
         );
+        // Провал самой фазы подтверждения (код≠0/таймаут) тоже не выдаём за успех.
+        if step.code != 0 {
+            dirty_notice(tx);
+            return Ok(TandemResult::Completed(step.code, opt_usage(total)));
+        }
         if !parse_tandem_signal(&step.text) {
             tandem_notice(
                 tx,
@@ -2807,6 +2818,29 @@ mod tests {
             calls,
             notices,
             chat,
+        }
+    }
+
+    #[test]
+    fn tandem_reports_a_failing_fix_phase_instead_of_success() {
+        // Дебаты→консенсус→исполнение→ревью с замечаниями→ФАЗА ПРАВКИ падает (code 7).
+        // Раньше код фазы правки игнорировался и тандем отдавал 0 (успех); теперь — её код.
+        let run = fake_tandem(
+            vec![
+                step("предложение"),
+                step("TANDEM: CONSENSUS"),
+                step("сделал"),
+                step("есть замечания"), // ревью без консенсуса → review_ok=false → фаза правки
+                failing_step(7),        // финальная правка упала
+            ],
+            3,
+            None,
+        );
+        match run.result {
+            TandemResult::Completed(code, _) => {
+                assert_eq!(code, 7, "провал фазы правки отдаётся кодом, а не 0")
+            }
+            TandemResult::Cancelled => panic!("не отменяли — правка провалилась"),
         }
     }
 

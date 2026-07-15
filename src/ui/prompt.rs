@@ -4,12 +4,21 @@ pub(crate) fn draw_prompt_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let lines = input_lines_wrapped(&app.input, area.width);
     let command_mode = normalized_command_query(&app.input).is_some();
     let tick = current_effort_tick();
-    let mut rendered = Vec::new();
+    let (cursor_line, col) = input_cursor_position_wrapped(&app.input, app.cursor, area.width);
 
+    // Область под сам ввод = высота композера минус две полоски. Когда строк ввода
+    // больше (многострочная вставка), прокручиваем окно так, чтобы строка курсора
+    // всегда оставалась видимой. Иначе курсор «отрывался» от текста, а хвост ввода
+    // просто не показывался.
+    let visible = area.height.saturating_sub(2).max(1) as usize;
+    let scroll = cursor_line.saturating_sub(visible.saturating_sub(1));
+
+    let mut rendered = Vec::new();
     // Верхняя полоска композера со встроенной у правого края плашкой названия чата.
     rendered.push(prompt_top_rule_line(area.width, command_mode, tick, app));
-    for (index, line) in lines.iter().enumerate() {
-        let prefix = if index == 0 { "› " } else { "  " };
+    for (offset, line) in lines.iter().skip(scroll).take(visible).enumerate() {
+        // Маркер «›» — только на самой первой строке ВВОДА, даже если она прокручена вверх.
+        let prefix = if scroll + offset == 0 { "› " } else { "  " };
         rendered.push(Line::from(vec![
             Span::styled(
                 prefix,
@@ -29,9 +38,9 @@ pub(crate) fn draw_prompt_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     frame.render_widget(Paragraph::new(rendered), area);
 
-    let (line_index, col) = input_cursor_position_wrapped(&app.input, app.cursor, area.width);
-    // +1: над первой строкой ввода только верхняя полоска (плашка встроена в неё).
-    let cursor_y = area.y + 1 + (line_index as u16).min(area.height.saturating_sub(2));
+    // +1: над первой видимой строкой ввода только верхняя полоска (плашка встроена в неё).
+    // Курсор считаем ОТНОСИТЕЛЬНО окна прокрутки, поэтому он всегда в видимой области.
+    let cursor_y = area.y + 1 + (cursor_line - scroll) as u16;
     let cursor_x = area.x + 2 + col as u16;
     let max_x = area.x + area.width.saturating_sub(1);
     frame.set_cursor_position(Position::new(cursor_x.min(max_x), cursor_y));
@@ -183,6 +192,45 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    // ── Прокрутка композера ──────────────────────────────────────────────────
+
+    /// Многострочный ввод (вставка) выше композера: строка курсора ОБЯЗАНА оставаться
+    /// видимой за счёт вертикальной прокрутки окна. Раньше скролла не было — курсор
+    /// «отрывался» от текста, а хвост ввода не показывался.
+    #[test]
+    fn composer_scrolls_to_keep_the_cursor_line_visible() {
+        let mut app = prompt_app();
+        // 12 строк ввода; курсор в самом конце (на последней, L11).
+        app.input = (0..12)
+            .map(|i| format!("L{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.cursor = app.input.len();
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 10,
+        };
+        let (buffer, cursor) = draw_into(&app, area, 40, 10);
+        let rows = buffer_rows(&buffer);
+
+        assert!(
+            rows.iter().any(|r| r.contains("L11")),
+            "строка курсора обязана быть видна:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            (cursor.y as usize) < rows.len() && rows[cursor.y as usize].contains("L11"),
+            "курсор стоит на своей (последней) строке, а не съехал"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("L00")),
+            "начало ввода прокручено вверх, а не залезло на курсор"
+        );
     }
 
     // ── Часть 1. top_rule_line_with_title ────────────────────────────────────
