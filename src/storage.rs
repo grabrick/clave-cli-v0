@@ -139,9 +139,13 @@ pub(crate) fn config_path() -> PathBuf {
 }
 
 pub(crate) fn load_config(path: &Path) -> AppConfig {
-    let Ok(content) = fs::read_to_string(path) else {
+    // Читаем БАЙТАМИ и декодируем лоссово: один битый UTF-8 байт не должен обнулять
+    // весь конфиг (read_to_string упал бы целиком → старт на дефолтах, а следующий save
+    // затёр бы существующий файл). Так уцелеют все валидные строки key=value.
+    let Ok(bytes) = fs::read(path) else {
         return AppConfig::default();
     };
+    let content = String::from_utf8_lossy(&bytes);
 
     let mut config = AppConfig::default();
     let mut legacy_effort = None;
@@ -287,12 +291,19 @@ fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     }
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("clave");
     let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
-    {
+    let result = (|| {
         let mut file = fs::File::create(&tmp)?;
         file.write_all(contents)?;
         file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)
+    })();
+    // При сбое записи/синка/переименования не оставляем осиротевший .tmp в каталоге
+    // состояния (иначе они копятся). На успехе tmp уже переименован — удалять нечего.
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, path)
+    result
 }
 
 /// Убирает символы, которые разбили бы построчный `key="value"`-формат конфига (переводы
@@ -761,6 +772,45 @@ mod tests {
         let path = dir.join(name);
         fs::write(&path, content).expect("write config");
         load_config(&path)
+    }
+
+    #[test]
+    fn config_survives_an_invalid_utf8_byte() {
+        let dir = temp_case("config-bad-utf8");
+        let path = dir.join("config");
+        let saved = AppConfig {
+            rounds: 7,
+            lang: Language::En,
+            ..AppConfig::default()
+        };
+        save_config(&path, &saved).expect("save");
+
+        // Вставляем битую UTF-8 строку в середину: реальные строки key=value уцелеют,
+        // битая пропустится (нет '='). Раньше read_to_string падал на 0xFF целиком → ВСЕ
+        // дефолты, и следующий save затёр бы существующий файл.
+        let mut bytes = fs::read(&path).expect("read");
+        if let Some(nl) = bytes.iter().position(|&b| b == b'\n') {
+            bytes.splice(nl + 1..nl + 1, [0xFF, b'\n']);
+        }
+        fs::write(&path, &bytes).expect("rewrite");
+
+        let loaded = load_config(&path);
+        assert_eq!(loaded.rounds, 7, "rounds уцелел, несмотря на битый байт");
+        assert_eq!(loaded.lang, Language::En, "lang уцелел");
+    }
+
+    #[test]
+    fn write_atomic_removes_the_tmp_file_when_the_write_fails() {
+        let dir = temp_case("atomic-fail");
+        // Пишем «в» существующий подкаталог: rename файла НА каталог падает.
+        let target = dir.join("subdir");
+        fs::create_dir_all(&target).expect("mkdir");
+
+        let result = write_atomic(&target, b"data");
+
+        assert!(result.is_err(), "rename файла на каталог обязан упасть");
+        let tmp = dir.join(format!(".subdir.{}.tmp", std::process::id()));
+        assert!(!tmp.exists(), "осиротевший .tmp убран после сбоя записи");
     }
 
     #[test]

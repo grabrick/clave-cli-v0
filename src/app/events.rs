@@ -308,6 +308,10 @@ impl App {
                         self.pending_plan = None;
                         self.status = self.lang.choose("ошибка плана", "plan failed").to_string();
                     }
+                    // Провал плана не открывает гейт → очередь pending должна возобновиться,
+                    // как после обычного завершения рана. На успехе pending_plan занят, и
+                    // process_pending_messages сам выйдет по plan_gate_active.
+                    self.process_pending_messages();
                 }
                 WorkerEvent::Cancelled => {
                     self.running = false;
