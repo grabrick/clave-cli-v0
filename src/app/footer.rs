@@ -246,4 +246,203 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(got, None);
     }
+
+    /// App без онбординга и auth-проб: `from_config` с `onboarding_done: true` не будит
+    /// Onboarding и не спавнит провайдерские пробы (иначе тест зелен локально, флейкует на CI).
+    /// `onboarding_done: true` ⇒ `app.onboarding == None` — это нужно palette-тестам.
+    fn footer_app() -> App {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let dir = env::temp_dir().join(format!(
+            "clave-footer-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let config = AppConfig {
+            onboarding_done: true,
+            ..AppConfig::default()
+        };
+        let mut app = App::from_config(
+            config,
+            dir.join("config.json"),
+            dir.join("history"),
+            dir.clone(),
+        );
+        app.lang = Language::En;
+        app
+    }
+
+    // ── ЧАСТЬ 1: push_command_invocation (35:9 →()) ─────────────────────────
+    /// Вызванная команда попадает в ленту строкой «❯ {command}». Ловит `35:9 →()`
+    /// (без тела ленты не пополнится и строки «❯ build» не будет).
+    #[test]
+    fn push_command_invocation_appends_prompt_line() {
+        let mut app = footer_app();
+        let before = app.transcript.len();
+        app.push_command_invocation("build");
+        assert!(
+            app.transcript.len() > before,
+            "лента не выросла после вызова команды"
+        );
+        assert!(
+            app.transcript.iter().any(|line| line.contains("❯ build")),
+            "лента не получила строку вызова команды: {:?}",
+            app.transcript
+        );
+    }
+
+    // ── ЧАСТЬ 2: expire_footer_notice (47:9, 50:53, 55:28) ──────────────────
+    /// Свежая подсказка не гаснет. Ловит `50:53 > → <` (`0 < 2s` = true → погасило бы свежую).
+    #[test]
+    fn fresh_footer_notice_survives_expire() {
+        let mut app = footer_app();
+        app.footer_notice = Some(("hi".to_string(), Instant::now()));
+        app.expire_footer_notice();
+        assert!(
+            app.footer_notice.is_some(),
+            "свежая подсказка не должна гаснуть"
+        );
+    }
+
+    /// Подсказка старше 2с гаснет. Ловит `47:9 →()` (не гасит), `50:53 > → ==`
+    /// (`3s == 2s` = false → не гасит) и `50:53 > → <` (`3s < 2s` = false → не гасит).
+    #[test]
+    fn stale_footer_notice_expires() {
+        let mut app = footer_app();
+        app.footer_notice = Some(("hi".to_string(), Instant::now() - Duration::from_secs(3)));
+        app.expire_footer_notice();
+        assert!(
+            app.footer_notice.is_none(),
+            "просроченная подсказка должна погаснуть"
+        );
+    }
+
+    /// При гашении просроченной подсказки статус «confirm exit» сбрасывается в «ready».
+    /// Ловит `55:28 == → !=` (при равенстве `!=` ложно → статус не сбросился бы).
+    #[test]
+    fn expiring_notice_resets_confirm_exit_status() {
+        let mut app = footer_app();
+        app.status = "confirm exit".to_string();
+        app.footer_notice = Some(("hi".to_string(), Instant::now() - Duration::from_secs(3)));
+        app.expire_footer_notice();
+        assert_eq!(
+            app.status, "ready",
+            "статус подтверждения выхода не сброшен"
+        );
+    }
+
+    // ── ЧАСТЬ 3: refresh_command_palette_state (62:9, 63:13, 64:13, 64:16) ───
+    /// Ввод-команда при закрытом overlay и без онбординга открывает палитру. Ловит
+    /// `62:9 →()` (не активирует) и `64:16 delete !` (у закрытого overlay `is_open()` = false → не активирует).
+    #[test]
+    fn command_input_opens_palette() {
+        let mut app = footer_app();
+        app.input = "/help".to_string();
+        app.refresh_command_palette_state();
+        assert!(
+            app.command_palette_opened_at.is_some(),
+            "палитра не открылась на команде"
+        );
+        assert_eq!(app.command_palette_query, "/help");
+    }
+
+    /// Обычный текст (без '/') палитру не открывает. Ловит `63:13 && → ||`
+    /// (A = false, но B && C = true → `||` дало бы active = true → открыло бы палитру).
+    #[test]
+    fn plain_input_keeps_palette_closed() {
+        let mut app = footer_app();
+        app.input = "hello".to_string();
+        app.refresh_command_palette_state();
+        assert!(
+            app.command_palette_opened_at.is_none(),
+            "палитра не должна открываться на не-команде"
+        );
+    }
+
+    /// При открытом overlay палитра не открывается даже на команде. Ловит `64:13 && → ||`
+    /// (!is_open = false, но A && B = true → `||` дало бы true → открыло бы палитру).
+    #[test]
+    fn open_overlay_blocks_palette() {
+        let mut app = footer_app();
+        app.input = "/help".to_string();
+        app.overlay = Overlay::Search;
+        app.refresh_command_palette_state();
+        assert!(
+            app.command_palette_opened_at.is_none(),
+            "при открытом overlay палитра не должна открываться"
+        );
+    }
+
+    // ── ЧАСТЬ 4: refresh_footer_right_state (77:9, 83:35, 92:52) ────────────
+    /// Пустой правый текст заполняется целевым сегментом. Ловит `77:9 →()` (остался бы пустым).
+    ///
+    /// Не сверяем с заранее вычисленным target: слот вращается по стенным часам (`(unix/8) % N`),
+    /// и на 8-секундной границе значения разошлись бы (флейк). Устойчиво: результат непуст и
+    /// принадлежит набору сегментов — сам набор от фазы не зависит.
+    #[test]
+    fn empty_footer_right_takes_target() {
+        let mut app = footer_app();
+        assert!(app.footer_right_text.is_empty());
+        app.refresh_footer_right_state();
+        assert!(
+            !app.footer_right_text.is_empty(),
+            "пустой правый слот не заполнился"
+        );
+        assert!(
+            footer_right_segments(&app).contains(&app.footer_right_text),
+            "правый слот не из набора сегментов: {:?}",
+            app.footer_right_text
+        );
+    }
+
+    /// Смена текста сохраняет предыдущий и ставит метку времени. Ловит `83:35 != → ==`
+    /// (`text != next` истинно, но `==` ложно → ветку пропустило бы, текст остался бы старым).
+    ///
+    /// «SENTINEL-OLD» заведомо не настоящий сегмент, поэтому `next != text` истинно при любой
+    /// фазе — флейка нет.
+    #[test]
+    fn footer_right_change_records_previous() {
+        let mut app = footer_app();
+        app.footer_right_text = "SENTINEL-OLD".to_string();
+        app.refresh_footer_right_state();
+        assert_ne!(app.footer_right_text, "SENTINEL-OLD", "текст не обновился");
+        assert_eq!(
+            app.footer_right_previous_text,
+            Some("SENTINEL-OLD".to_string())
+        );
+        assert!(app.footer_right_changed_at.is_some());
+    }
+
+    /// Просроченная (>820мс) смена очищает previous/changed_at. Ловит `92:52 > → ==`
+    /// (`900 == 820` ложь → не чистит) и `92:52 > → <` (`900 < 820` ложь → не чистит).
+    ///
+    /// Чтобы дойти до ветки transition_done, нужен текст, равный target. Слот вращается по
+    /// стенным часам, поэтому редкая 8-секундная граница между чтением target и refresh увела бы
+    /// в ветку «текст сменился». Retry: берём свежий app и повторяем, пока текст остался равен
+    /// target (фаза не прыгнула) — только тогда мы в нужной ветке. Без sleep и env-переменных.
+    #[test]
+    fn stale_footer_right_transition_clears() {
+        let mut caught = false;
+        for _ in 0..8 {
+            let mut app = footer_app();
+            let target = footer_right_target(&app);
+            app.footer_right_text = target.clone();
+            app.footer_right_previous_text = Some("prev".to_string());
+            app.footer_right_changed_at = Some(Instant::now() - Duration::from_millis(900));
+            app.refresh_footer_right_state();
+            if app.footer_right_text == target {
+                assert!(
+                    app.footer_right_previous_text.is_none(),
+                    "просроченный previous не очищен"
+                );
+                assert!(
+                    app.footer_right_changed_at.is_none(),
+                    "просроченная метка смены не очищена"
+                );
+                caught = true;
+                break;
+            }
+        }
+        assert!(caught, "не поймали стабильную фазу для проверки очистки");
+    }
 }
