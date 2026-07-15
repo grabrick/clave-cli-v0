@@ -288,4 +288,158 @@ mod tests {
         let (line, col) = input_cursor_position_wrapped(input, input.len(), 10);
         assert_eq!((line, col), (rows.len() - 1, display_width("cd")));
     }
+
+    // ── wrap_chars: перенос по словам и разбивка длинных слов ────────────────
+
+    /// Короткие слова склеиваются через пробел, а перенос идёт РОВНО перед словом,
+    /// что не влезло. Границу берём впритык, чтобы `>`/`>=` и `+`/`-`/`*` разошлись.
+    #[test]
+    fn wrap_chars_breaks_exactly_before_the_overflowing_word() {
+        // 3 + 1(пробел) + 3 = 7 > 6 → «bbb» уезжает на новую строку.
+        // Ловит: delete `!` (185), `+`→`-`/`*` (187:24) и `+`→`*` (187:38) —
+        // при любой из подмен сумма падает до ≤6 и перенос не срабатывает.
+        assert_eq!(wrap_chars("aaa bbb", 6), vec!["aaa", "bbb"]);
+        // 3 + 1 + 2 = 6, РОВНО ширина → переносить нечего, слова остаются вместе.
+        // Здесь `>` и `>=` (187:49) расходятся: `>=` порвал бы строку зря.
+        assert_eq!(wrap_chars("aaa bb", 6), vec!["aaa bb"]);
+    }
+
+    /// Слово длиннее ширины целиком влезть не может — дробится ровно по max_chars,
+    /// последний кусок короче. Точные куски, а не длина.
+    #[test]
+    fn wrap_chars_splits_a_word_longer_than_the_width_into_exact_chunks() {
+        assert_eq!(wrap_chars("aaaaaaaaaa", 4), vec!["aaaa", "aaaa", "aa"]);
+    }
+
+    /// Слово из буквы и комбинирующего знака (нулевой ширины) при max_chars=1 занимает
+    /// РОВНО одну колонку и рвать его нельзя. Здесь `>` и `>=` (192:21) расходятся: `>=`
+    /// вошёл бы в дробление и оторвал бы диакритику от буквы.
+    #[test]
+    fn wrap_chars_keeps_a_combining_mark_attached_to_its_base() {
+        assert_eq!(wrap_chars("e\u{0301}", 1), vec!["e\u{0301}"]);
+    }
+
+    // ── input_cursor_position_wrapped: (визуальная строка, колонка) ──────────
+
+    /// Курсор идёт тем же обходом, что и перенос: за точкой переноса он переезжает
+    /// на следующую визуальную строку. Узкая ширина, чтобы граница была видна.
+    #[test]
+    fn cursor_follows_the_wrap_exactly() {
+        // width=5 → content_width=3. «abcdef» рвётся после 3-й колонки: «abc»/«def».
+        // Курсор в конце — строка 1, колонка 3. Один этот assert валит все пять
+        // мутантов 124–128: `==`/`>=` дают (2,2), `*` (124:23) — (1,2),
+        // `-=` — underflow-паника, `*=` — (0,0).
+        assert_eq!(input_cursor_position_wrapped("abcdef", 6, 5), (1, 3));
+        // Курсор в середине первой строки — строка 0, колонка 2.
+        assert_eq!(input_cursor_position_wrapped("abcdef", 2, 5), (0, 2));
+        // Широкий символ (2 колонки) не разрывается: у границы переносится ПЕРЕД ним.
+        assert_eq!(
+            input_cursor_position_wrapped("ab機", "ab機".len(), 5),
+            (1, 2)
+        );
+        // Явный \n: курсор на следующей строке, колонка 0.
+        assert_eq!(input_cursor_position_wrapped("ab\ncd", 3, 10), (1, 0));
+    }
+
+    // ── Провайдеры: индекс ⇄ режим ⇄ описание ────────────────────────────────
+
+    /// Каждый режим — свой слот. Четыре разных числа валят `->0` и `->1` (67:5).
+    #[test]
+    fn provider_index_maps_each_mode_to_its_own_slot() {
+        assert_eq!(provider_index(Mode::CodexOnly), 0);
+        assert_eq!(provider_index(Mode::ClaudeCodex), 1);
+        assert_eq!(provider_index(Mode::CodexClaude), 2);
+        assert_eq!(provider_index(Mode::ClaudeOnly), 3);
+    }
+
+    /// Обратное отображение + круговой проход. `provider_mode(2)` == `CodexClaude`
+    /// (и round-trip) валит delete match arm 2 (60): без арма 2 индекс 2 съехал бы
+    /// в дефолт `CodexOnly` и round-trip бы сломался.
+    #[test]
+    fn provider_mode_is_the_inverse_of_provider_index() {
+        assert_eq!(provider_mode(0), Mode::CodexOnly);
+        assert_eq!(provider_mode(1), Mode::ClaudeCodex);
+        assert_eq!(provider_mode(2), Mode::CodexClaude);
+        assert_eq!(provider_mode(3), Mode::ClaudeOnly);
+        // Вне диапазона — откат к первому режиму.
+        assert_eq!(provider_mode(4), Mode::CodexOnly);
+        assert_eq!(provider_mode(usize::MAX), Mode::CodexOnly);
+        for index in 0..provider_count() {
+            assert_eq!(provider_index(provider_mode(index)), index);
+        }
+    }
+
+    /// У каждого режима своё непустое описание на обоих языках. Непустота валит `->""`,
+    /// различность — `->"xyzzy"` (76:5, при нём все четыре стали бы одинаковы).
+    #[test]
+    fn provider_description_is_non_empty_and_distinct_per_mode() {
+        let modes = [
+            Mode::CodexOnly,
+            Mode::ClaudeCodex,
+            Mode::CodexClaude,
+            Mode::ClaudeOnly,
+        ];
+        for lang in [Language::Ru, Language::En] {
+            let texts: Vec<&str> = modes
+                .iter()
+                .map(|&mode| provider_description(mode, lang))
+                .collect();
+            for text in &texts {
+                assert!(!text.is_empty(), "описание режима пустое на {lang:?}");
+            }
+            let unique: std::collections::HashSet<&str> = texts.iter().copied().collect();
+            assert_eq!(
+                unique.len(),
+                modes.len(),
+                "описания режимов обязаны различаться ({lang:?})"
+            );
+        }
+        // Точные строки, чтобы «xyzzy» и перепутанные режимы не прошли.
+        assert_eq!(
+            provider_description(Mode::CodexOnly, Language::Ru),
+            "Codex пишет и ревьюит"
+        );
+        assert_eq!(
+            provider_description(Mode::ClaudeOnly, Language::En),
+            "Claude drafts and reviews"
+        );
+    }
+
+    // ── composer_height: (строки ввода + 2), зажатое в [3, 10] ────────────────
+
+    fn composer_app(input: &str) -> App {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+        let dir = std::env::temp_dir().join(format!(
+            "clave-helpers-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let config = AppConfig {
+            onboarding_done: true,
+            ..AppConfig::default()
+        };
+        let mut app = App::from_config(
+            config,
+            dir.join("config.json"),
+            dir.join("history"),
+            dir.clone(),
+        );
+        app.input = input.to_string();
+        app
+    }
+
+    /// Высота = строки ввода + 2 служебные, зажатые в [3, 10].
+    #[test]
+    fn composer_height_is_input_lines_plus_two_clamped_to_three_and_ten() {
+        // Пустой ввод: 1 + 2 = 3, нижний кламп. Валит `->0` и `->1` (43:5).
+        assert_eq!(composer_height(&composer_app(""), 20), 3);
+        // Три строки: 3 + 2 = 5. Здесь `+` и `*` (45:12) расходятся: 3*2=6 ≠ 5.
+        assert_eq!(composer_height(&composer_app("a\nb\nc"), 20), 5);
+        // Пятнадцать строк: 15 + 2 = 17, верхний кламп режет до 10.
+        let tall = "x\n".repeat(15);
+        assert_eq!(composer_height(&composer_app(&tall), 20), 10);
+    }
 }
