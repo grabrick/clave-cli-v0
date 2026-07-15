@@ -961,4 +961,213 @@ mod tests {
             );
         }
     }
+
+    // ── is_error_status_line: по маркеру на строку (все ||→&&) ────────────────
+    #[test]
+    fn error_status_line_catches_each_marker() {
+        // Каждая строка несёт РОВНО один маркер: подмена соседнего ||→&& требует
+        // двух истинных условий разом и обнуляет результат — тест краснеет.
+        for text in [
+            "error: boom",
+            "failed: boom",
+            "failed to compile", // маркер "failed "
+            "wait failed: x",
+            "engine missing x",
+            "boom returned an error",
+            "boom failed to spawn",
+            "процесс завершился с кодом 1",
+            "codex вернул ошибку",
+            "⎿ read-only file system",
+            "⎿ compile error", // бьёт 392: только error, без failed/read-only
+            "⎿ deploy failed", // бьёт 392: только failed, без error/read-only
+        ] {
+            assert!(is_error_status_line(text), "маркер ошибки: {text:?}");
+        }
+        // Контроль от мутантов «всегда true».
+        assert!(!is_error_status_line("всё хорошо, готово"));
+    }
+
+    // ── style_transcript_line ────────────────────────────────────────────────
+    #[test]
+    fn style_step_headers_get_accent_prefix() {
+        // Три ветки Drafting/Review/Revision: ||→&& (224/225) убирает две из трёх.
+        let accent = Theme::Purple.accent();
+        for text in ["Drafting the plan", "Review pass", "Revision cycle"] {
+            let line = style_transcript_line(text, Language::Ru, Theme::Purple);
+            assert_eq!(line.spans[0].content.as_ref(), "⏺ ", "{text}: префикс-спан");
+            assert_eq!(line.spans[0].style.fg, Some(accent), "{text}: цвет акцента");
+            assert!(
+                line.spans[0].style.add_modifier.contains(Modifier::BOLD),
+                "{text}: жирный префикс"
+            );
+            let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(joined.contains(text), "{text}: текст на месте");
+        }
+    }
+
+    #[test]
+    fn style_continuation_line_is_dark_gray_even_with_indent() {
+        // «⎿ x» и «  ⎿ x» (с пробелами) — обе DarkGray; вторая бьёт 236 ||→&&.
+        for text in ["⎿ x", "  ⎿ x"] {
+            let line = style_transcript_line(text, Language::Ru, Theme::Purple);
+            assert_eq!(line.style.fg, Some(Color::DarkGray), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn style_thinking_markers_are_bold_accent() {
+        // «✻» и «✦» — обе акцент+BOLD; 247 ||→&& уронит любую из них в else.
+        let accent = Theme::Purple.accent();
+        for text in ["✻ думаю", "✦ думаю"] {
+            let line = style_transcript_line(text, Language::Ru, Theme::Purple);
+            assert_eq!(line.style.fg, Some(accent), "{text:?}");
+            assert!(line.style.add_modifier.contains(Modifier::BOLD), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn style_h1_is_bold_and_underlined() {
+        // «# …» несёт ОБА модификатора; 289 |→& даёт пустой набор.
+        let line = style_transcript_line("# Заголовок", Language::Ru, Theme::Purple);
+        assert!(
+            line.style.add_modifier.contains(Modifier::BOLD),
+            "BOLD у H1"
+        );
+        assert!(
+            line.style.add_modifier.contains(Modifier::UNDERLINED),
+            "UNDERLINED у H1"
+        );
+    }
+
+    // ── transcript_entry_lines_with_state ────────────────────────────────────
+    #[test]
+    fn welcome_lines_are_not_word_wrapped() {
+        // Длинный контент при узкой ширине: welcome-ветка держит одну строку, а
+        // провал в wrap_chars (мутанты 47/48) порвал бы её на несколько.
+        for sentinel in [WELCOME_NAME, WELCOME_INFO, WELCOME_HINT] {
+            let line = format!("{sentinel}one two three four five six");
+            let mut state = TranscriptRenderState::default();
+            let out = transcript_entry_lines_with_state(
+                &line,
+                Language::Ru,
+                10,
+                Theme::Purple,
+                &mut state,
+            );
+            assert_eq!(out.len(), 1, "welcome не переносится ({sentinel:?})");
+        }
+    }
+
+    #[test]
+    fn answer_and_command_get_leading_air_line() {
+        // «⏺ » и «❯ » дают пустую строку-воздух первой; 55 ||→&& уберёт её.
+        for (text, marker) in [("⏺ ответ бота", "ответ"), ("❯ команда", "команда")]
+        {
+            let mut state = TranscriptRenderState::default();
+            let out = transcript_entry_lines_with_state(
+                text,
+                Language::Ru,
+                80,
+                Theme::Purple,
+                &mut state,
+            );
+            assert!(out.len() >= 2, "{text}: воздух + строка");
+            assert!(plain(&out[0]).is_empty(), "{text}: первая строка — воздух");
+            assert!(plain(&out[1]).contains(marker), "{text}: содержимое ниже");
+        }
+    }
+
+    // ── detect_paths: границы (потенциальные паники) и семантика ──────────────
+    #[test]
+    fn detect_paths_handles_tokens_at_end_of_text() {
+        let cwd = temp_repo("borders");
+
+        // Путь у самого конца строки: chars[end] за границей — 493:35 <→<= паникует.
+        let segs = detect_paths("src/app.rs", &cwd);
+        assert_eq!(rejoin(&segs), "src/app.rs");
+        let link = segs.iter().find(|s| s.file.is_some()).unwrap();
+        assert_eq!(link.text, "src/app.rs");
+        assert_eq!(link.file.as_ref().unwrap().1, None, "без номера строки");
+
+        // Число ПОСЛЕ пробела в конце: 493:28 &&→|| ошибочно зайдёт в разбор :line
+        // и приклеит « 12» к ссылке с line=Some(12). Оригинал — путь без номера.
+        let segs = detect_paths("src/app.rs 12", &cwd);
+        assert_eq!(rejoin(&segs), "src/app.rs 12");
+        let link = segs.iter().find(|s| s.file.is_some()).unwrap();
+        assert_eq!(
+            link.text, "src/app.rs",
+            "число за пробелом не входит в ссылку"
+        );
+        let (_, line, col) = link.file.as_ref().unwrap();
+        assert_eq!((*line, *col), (None, None));
+
+        // :line в самом конце — 497:24 <→<= и 497:38 &&→|| лезут в chars[end].
+        let segs = detect_paths("src/app.rs:12", &cwd);
+        assert_eq!(rejoin(&segs), "src/app.rs:12");
+        let link = segs.iter().find(|s| s.file.is_some()).unwrap();
+        assert_eq!(link.text, "src/app.rs:12");
+        let (_, line, col) = link.file.as_ref().unwrap();
+        assert_eq!((*line, *col), (Some(12), None));
+
+        // :line:col в самом конце.
+        let segs = detect_paths("src/app.rs:12:5", &cwd);
+        assert_eq!(rejoin(&segs), "src/app.rs:12:5");
+        let link = segs.iter().find(|s| s.file.is_some()).unwrap();
+        let (_, line, col) = link.file.as_ref().unwrap();
+        assert_eq!((*line, *col), (Some(12), Some(5)));
+
+        // Двоеточие без числа в конце: не съедается, файл распознан, паники нет.
+        let segs = detect_paths("src/app.rs:", &cwd);
+        assert_eq!(rejoin(&segs), "src/app.rs:");
+        assert!(segs.iter().any(|s| s.file.is_some()), "файл распознан");
+
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    // ── take_number ──────────────────────────────────────────────────────────
+    #[test]
+    fn take_number_reads_digits_without_overrun() {
+        // Число до конца среза: 435 <→<= полез бы в chars[len] и паникнул.
+        assert_eq!(take_number(&['1', '2'], 0), Some((12, 2)));
+        assert_eq!(take_number(&['a'], 0), None);
+        assert_eq!(take_number(&['5', 'x'], 0), Some((5, 1)));
+    }
+
+    // ── inline_md_spans / inline_code_spans: смещения не в начале строки ──────
+    #[test]
+    fn inline_md_offsets_hold_for_mid_line_fragments() {
+        // Код в СЕРЕДИНЕ строки: 146 (i+1→i-1) и 154 (i+=→i*=) разъедут спаны/хвост.
+        let spans = inline_md_spans("aa `bb` cc");
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "aa bb cc");
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.content == "bb" && s.style.fg == Some(Color::Indexed(180))),
+            "код-фрагмент bb выделен точно"
+        );
+
+        // Одиночная «*» в середине не запускает разбор жирного (159: i+1→i*1).
+        let spans = inline_md_spans("a * b **c** d");
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "a * b c d");
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.content == "c" && s.style.add_modifier.contains(Modifier::BOLD)),
+            "жирный c выделен, звёздочка литеральна"
+        );
+    }
+
+    #[test]
+    fn inline_code_at_line_start_has_no_empty_span() {
+        // Бэктик в начале (open==0): 116 >→>= вставил бы пустой ведущий спан.
+        let spans = inline_code_spans("`code` tail");
+        assert_eq!(
+            spans[0].content.as_ref(),
+            "code",
+            "нет пустого ведущего спана"
+        );
+        assert_eq!(spans[0].style.fg, Some(Color::Indexed(180)));
+    }
 }
