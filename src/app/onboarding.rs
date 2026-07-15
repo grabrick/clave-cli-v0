@@ -70,11 +70,15 @@ impl App {
     }
 
     pub(crate) fn ensure_auth_ready_for_current_mode(&mut self) -> bool {
-        let onboarding = Onboarding::new(self.mode);
-        if auth_requirements_ready(self.mode, &onboarding) {
+        // Готовность читаем через хук (дефолт — provider_authenticated, тот же источник,
+        // что onboarding.*_authenticated): путь «готов» не спавнит auth-пробу.
+        let codex_ok = (self.run_hooks.authenticated)(Provider::Codex);
+        let claude_ok = (self.run_hooks.authenticated)(Provider::Claude);
+        if (!self.mode.needs_codex() || codex_ok) && (!self.mode.needs_claude() || claude_ok) {
             return true;
         }
 
+        let onboarding = Onboarding::new(self.mode);
         let missing = missing_auth_text(self.mode, &onboarding, self.lang);
         let message = format!(
             "{} {}. {}",

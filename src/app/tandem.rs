@@ -62,34 +62,37 @@ impl App {
         ));
 
         let tx = self.tx.clone();
-        spawn_worker(self.tx.clone(), move || {
-            let result = run_tandem(
-                executor.as_str(),
-                critic.as_str(),
-                &executor_effort,
-                &critic_effort,
-                &task_run,
-                rounds,
-                &work_dir,
-                cancel_rx,
-                tx.clone(),
-                lang,
-            );
-            match result {
-                Ok(TandemResult::Completed(code, usage)) => {
-                    let _ = tx.send(WorkerEvent::ChatDone(executor, code, usage));
+        (self.run_hooks.spawn)(
+            self.tx.clone(),
+            Box::new(move || {
+                let result = run_tandem(
+                    executor.as_str(),
+                    critic.as_str(),
+                    &executor_effort,
+                    &critic_effort,
+                    &task_run,
+                    rounds,
+                    &work_dir,
+                    cancel_rx,
+                    tx.clone(),
+                    lang,
+                );
+                match result {
+                    Ok(TandemResult::Completed(code, usage)) => {
+                        let _ = tx.send(WorkerEvent::ChatDone(executor, code, usage));
+                    }
+                    Ok(TandemResult::Cancelled) => {
+                        let _ = tx.send(WorkerEvent::Cancelled);
+                    }
+                    Err(err) => {
+                        let _ = tx.send(WorkerEvent::Failed(format!(
+                            "{}: {}",
+                            lang.choose("Тандем", "Tandem"),
+                            err
+                        )));
+                    }
                 }
-                Ok(TandemResult::Cancelled) => {
-                    let _ = tx.send(WorkerEvent::Cancelled);
-                }
-                Err(err) => {
-                    let _ = tx.send(WorkerEvent::Failed(format!(
-                        "{}: {}",
-                        lang.choose("Тандем", "Tandem"),
-                        err
-                    )));
-                }
-            }
-        });
+            }),
+        );
     }
 }

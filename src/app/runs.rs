@@ -106,22 +106,31 @@ impl App {
         }
 
         let tx = self.tx.clone();
-        spawn_worker(self.tx.clone(), move || {
-            if !chat_auth_ok(provider_authenticated(provider), provider, &tx) {
-                return;
-            }
-            let result = run_chat_provider(
-                provider.as_str(),
-                &effort,
-                &prompt,
-                &work_dir,
-                cancel_rx,
-                tx.clone(),
-                lang,
-                access,
-            );
-            emit_chat_run_result(result, provider, planning, lang, &tx);
-        });
+        let authenticated = self.run_hooks.authenticated;
+        (self.run_hooks.spawn)(
+            self.tx.clone(),
+            Box::new(move || {
+                run_chat_worker_body(
+                    authenticated(provider),
+                    provider,
+                    || {
+                        run_chat_provider(
+                            provider.as_str(),
+                            &effort,
+                            &prompt,
+                            &work_dir,
+                            cancel_rx,
+                            tx.clone(),
+                            lang,
+                            access,
+                        )
+                    },
+                    planning,
+                    lang,
+                    &tx,
+                );
+            }),
+        );
     }
 
     pub(crate) fn start_task(&mut self, task: String) {
@@ -211,101 +220,121 @@ impl App {
             self.out_dir
         ));
 
-        spawn_worker(self.tx.clone(), move || {
-            let mut args = Vec::new();
+        (self.run_hooks.spawn)(
+            self.tx.clone(),
+            Box::new(move || {
+                let mut args = Vec::new();
 
-            match mode {
-                Mode::CodexOnly => args.push("--codex-only".to_string()),
-                Mode::ClaudeOnly => {
-                    args.extend([
-                        "--architect".to_string(),
-                        "claude".to_string(),
-                        "--reviewer".to_string(),
-                        "claude".to_string(),
-                    ]);
-                }
-                Mode::ClaudeCodex => {
-                    args.extend([
-                        "--architect".to_string(),
-                        "claude".to_string(),
-                        "--reviewer".to_string(),
-                        "codex".to_string(),
-                    ]);
-                }
-                Mode::CodexClaude => {
-                    args.extend([
-                        "--architect".to_string(),
-                        "codex".to_string(),
-                        "--reviewer".to_string(),
-                        "claude".to_string(),
-                    ]);
-                }
-            }
-
-            args.extend([
-                "--cwd".to_string(),
-                work_dir_arg,
-                "--rounds".to_string(),
-                rounds,
-                "--out".to_string(),
-                out_dir,
-                "--effort".to_string(),
-                common_effort,
-                "--architect-effort".to_string(),
-                architect_effort,
-                "--reviewer-effort".to_string(),
-                reviewer_effort,
-                task,
-            ]);
-
-            let mut engine_command = Command::new(&engine);
-            engine_command
-                .current_dir(&work_dir)
-                .args(args)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            configure_process_group(&mut engine_command);
-            let mut child = match engine_command.spawn() {
-                Ok(child) => child,
-                Err(err) => {
-                    let _ = tx.send(WorkerEvent::Failed(format!(
-                        "Failed to spawn {}: {err}",
-                        engine.display()
-                    )));
-                    return;
-                }
-            };
-
-            if let Some(stdout) = child.stdout.take() {
-                spawn_reader(stdout, tx.clone());
-            }
-
-            if let Some(stderr) = child.stderr.take() {
-                spawn_reader(stderr, tx.clone());
-            }
-
-            loop {
-                if cancel_rx.try_recv().is_ok() {
-                    // Убиваем всю группу движка (spec-clave + порождённые им claude/codex).
-                    kill_process_tree(&mut child);
-                    let _ = tx.send(WorkerEvent::Cancelled);
-                    return;
-                }
-
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        let _ = tx.send(WorkerEvent::Done(status.code().unwrap_or(1)));
-                        return;
+                match mode {
+                    Mode::CodexOnly => args.push("--codex-only".to_string()),
+                    Mode::ClaudeOnly => {
+                        args.extend([
+                            "--architect".to_string(),
+                            "claude".to_string(),
+                            "--reviewer".to_string(),
+                            "claude".to_string(),
+                        ]);
                     }
-                    Ok(None) => thread::sleep(Duration::from_millis(80)),
+                    Mode::ClaudeCodex => {
+                        args.extend([
+                            "--architect".to_string(),
+                            "claude".to_string(),
+                            "--reviewer".to_string(),
+                            "codex".to_string(),
+                        ]);
+                    }
+                    Mode::CodexClaude => {
+                        args.extend([
+                            "--architect".to_string(),
+                            "codex".to_string(),
+                            "--reviewer".to_string(),
+                            "claude".to_string(),
+                        ]);
+                    }
+                }
+
+                args.extend([
+                    "--cwd".to_string(),
+                    work_dir_arg,
+                    "--rounds".to_string(),
+                    rounds,
+                    "--out".to_string(),
+                    out_dir,
+                    "--effort".to_string(),
+                    common_effort,
+                    "--architect-effort".to_string(),
+                    architect_effort,
+                    "--reviewer-effort".to_string(),
+                    reviewer_effort,
+                    task,
+                ]);
+
+                let mut engine_command = Command::new(&engine);
+                engine_command
+                    .current_dir(&work_dir)
+                    .args(args)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                configure_process_group(&mut engine_command);
+                let mut child = match engine_command.spawn() {
+                    Ok(child) => child,
                     Err(err) => {
-                        let _ = tx.send(WorkerEvent::Failed(format!("Wait failed: {err}")));
+                        let _ = tx.send(WorkerEvent::Failed(format!(
+                            "Failed to spawn {}: {err}",
+                            engine.display()
+                        )));
                         return;
                     }
+                };
+
+                if let Some(stdout) = child.stdout.take() {
+                    spawn_reader(stdout, tx.clone());
                 }
-            }
-        });
+
+                if let Some(stderr) = child.stderr.take() {
+                    spawn_reader(stderr, tx.clone());
+                }
+
+                loop {
+                    if cancel_rx.try_recv().is_ok() {
+                        // Убиваем всю группу движка (spec-clave + порождённые им claude/codex).
+                        kill_process_tree(&mut child);
+                        let _ = tx.send(WorkerEvent::Cancelled);
+                        return;
+                    }
+
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            let _ = tx.send(WorkerEvent::Done(status.code().unwrap_or(1)));
+                            return;
+                        }
+                        Ok(None) => thread::sleep(Duration::from_millis(80)),
+                        Err(err) => {
+                            let _ = tx.send(WorkerEvent::Failed(format!("Wait failed: {err}")));
+                            return;
+                        }
+                    }
+                }
+            }),
+        );
     }
+}
+
+/// Тело чат-воркера в отрыве от спавна: гейт логина → запуск → эмит результата.
+/// Вынесено, чтобы `!chat_auth_ok` проверялось без реального подпроцесса.
+fn run_chat_worker_body(
+    authenticated: bool,
+    provider: Provider,
+    run: impl FnOnce() -> io::Result<ChatRunResult>,
+    planning: bool,
+    lang: Language,
+    tx: &Sender<WorkerEvent>,
+) {
+    if !chat_auth_ok(authenticated, provider, tx) {
+        return;
+    }
+    let result = run();
+    emit_chat_run_result(result, provider, planning, lang, tx);
 }
 
 fn chat_auth_ok(authenticated: bool, provider: Provider, tx: &Sender<WorkerEvent>) -> bool {
@@ -377,6 +406,38 @@ mod tests {
 
     fn drain(rx: &mpsc::Receiver<WorkerEvent>) -> Vec<WorkerEvent> {
         rx.try_iter().collect()
+    }
+
+    fn noop_spawn(_tx: Sender<WorkerEvent>, _body: Box<dyn FnOnce() + Send + 'static>) {}
+
+    /// App с ФЕЙКОВЫМИ хуками: спавн — no-op (тело дропается, реального воркера нет),
+    /// логин — «залогинен». Позволяет наблюдать диспетч start_chat и guard-ы без
+    /// подпроцессов и живых auth-проб.
+    fn runs_app() -> App {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "clave-runs-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let config = AppConfig {
+            onboarding_done: true,
+            ..AppConfig::default()
+        };
+        let mut app = App::from_config(
+            config,
+            dir.join("config.json"),
+            dir.join("history"),
+            dir.clone(),
+        );
+        app.lang = Language::En;
+        app.run_hooks = RunHooks {
+            spawn: noop_spawn,
+            authenticated: |_| true,
+        };
+        app
     }
 
     // --- Мутант 111:16 (delete `!` в логин-гейте) ---
@@ -516,5 +577,156 @@ mod tests {
         assert!(!events
             .iter()
             .any(|e| matches!(e, WorkerEvent::ChatDone(..))));
+    }
+
+    // --- Мутант runs.rs:333 (`run_chat_worker_body → ()` И delete `!`): гейт без логина ---
+    // Прямой вызов ОБЁРТКИ, а не её внутренностей — иначе мутация тела не ловится.
+
+    #[test]
+    fn worker_body_gates_run_and_emits_auth_missing_when_unauthenticated() {
+        let (tx, rx) = mpsc::channel();
+        run_chat_worker_body(
+            false,
+            Provider::Claude,
+            || panic!("run не должен зваться без логина"),
+            false,
+            Language::En,
+            &tx,
+        );
+        let events = drain(&rx);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            WorkerEvent::AuthMissing(Provider::Claude)
+        ));
+    }
+
+    // --- Мутант runs.rs:333 (`run_chat_worker_body → ()` И delete `!`): счастливый путь ---
+
+    #[test]
+    fn worker_body_runs_and_emits_result_when_authenticated() {
+        let (tx, rx) = mpsc::channel();
+        run_chat_worker_body(
+            true,
+            Provider::Claude,
+            || Ok(ChatRunResult::Completed(0, "hi".into(), "".into(), None)),
+            false,
+            Language::En,
+            &tx,
+        );
+        let events = drain(&rx);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::ChatLine(s) if s.contains("hi"))));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::ChatDone(..))));
+    }
+
+    // --- Мутант mod.rs:178 (`real_spawn → ()`): дефолтный хук обязан выполнить тело ---
+    // Берём фн-указатель через RunHooks::real(), спавним тело, шлющее сигнал, и ждём с таймаутом.
+
+    #[test]
+    fn real_spawn_hook_actually_runs_the_body() {
+        let hooks = RunHooks::real();
+        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
+        let (done_tx, done_rx) = mpsc::channel();
+        (hooks.spawn)(
+            tx,
+            Box::new(move || {
+                let _ = done_tx.send(());
+            }),
+        );
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("real_spawn обязан выполнить тело в потоке");
+    }
+
+    // --- Диспетч start_chat по режиму (delete match arm Plan/Tandem) ---
+
+    #[test]
+    fn start_chat_in_plan_mode_dispatches_to_start_plan() {
+        let mut app = runs_app();
+        app.chat_mode = ChatMode::Plan;
+        app.start_chat("t".into());
+        // start_plan ставит plan_flow=Planning; при удалении плеча ушло бы в
+        // start_chat_with_prompt, и plan_flow остался бы None.
+        assert!(matches!(app.plan_flow, PlanFlow::Planning { .. }));
+    }
+
+    #[test]
+    fn start_chat_in_tandem_mode_dispatches_to_start_tandem() {
+        let mut app = runs_app();
+        app.chat_mode = ChatMode::Tandem;
+        app.start_chat("t".into());
+        // start_tandem ставит run_label="Tandem"; при удалении плеча ушло бы в
+        // start_chat_with_prompt (run_label = имя провайдера).
+        assert_eq!(app.run_label, "Tandem");
+    }
+
+    // --- guard process_pending_messages (→() и два ||→&&) ---
+
+    #[test]
+    fn process_pending_starts_the_next_queued_message() {
+        let mut app = runs_app();
+        app.running = false;
+        app.pending_messages.clear();
+        app.pending_messages.push_back("m".into());
+        app.process_pending_messages();
+        // →(): очередь не тронута; корректно — сообщение снято и запущено.
+        assert!(
+            app.pending_messages.is_empty(),
+            "сообщение снято из очереди"
+        );
+        assert!(app.running, "и запущено (running=true)");
+    }
+
+    #[test]
+    fn process_pending_does_nothing_while_running() {
+        let mut app = runs_app();
+        app.running = true; // первый ||: running обязан заблокировать
+        app.pending_messages.clear();
+        app.pending_messages.push_back("m".into());
+        let before = app.transcript.len();
+        app.process_pending_messages();
+        // ||→&& (running && plan_gate): guard стал бы false → снял бы из очереди и
+        // start_chat при running=true до-эхнул бы «в очереди» в ленту.
+        assert_eq!(
+            app.transcript.len(),
+            before,
+            "при running=true очередь не трогается"
+        );
+    }
+
+    #[test]
+    fn process_pending_does_nothing_while_the_plan_gate_is_open() {
+        let mut app = runs_app();
+        app.running = false;
+        app.pending_plan = Some(PendingPlan {
+            task: "t".into(),
+            plan: "p".into(),
+        });
+        assert!(app.plan_gate_active());
+        app.pending_messages.clear();
+        app.pending_messages.push_back("m".into());
+        app.process_pending_messages();
+        // ||→&& (plan_gate && ask): при ask=false guard стал бы false → снял бы очередь
+        // и стартовал ран. Корректно — гейт плана блокирует.
+        assert!(!app.running, "гейт плана открыт → ран не стартует");
+        assert_eq!(app.pending_messages.len(), 1, "очередь не тронута");
+    }
+
+    // --- guard start_task (delete `!ensure_auth_ready`) ---
+
+    #[test]
+    fn start_task_bails_and_opens_auth_when_not_authenticated() {
+        let mut app = runs_app();
+        app.mode = Mode::ClaudeCodex; // режим требует обоих провайдеров
+        app.run_hooks.authenticated = |_| false; // не залогинен
+        app.start_task("t".into());
+        // Корректно: `!ensure_auth_ready` → ранний return, открыт экран авторизации.
+        // Мутант (delete `!`) полез бы к движку (onboarding остался бы None).
+        assert!(app.onboarding.is_some(), "не залогинен → экран авторизации");
+        assert!(!app.running, "ран не стартует без логина");
     }
 }

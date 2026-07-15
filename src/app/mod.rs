@@ -123,6 +123,9 @@ pub(crate) struct App {
     /// Чем читаем ref. Отдельным полем — чтобы тест мог подменить детектор и доказать, что
     /// без событий git не дёргается вовсе. Обычный fn-указатель: детектор — чистая функция.
     pub(crate) git_ref_detector: fn(&Path) -> Option<String>,
+    /// Инъектируемые хуки раннера (спавн воркера и проверка логина). Дефолт — прод-функции;
+    /// тест подменяет фейками, чтобы граница спавна/диспетча/проб проверялась без подпроцессов.
+    pub(crate) run_hooks: RunHooks,
     pub(crate) should_quit: bool,
     pub(crate) history: Vec<String>,
     pub(crate) history_index: Option<usize>,
@@ -151,6 +154,28 @@ pub(crate) struct App {
     pub(crate) tx: Sender<WorkerEvent>,
     pub(crate) rx: Receiver<WorkerEvent>,
     pub(crate) usage: SessionUsage,
+}
+
+/// Инъектируемые хуки раннера. Дефолт — прод-функции; тест подменяет фейками,
+/// чтобы граница спавна/логина проверялась без реальных подпроцессов.
+pub(crate) struct RunHooks {
+    /// Спавн фонового воркера. Дефолт — spawn_worker; тест — фейк, дропающий тело.
+    pub(crate) spawn: fn(Sender<WorkerEvent>, Box<dyn FnOnce() + Send + 'static>),
+    /// Залогинен ли провайдер. Дефолт — provider_authenticated; тест — фейк, без проб.
+    pub(crate) authenticated: fn(Provider) -> bool,
+}
+
+impl RunHooks {
+    pub(crate) fn real() -> Self {
+        RunHooks {
+            spawn: real_spawn,
+            authenticated: provider_authenticated,
+        }
+    }
+}
+
+fn real_spawn(tx: Sender<WorkerEvent>, body: Box<dyn FnOnce() + Send + 'static>) {
+    spawn_worker(tx, body);
 }
 
 impl App {
@@ -248,6 +273,7 @@ impl App {
             footer_right_changed_at: None,
             git_ref: None,
             git_ref_detector: footer::detect_git_ref,
+            run_hooks: RunHooks::real(),
             should_quit: false,
             history,
             history_index: None,
