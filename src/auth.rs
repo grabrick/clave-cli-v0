@@ -126,12 +126,15 @@ fn auth_probe(binary: &str, args: &[&str], timeout: Duration) -> AuthProbe {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let out = stdout
-                    .map(|h| h.join().unwrap_or_default())
-                    .unwrap_or_default();
-                let err = stderr
-                    .map(|h| h.join().unwrap_or_default())
-                    .unwrap_or_default();
+                // CLI вышел — его собственный вывод уже в пайпе и читается мгновенно.
+                // Но если внук унаследовал stdout/stderr и держит их открытыми,
+                // read_to_string не дождётся EOF; безусловный join висел бы здесь до
+                // выхода внука (исторический вечный фриз старта — пробу зовут из
+                // App::new ещё до первого кадра). Поэтому собираем с коротким потолком
+                // и, не дождавшись, отпускаем (детач) ридеры: child уже реапнут, и
+                // kill по его возможно-переиспользованному PID был бы опасен.
+                let out = join_with_ceiling(stdout);
+                let err = join_with_ceiling(stderr);
                 let text = command_output_text(out.as_bytes(), err.as_bytes());
                 return AuthProbe {
                     installed: true,
@@ -166,6 +169,23 @@ fn auth_probe(binary: &str, args: &[&str], timeout: Duration) -> AuthProbe {
             }
         }
     }
+}
+
+/// Забирает вывод ридера с коротким потолком. Вызывается, когда CLI УЖЕ вышел, — его
+/// вывод обычно приходит мгновенно. Но `handle.join()` напрямую висел бы вечно, если
+/// внук унаследовал пайп и держит его открытым (нет EOF). Джойн уводим в отдельный
+/// тред, а результат ждём через канал с `recv_timeout`: не дождавшись — возвращаем
+/// пусто, а зависший джойн-тред отпускаем (он завершится, когда внук закроет пайп).
+fn join_with_ceiling(handle: Option<thread::JoinHandle<String>>) -> String {
+    let Some(handle) = handle else {
+        return String::new();
+    };
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(handle.join().unwrap_or_default());
+    });
+    rx.recv_timeout(Duration::from_millis(200))
+        .unwrap_or_default()
 }
 
 /// Эвристика «залогинен ли провайдер» по выводу `*_auth_probe`. Стабильного контракта у
@@ -479,6 +499,23 @@ mod tests {
             "статус обязан назвать причину: иначе это выглядит как «не залогинен», \
              и пользователь пойдёт чинить логин, с которым всё в порядке"
         );
+    }
+
+    // Внук унаследовал stdout, а сам CLI ВЫШЕЛ мгновенно (exit 0). try_wait даёт
+    // Ok(Some(0)) сразу, но read_to_string ридера не видит EOF — внук держит пайп.
+    // Раньше безусловный join() в ветке выхода висел бы до самого выхода внука (для
+    // настоящего фонового демона — фактически вечно), морозя старт Clave. Потолок
+    // join_with_ceiling обязан вернуть пробу быстро.
+    #[cfg(unix)]
+    #[test]
+    fn a_fast_exit_leaving_a_grandchild_on_the_pipe_does_not_freeze_the_probe() {
+        // `sleep 30 &` — внук с унаследованным stdout; `exit 0` — sh выходит сразу.
+        let rx = probe_in_thread("sleep 30 & exit 0", Duration::from_secs(1));
+        let probe = rx.recv_timeout(Duration::from_secs(5)).expect(
+            "проба обязана вернуться, не дожидаясь EOF от внука: безусловный join висел \
+             бы до самого выхода внука",
+        );
+        assert!(probe.installed, "процесс запустился — бинарь установлен");
     }
 
     #[cfg(unix)]

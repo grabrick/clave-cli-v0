@@ -647,6 +647,7 @@ pub(crate) fn run_chat_provider(
                 provider, effort, prompt, work_dir, &cancel_rx, &tx, lang, access,
             )
         },
+        access.is_read_only(),
         &cancel_rx,
         &tx,
         lang,
@@ -658,6 +659,7 @@ pub(crate) fn run_chat_provider(
 /// проверяемо только реальным CLI.
 fn run_chat_retrying<F>(
     mut attempt: F,
+    retryable: bool,
     cancel_rx: &Receiver<()>,
     tx: &Sender<WorkerEvent>,
     lang: Language,
@@ -667,6 +669,13 @@ where
 {
     let result = attempt()?;
     if !is_transient_chat_failure(&result) {
+        return Ok(result);
+    }
+    // Мутирующий ран НЕ ретраим: первая попытка могла уже применить необратимые
+    // побочные эффекты (правки файлов, Bash, git-коммит), а «пустой result» при
+    // обрыве до финального события неотличим от «ничего не сделал» — повтор
+    // применил бы их дважды и мог бы испортить рабочую директорию.
+    if !retryable {
         return Ok(result);
     }
     // Один ретрай: мгновенный exit≠0 без вывода и без stderr — обычно транзиент
@@ -2636,6 +2645,7 @@ mod tests {
                     completed(0, "ответ", "")
                 })
             },
+            true,
             &cancel_rx,
             &tx,
             Language::Ru,
@@ -2665,6 +2675,28 @@ mod tests {
     }
 
     #[test]
+    fn chat_does_not_retry_a_mutating_run() {
+        // Мутирующий ран (retryable=false): даже транзиентный молчаливый сбой НЕ
+        // повторяется — иначе уже применённые правки/Bash/git-коммит ушли бы дважды.
+        let (tx, _rx) = mpsc::channel();
+        let (_cancel_tx, cancel_rx) = mpsc::channel();
+        let mut calls = 0;
+        let result = run_chat_retrying(
+            || {
+                calls += 1;
+                Ok(completed(1, "", ""))
+            },
+            false,
+            &cancel_rx,
+            &tx,
+            Language::Ru,
+        )
+        .expect("прогон не падает");
+        assert_eq!(calls, 1, "мутирующий ран не повторяется");
+        assert!(matches!(result, ChatRunResult::Completed(1, ..)));
+    }
+
+    #[test]
     fn chat_does_not_retry_success_timeout_or_after_cancel() {
         let attempts = |result: ChatRunResult, cancelled: bool| -> usize {
             let (tx, _rx) = mpsc::channel();
@@ -2679,6 +2711,7 @@ mod tests {
                     calls += 1;
                     Ok(once.take().unwrap_or_else(|| completed(0, "повтор", "")))
                 },
+                true,
                 &cancel_rx,
                 &tx,
                 Language::Ru,
