@@ -107,12 +107,10 @@ impl App {
 
         let tx = self.tx.clone();
         spawn_worker(self.tx.clone(), move || {
-            // Логин проверяем здесь, в воркере (не морозя UI). Не залогинен → событие.
-            if !provider_authenticated(provider) {
-                let _ = tx.send(WorkerEvent::AuthMissing(provider));
+            if !chat_auth_ok(provider_authenticated(provider), provider, &tx) {
                 return;
             }
-            let command_result = run_chat_provider(
+            let result = run_chat_provider(
                 provider.as_str(),
                 &effort,
                 &prompt,
@@ -122,52 +120,7 @@ impl App {
                 lang,
                 access,
             );
-
-            match command_result {
-                Ok(ChatRunResult::Completed(code, stdout, stderr, usage)) => {
-                    let stdout = stdout.trim();
-                    let stderr = stderr.trim();
-
-                    if !stdout.is_empty() {
-                        emit_chat_lines(&tx, stdout);
-                    } else if code == 0 {
-                        let _ = tx.send(WorkerEvent::Line(
-                            lang.choose(
-                                "Модель не вернула текстовый ответ.",
-                                "The model returned no text response.",
-                            )
-                            .to_string(),
-                        ));
-                    } else {
-                        // Показываем КОД выхода и причину — раньше код терялся, а пустой
-                        // stderr давал немое «no stderr output» (см. chat_error_lines).
-                        for line in chat_error_lines(provider.as_str(), code, stderr, lang) {
-                            let _ = tx.send(WorkerEvent::Line(line));
-                        }
-                    }
-
-                    if planning {
-                        let _ = tx.send(WorkerEvent::PlanReady(
-                            provider,
-                            stdout.to_string(),
-                            code,
-                            usage,
-                        ));
-                    } else {
-                        let _ = tx.send(WorkerEvent::ChatDone(provider, code, usage));
-                    }
-                }
-                Ok(ChatRunResult::Cancelled) => {
-                    let _ = tx.send(WorkerEvent::Cancelled);
-                }
-                Err(err) => {
-                    let _ = tx.send(WorkerEvent::Failed(format!(
-                        "{}: {}",
-                        provider_display(provider.as_str(), lang),
-                        err
-                    )));
-                }
-            }
+            emit_chat_run_result(result, provider, planning, lang, &tx);
         });
     }
 
@@ -352,5 +305,216 @@ impl App {
                 }
             }
         });
+    }
+}
+
+fn chat_auth_ok(authenticated: bool, provider: Provider, tx: &Sender<WorkerEvent>) -> bool {
+    if !authenticated {
+        let _ = tx.send(WorkerEvent::AuthMissing(provider));
+        return false;
+    }
+    true
+}
+
+fn emit_chat_run_result(
+    result: io::Result<ChatRunResult>,
+    provider: Provider,
+    planning: bool,
+    lang: Language,
+    tx: &Sender<WorkerEvent>,
+) {
+    match result {
+        Ok(ChatRunResult::Completed(code, stdout, stderr, usage)) => {
+            let stdout = stdout.trim();
+            let stderr = stderr.trim();
+
+            if !stdout.is_empty() {
+                emit_chat_lines(tx, stdout);
+            } else if code == 0 {
+                let _ = tx.send(WorkerEvent::Line(
+                    lang.choose(
+                        "Модель не вернула текстовый ответ.",
+                        "The model returned no text response.",
+                    )
+                    .to_string(),
+                ));
+            } else {
+                // Показываем КОД выхода и причину — раньше код терялся, а пустой
+                // stderr давал немое «no stderr output» (см. chat_error_lines).
+                for line in chat_error_lines(provider.as_str(), code, stderr, lang) {
+                    let _ = tx.send(WorkerEvent::Line(line));
+                }
+            }
+
+            if planning {
+                let _ = tx.send(WorkerEvent::PlanReady(
+                    provider,
+                    stdout.to_string(),
+                    code,
+                    usage,
+                ));
+            } else {
+                let _ = tx.send(WorkerEvent::ChatDone(provider, code, usage));
+            }
+        }
+        Ok(ChatRunResult::Cancelled) => {
+            let _ = tx.send(WorkerEvent::Cancelled);
+        }
+        Err(err) => {
+            let _ = tx.send(WorkerEvent::Failed(format!(
+                "{}: {}",
+                provider_display(provider.as_str(), lang),
+                err
+            )));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn drain(rx: &mpsc::Receiver<WorkerEvent>) -> Vec<WorkerEvent> {
+        rx.try_iter().collect()
+    }
+
+    // --- Мутант 111:16 (delete `!` в логин-гейте) ---
+
+    #[test]
+    fn auth_gate_blocks_and_emits_when_unauthenticated() {
+        let (tx, rx) = mpsc::channel();
+        let ok = chat_auth_ok(false, Provider::Claude, &tx);
+        let events = drain(&rx);
+        assert!(!ok);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            WorkerEvent::AuthMissing(Provider::Claude)
+        ));
+    }
+
+    #[test]
+    fn auth_gate_passes_silently_when_authenticated() {
+        let (tx, rx) = mpsc::channel();
+        let ok = chat_auth_ok(true, Provider::Claude, &tx);
+        let events = drain(&rx);
+        assert!(ok);
+        assert!(events.is_empty());
+    }
+
+    // --- Мутант 131:24 (delete `!` в `!stdout.is_empty()`) ---
+
+    #[test]
+    fn nonempty_stdout_emits_chat_line_and_done() {
+        let (tx, rx) = mpsc::channel();
+        emit_chat_run_result(
+            Ok(ChatRunResult::Completed(0, "hello".into(), "".into(), None)),
+            Provider::Claude,
+            false,
+            Language::En,
+            &tx,
+        );
+        let events = drain(&rx);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::ChatLine(s) if s.contains("hello"))));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::ChatDone(..))));
+    }
+
+    // --- Мутант 133:36 (`==` → `!=` в `code == 0`) ---
+
+    #[test]
+    fn empty_stdout_zero_code_emits_no_text_line() {
+        let (tx, rx) = mpsc::channel();
+        emit_chat_run_result(
+            Ok(ChatRunResult::Completed(0, "".into(), "".into(), None)),
+            Provider::Claude,
+            false,
+            Language::En,
+            &tx,
+        );
+        let events = drain(&rx);
+        assert!(events.iter().any(
+            |e| matches!(e, WorkerEvent::Line(s) if s == "The model returned no text response.")
+        ));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::ChatDone(..))));
+    }
+
+    // --- Дополнительные ветви ---
+
+    #[test]
+    fn nonzero_code_emits_error_lines_and_done() {
+        let (tx, rx) = mpsc::channel();
+        emit_chat_run_result(
+            Ok(ChatRunResult::Completed(1, "".into(), "boom".into(), None)),
+            Provider::Claude,
+            false,
+            Language::En,
+            &tx,
+        );
+        let events = drain(&rx);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::Line(s) if s.contains("boom") || s.contains('1'))));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::ChatDone(_, 1, _))));
+    }
+
+    #[test]
+    fn cancelled_result_emits_cancelled() {
+        let (tx, rx) = mpsc::channel();
+        emit_chat_run_result(
+            Ok(ChatRunResult::Cancelled),
+            Provider::Claude,
+            false,
+            Language::En,
+            &tx,
+        );
+        let events = drain(&rx);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], WorkerEvent::Cancelled));
+    }
+
+    #[test]
+    fn err_result_emits_failed_with_cause() {
+        let (tx, rx) = mpsc::channel();
+        emit_chat_run_result(
+            Err(io::Error::other("oops")),
+            Provider::Claude,
+            false,
+            Language::En,
+            &tx,
+        );
+        let events = drain(&rx);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            WorkerEvent::Failed(msg) => assert!(msg.contains("oops")),
+            other => panic!("ожидали Failed, получили {other:?}"),
+        }
+    }
+
+    #[test]
+    fn planning_emits_plan_ready_not_chat_done() {
+        let (tx, rx) = mpsc::channel();
+        emit_chat_run_result(
+            Ok(ChatRunResult::Completed(0, "план".into(), "".into(), None)),
+            Provider::Claude,
+            true,
+            Language::En,
+            &tx,
+        );
+        let events = drain(&rx);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::PlanReady(..))));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, WorkerEvent::ChatDone(..))));
     }
 }
