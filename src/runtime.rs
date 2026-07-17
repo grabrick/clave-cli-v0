@@ -928,6 +928,8 @@ fn handle_plugin_list_key(app: &mut App, key: KeyEvent, ctrl: bool) {
             let last = app.filtered_plugins().len().saturating_sub(1);
             app.plugins_index = (app.plugins_index + 1).min(last);
         }
+        // ←/→ — переключить провайдера (Claude ⇄ Codex); иначе codex тонет под каталогом claude.
+        KeyCode::Left | KeyCode::Right => app.toggle_plugins_provider(),
         KeyCode::Enter => app.plugin_enter(),
         KeyCode::Char('e') if ctrl => app.plugin_toggle(),
         KeyCode::Char('u') if ctrl => app.plugin_update(),
@@ -2995,6 +2997,28 @@ mod tests {
 
         handle_plugins_key(&mut app, key(KeyCode::BackTab));
         assert_eq!(app.plugins_tab, PluginsTab::Sources, "Shift+Tab — назад");
+    }
+
+    /// ←/→ в списковом табе переключают провайдера (иначе codex тонет под каталогом claude).
+    #[test]
+    fn left_right_toggles_provider_in_list_tabs() {
+        let mut app = app_for_keys();
+        app.overlay = Overlay::Plugins;
+        app.plugins_tab = PluginsTab::Catalog;
+        assert_eq!(
+            app.plugins_provider,
+            Provider::Claude,
+            "по умолчанию Claude"
+        );
+
+        handle_plugins_key(&mut app, key(KeyCode::Right));
+        assert_eq!(
+            app.plugins_provider,
+            Provider::Codex,
+            "→ переключил на Codex"
+        );
+        handle_plugins_key(&mut app, key(KeyCode::Left));
+        assert_eq!(app.plugins_provider, Provider::Claude, "← вернул Claude");
     }
 
     /// `a` открывает ввод адреса; печать его наполняет; Tab меняет провайдера (а не выходит);

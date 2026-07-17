@@ -130,6 +130,7 @@ impl App {
         // Панель всегда открывается на «Обзоре», без залипшего таба/ввода с прошлого раза.
         self.plugins_tab = PluginsTab::Overview;
         self.overview_index = 0;
+        self.plugins_provider = Provider::Claude;
         self.plugins_query.clear();
         self.marketplace_input = None;
         self.marketplace_confirm = None;
@@ -160,14 +161,20 @@ impl App {
         self.plugins_loading = false;
     }
 
-    /// Плагины активного таба: «Установленные» → установленные, «Каталог» → доступные (с
-    /// инкрементальным поиском по имени). Прочие табы (Обзор/Источники) список не показывают.
+    /// Плагины активного таба: «Установленные» → установленные, «Каталог» → доступные — и только
+    /// текущего провайдера (`←/→` переключает; каталог claude огромен и иначе прячет codex). В
+    /// Каталоге — ещё инкрементальный поиск по имени. Обзор/Источники список не показывают.
     pub(crate) fn filtered_plugins(&self) -> Vec<&PluginEntry> {
-        let base: Vec<&PluginEntry> = match self.plugins_tab {
-            PluginsTab::Installed => self.plugins.iter().filter(|p| p.installed).collect(),
-            PluginsTab::Catalog => self.plugins.iter().filter(|p| !p.installed).collect(),
+        let installed_wanted = match self.plugins_tab {
+            PluginsTab::Installed => true,
+            PluginsTab::Catalog => false,
             PluginsTab::Overview | PluginsTab::Sources => return Vec::new(),
         };
+        let base: Vec<&PluginEntry> = self
+            .plugins
+            .iter()
+            .filter(|p| p.installed == installed_wanted && p.provider == self.plugins_provider)
+            .collect();
         // Поиск живёт только в Каталоге (там сотни плагинов); Установленных единицы.
         if self.plugins_tab == PluginsTab::Catalog && !self.plugins_query.is_empty() {
             let needle = self.plugins_query.to_lowercase();
@@ -177,6 +184,12 @@ impl App {
                 .collect();
         }
         base
+    }
+
+    /// `←/→` в списковых табах: переключить показываемого провайдера (Claude ⇄ Codex).
+    pub(crate) fn toggle_plugins_provider(&mut self) {
+        self.plugins_provider = other_provider(self.plugins_provider);
+        self.plugins_index = 0;
     }
 
     /// Сводка для «Обзора»: числа установленного/доступного/источников.
@@ -664,6 +677,7 @@ mod tests {
             },
         ];
         app.plugins_tab = PluginsTab::Catalog; // поиск живёт в Каталоге (доступные)
+        app.plugins_provider = Provider::Codex; // documents — codex-доступный
         app.plugins_query = "doc".into();
         let filtered = app.filtered_plugins();
         assert_eq!(filtered.len(), 1);
@@ -691,14 +705,25 @@ mod tests {
             plugin_entry(Provider::Codex, "avail", false),
         ];
 
+        // Установленные + провайдер Claude (по умолчанию) → только claude-installed.
         app.plugins_tab = PluginsTab::Installed;
         let inst = app.filtered_plugins();
-        assert_eq!(inst.len(), 1, "Установленные — только installed");
+        assert_eq!(
+            inst.len(),
+            1,
+            "Установленные — только installed текущего провайдера"
+        );
         assert_eq!(inst[0].name, "inst");
 
+        // Каталог + Claude → пусто (доступный-то codex); ←/→ показывает его.
         app.plugins_tab = PluginsTab::Catalog;
+        assert!(
+            app.filtered_plugins().is_empty(),
+            "codex-доступный не виден под Claude"
+        );
+        app.toggle_plugins_provider(); // → Codex
         let avail = app.filtered_plugins();
-        assert_eq!(avail.len(), 1, "Каталог — только доступные");
+        assert_eq!(avail.len(), 1, "Каталог+Codex — доступный codex");
         assert_eq!(avail[0].name, "avail");
 
         // Обзор и Источники список плагинов не показывают.
