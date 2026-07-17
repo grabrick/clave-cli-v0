@@ -14,11 +14,18 @@ pub(crate) fn loader_line(app: &App) -> Line<'static> {
     // или активность инструментов. В тишине ожидания первого байта — статично.
     let active = reasoning || answering || !app.run_activity.is_empty();
     let phrase = if reasoning {
-        app.lang.choose("Рассуждаю", "Reasoning")
+        // В рассуждении показываем УСИЛИЕ, а не расход: видно, что модель думает на заданном
+        // уровне, до того как пошёл ответ (и появилась осмысленная оценка расхода).
+        format!(
+            "{} {}",
+            app.lang
+                .choose("Рассуждаю с усилием", "Reasoning at effort"),
+            app.human_effort_summary()
+        )
     } else if answering {
-        app.lang.choose("Пишу ответ", "Writing answer")
+        app.lang.choose("Пишу ответ", "Writing answer").to_string()
     } else {
-        app.lang.choose("Думаю", "Thinking")
+        app.lang.choose("Думаю", "Thinking").to_string()
     };
     let label = if app.run_label.is_empty() {
         app.mode.as_str().to_string()
@@ -35,7 +42,9 @@ pub(crate) fn loader_line(app: &App) -> Line<'static> {
         estimate_tokens(&app.live_answer)
     };
     let tokens = app.run_token_estimate.unwrap_or(0) + out_tokens;
-    let detail = if tokens > 0 {
+    // Расход (≈) показываем ТОЛЬКО когда пошёл ответ: в рассуждении/ожидании висела бы оценка
+    // входного промпта и читалась бы как «уже потрачено», хотя генерация ещё не началась.
+    let detail = if answering && tokens > 0 {
         format!(
             "({} · {} · ≈ {} {})",
             format_elapsed(elapsed),
@@ -234,7 +243,8 @@ mod tests {
         app.run_started_at = Some(Instant::now());
         app.run_label = "Claude".to_string();
         app.run_token_estimate = Some(1200);
-        // Поток ответа пуст — показываем оценку промта.
+        // Расход (≈) показываем на ОТВЕТЕ (UX-001): ставим живой ответ.
+        app.live_answer = "x".to_string();
         let text = line_text(&loader_line(&app));
         assert!(text.contains('≈'), "есть пометка оценки: {text}");
         assert!(text.contains("1.2k"), "форматированный счётчик: {text}");
@@ -245,6 +255,34 @@ mod tests {
         app.live_answer.clear();
         let text = line_text(&loader_line(&app));
         assert!(!text.contains('≈'), "нет токенов — нет пометки: {text}");
+    }
+
+    #[test]
+    fn loader_hides_spend_and_shows_effort_until_the_answer_starts() {
+        let mut app = loader_app();
+        app.run_started_at = Some(Instant::now());
+        app.run_token_estimate = Some(1200);
+        // Фаза рассуждения: расход СКРЫТ (оценка входа не читается как «уже потрачено»),
+        // зато видно усилие.
+        app.live_reasoning = "думаю".to_string();
+        app.live_answer.clear();
+        let reasoning = line_text(&loader_line(&app));
+        assert!(
+            !reasoning.contains('≈'),
+            "в рассуждении расход скрыт: {reasoning}"
+        );
+        assert!(
+            reasoning.contains("усилием"),
+            "показываем усилие: {reasoning}"
+        );
+        // Пошёл ответ → расход появляется.
+        app.live_reasoning.clear();
+        app.live_answer = "печатаю".to_string();
+        let answering = line_text(&loader_line(&app));
+        assert!(
+            answering.contains('≈'),
+            "на ответе расход появляется: {answering}"
+        );
     }
 
     #[test]

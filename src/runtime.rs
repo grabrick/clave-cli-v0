@@ -13,6 +13,8 @@ pub(crate) enum Launch {
     /// Задача натуральным языком → встроенный движок.
     Engine,
     Tui,
+    /// `--resume`/`-r`: TUI сразу с открытым списком сохранённых чатов.
+    ResumeTui,
 }
 
 /// Разбор аргументов в РЕШЕНИЕ — отдельно от его исполнения.
@@ -32,6 +34,11 @@ pub(crate) fn launch_for(args: &[String]) -> Launch {
     }
     if args.first().map(String::as_str) == Some("--run") {
         return Launch::Headless;
+    }
+    // `--resume`/`-r`: открыть TUI сразу на списке сохранённых чатов (иначе флаг ушёл бы в
+    // UnknownFlag ниже — resume существовал только как команда `/resume` внутри TUI).
+    if args.iter().any(|arg| arg == "-r" || arg == "--resume") {
+        return Launch::ResumeTui;
     }
     // Неизвестный флаг (например, удалённый `--serve`) не должен молча уходить в движок как
     // «задача»: задачи натуральным языком с дефиса не начинаются.
@@ -65,7 +72,8 @@ pub(crate) fn main_entry() -> AnyResult<()> {
             Ok(())
         }
         Launch::Engine => run_engine_direct(args),
-        Launch::Tui => run_tui(),
+        Launch::Tui => run_tui(false),
+        Launch::ResumeTui => run_tui(true),
     }
 }
 
@@ -91,7 +99,7 @@ fn needs_welcome(transcript: &[String]) -> bool {
 /// замечал — то есть `clave --help` мог начать печатать пустоту, а CI бы это пропустил.
 pub(crate) fn usage_text() -> String {
     format!(
-        "{APP_COMMAND}\n\nUsage:\n  {APP_COMMAND}                 Open TUI\n  {APP_COMMAND} <task...>       Run task directly through {ENGINE_NAME}\n  {APP_COMMAND} --help          Show help\n"
+        "{APP_COMMAND}\n\nUsage:\n  {APP_COMMAND}                 Open TUI\n  {APP_COMMAND} --resume        Open TUI on the saved chats list\n  {APP_COMMAND} <task...>       Run task directly through {ENGINE_NAME}\n  {APP_COMMAND} --help          Show help\n"
     )
 }
 
@@ -105,7 +113,7 @@ pub(crate) fn run_engine_direct(args: Vec<String>) -> AnyResult<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-pub(crate) fn run_tui() -> AnyResult<()> {
+pub(crate) fn run_tui(open_resume: bool) -> AnyResult<()> {
     force_color_output(true);
     install_panic_hook();
     let _guard = TerminalGuard::new()?;
@@ -114,6 +122,10 @@ pub(crate) fn run_tui() -> AnyResult<()> {
     if needs_welcome(&app.transcript) {
         // В файл не пишется (не через push_system) — живёт только в живом блоке.
         app.transcript = welcome_lines(&app);
+    }
+    // `clave --resume`: сразу открыть список сохранённых чатов (пусто — покажет подсказку).
+    if open_resume {
+        app.open_chats_picker();
     }
     let mut renderer = LiveRenderer::new();
     run_app(&mut app, &mut renderer)
@@ -1958,6 +1970,10 @@ mod tests {
         assert_eq!(launch_for(&argv(&["--version"])), Launch::Version);
         assert_eq!(launch_for(&argv(&["--run", "tandem"])), Launch::Headless);
         assert_eq!(launch_for(&argv(&["напиши тест"])), Launch::Engine);
+        // --resume / -r открывают TUI на списке сохранённых чатов (иначе флаг уехал бы в
+        // UnknownFlag — resume был только командой /resume внутри TUI).
+        assert_eq!(launch_for(&argv(&["--resume"])), Launch::ResumeTui);
+        assert_eq!(launch_for(&argv(&["-r"])), Launch::ResumeTui);
 
         // Справка перекрывает всё: `clave задача --help` — это просьба о справке.
         assert_eq!(launch_for(&argv(&["задача", "--help"])), Launch::Usage);
@@ -1993,6 +2009,10 @@ mod tests {
             "справка обязана назвать команду"
         );
         assert!(text.contains("--help"), "справка обязана упомянуть --help");
+        assert!(
+            text.contains("--resume"),
+            "справка обязана упомянуть --resume"
+        );
         assert!(
             text.contains("<task...>"),
             "справка обязана показать запуск задачи"

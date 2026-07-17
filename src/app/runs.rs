@@ -357,8 +357,16 @@ fn emit_chat_run_result(
             let stdout = stdout.trim();
             let stderr = stderr.trim();
 
-            if !stdout.is_empty() {
+            if !stdout.is_empty() && code == 0 {
                 emit_chat_lines(tx, stdout);
+            } else if !stdout.is_empty() {
+                // Ненулевой код, но в result есть текст — это structured error claude
+                // (недоступная модель, api-ошибка, лимит: сообщение доезжает в result).
+                // Показываем ЯВНО как ошибку с кодом, а не как обычный ответ ⏺ — иначе
+                // причина сбоя читается как «ответ модели».
+                for line in chat_error_lines(provider.as_str(), code, stdout, lang) {
+                    let _ = tx.send(WorkerEvent::Line(line));
+                }
             } else if code == 0 {
                 let _ = tx.send(WorkerEvent::Line(
                     lang.choose(
@@ -368,8 +376,9 @@ fn emit_chat_run_result(
                     .to_string(),
                 ));
             } else {
-                // Показываем КОД выхода и причину — раньше код терялся, а пустой
-                // stderr давал немое «no stderr output» (см. chat_error_lines).
+                // Пустой stdout И ненулевой код: обрыв ДО result (сеть/лимит/таймаут).
+                // Пустой stderr дал бы немое «no stderr output» — chat_error_lines честно
+                // назовёт транзиент и предложит повтор.
                 for line in chat_error_lines(provider.as_str(), code, stderr, lang) {
                     let _ = tx.send(WorkerEvent::Line(line));
                 }
@@ -525,6 +534,43 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, WorkerEvent::ChatDone(_, 1, _))));
+    }
+
+    #[test]
+    fn nonzero_code_with_stdout_shows_structured_error_not_an_answer() {
+        // claude вернул текст в result при коде ≠ 0 (structured error: недоступная модель,
+        // лимит, api-ошибка). Показываем как ОШИБКУ с кодом, а не как обычный ответ ⏺.
+        let (tx, rx) = mpsc::channel();
+        emit_chat_run_result(
+            Ok(ChatRunResult::Completed(
+                1,
+                "There's an issue with the selected model".into(),
+                "".into(),
+                None,
+            )),
+            Provider::Claude,
+            false,
+            Language::En,
+            &tx,
+        );
+        let events = drain(&rx);
+        // Заголовок ошибки с кодом + текст причины из result.
+        assert!(
+            events.iter().any(
+                |e| matches!(e, WorkerEvent::Line(s) if s.contains("error") && s.contains('1'))
+            ),
+            "заголовок ошибки с кодом"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, WorkerEvent::Line(s)
+                if s.contains("issue with the selected model"))),
+            "текст ошибки показан"
+        );
+        // НЕ как обычный ответ: structured error не должен идти через ChatLine («⏺ …»).
+        assert!(
+            !events.iter().any(|e| matches!(e, WorkerEvent::ChatLine(_))),
+            "structured error не должен показываться обычным ответом"
+        );
     }
 
     #[test]
