@@ -136,6 +136,12 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         description_ru: "Удалить мелкие сохранённые чаты",
     },
     CommandSpec {
+        usage: "/plugins",
+        insert: "/plugins",
+        description_en: "Manage Claude/Codex plugins",
+        description_ru: "Плагины Claude и Codex",
+    },
+    CommandSpec {
         usage: "/resume <id>",
         insert: "/resume ",
         description_en: "Resume a saved chat",

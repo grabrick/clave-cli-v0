@@ -507,6 +507,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         Overlay::Effort => handle_effort_key(app, key),
         Overlay::Settings => handle_settings_key(app, key),
         Overlay::Chats => handle_chats_key(app, key),
+        Overlay::Plugins => handle_plugins_key(app, key),
         Overlay::Shortcuts => handle_shortcuts_key(app, key),
         Overlay::Search => handle_search_key(app, key),
     }
@@ -842,6 +843,108 @@ pub(crate) fn handle_search_key(app: &mut App, key: KeyEvent) {
         KeyCode::Up => app.search_step(-1),
         KeyCode::Backspace => app.search_backspace(),
         KeyCode::Char(ch) if !ch.is_control() => app.search_input(ch),
+        _ => {}
+    }
+}
+
+/// Клавиши панели плагинов: навигация, поиск (прямой ввод), действия и подтверждение.
+pub(crate) fn handle_plugins_key(app: &mut App, key: KeyEvent) {
+    // Режим marketplace-источников — свой набор клавиш (Tab внутри него уводит обратно).
+    if app.plugins_marketplace_mode {
+        handle_marketplace_key(app, key);
+        return;
+    }
+
+    // Строка подтверждения перехватывает ввод: только да/отмена.
+    if app.plugins_confirm.is_some() {
+        match key.code {
+            KeyCode::Enter => app.confirm_plugin_action(),
+            KeyCode::Esc => app.cancel_plugin_action(),
+            _ => {}
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Up => app.plugins_index = app.plugins_index.saturating_sub(1),
+        KeyCode::Down => {
+            let last = app.filtered_plugins().len().saturating_sub(1);
+            app.plugins_index = (app.plugins_index + 1).min(last);
+        }
+        KeyCode::Enter => app.plugin_enter(),
+        // Действия — на Ctrl+клавишах, чтобы буквы уходили в поиск, а не путались с вводом.
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => app.plugin_toggle(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => app.plugin_update(),
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.handle_ctrl_c(),
+        // Tab — к управлению marketplace-источниками (буквы заняты поиском, потому таб).
+        KeyCode::Tab => app.toggle_marketplace_mode(),
+        // Инкрементальный поиск: прямой ввод фильтрует список.
+        KeyCode::Char(c) => {
+            app.plugins_query.push(c);
+            app.plugins_index = 0;
+        }
+        KeyCode::Backspace => {
+            app.plugins_query.pop();
+            app.plugins_index = 0;
+        }
+        KeyCode::Esc => {
+            // Esc сначала снимает поиск, затем закрывает панель.
+            if app.plugins_query.is_empty() {
+                app.overlay = Overlay::None;
+            } else {
+                app.plugins_query.clear();
+                app.plugins_index = 0;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Клавиши режима marketplace-источников. В источниках нет поиска (их единицы), поэтому буквы
+/// свободны под действия: `a` — добавить, `Enter` — удалить (через подтверждение), `Tab`/`Esc` —
+/// назад к плагинам. Ввод адреса и подтверждение удаления перехватывают ввод целиком.
+fn handle_marketplace_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Ctrl+C выходит из приложения из любого под-состояния.
+    if ctrl && matches!(key.code, KeyCode::Char('c')) {
+        app.handle_ctrl_c();
+        return;
+    }
+
+    // Ввод адреса нового источника: печать, Tab — сменить провайдера, Enter — добавить, Esc — отмена.
+    if app.marketplace_input.is_some() {
+        match key.code {
+            KeyCode::Enter => app.marketplace_submit_add(),
+            KeyCode::Esc => app.marketplace_cancel_input(),
+            KeyCode::Tab => app.marketplace_toggle_add_provider(),
+            KeyCode::Backspace => app.marketplace_input_backspace(),
+            KeyCode::Char(c) if !ctrl => app.marketplace_input_push(c),
+            _ => {}
+        }
+        return;
+    }
+
+    // Подтверждение удаления источника: только да/отмена.
+    if app.marketplace_confirm.is_some() {
+        match key.code {
+            KeyCode::Enter => app.confirm_marketplace_remove(),
+            KeyCode::Esc => app.cancel_marketplace_remove(),
+            _ => {}
+        }
+        return;
+    }
+
+    // Просмотр источников.
+    match key.code {
+        KeyCode::Up => app.marketplaces_index = app.marketplaces_index.saturating_sub(1),
+        KeyCode::Down => {
+            let last = app.marketplaces.len().saturating_sub(1);
+            app.marketplaces_index = (app.marketplaces_index + 1).min(last);
+        }
+        KeyCode::Char('a') => app.marketplace_start_add(),
+        KeyCode::Enter => app.marketplace_enter_remove(),
+        // Tab/Esc — назад к списку плагинов.
+        KeyCode::Tab | KeyCode::Esc => app.toggle_marketplace_mode(),
         _ => {}
     }
 }
@@ -2823,5 +2926,105 @@ mod tests {
             1,
             "Ctrl+C до навигации по шагу не доходит"
         );
+    }
+
+    // ───────────────────────── handle_marketplace_key ─────────────────────────
+
+    fn market(provider: Provider, name: &str) -> Marketplace {
+        Marketplace {
+            provider,
+            name: name.to_string(),
+            source: format!("src/{name}"),
+        }
+    }
+
+    /// Tab в панели плагинов уводит в режим marketplace-источников (не закрывает панель).
+    #[test]
+    fn tab_enters_marketplace_mode_from_plugins() {
+        let mut app = app_for_keys();
+        app.overlay = Overlay::Plugins;
+        // Не читать реальный ~/.claude и не поднимать codex при загрузке источников.
+        app.claude_home = env::temp_dir().join(format!("clave-nohome-{}", std::process::id()));
+        app.run_hooks.spawn = |_tx, _body| {};
+        assert!(!app.plugins_marketplace_mode);
+
+        handle_plugins_key(&mut app, key(KeyCode::Tab));
+
+        assert!(app.plugins_marketplace_mode, "Tab открыл источники");
+        assert_eq!(app.overlay, Overlay::Plugins, "панель осталась открытой");
+    }
+
+    /// `a` открывает ввод адреса; печать его наполняет; Tab меняет провайдера (а не выходит);
+    /// Backspace стирает; Esc закрывает ввод, оставаясь в режиме источников.
+    #[test]
+    fn marketplace_add_input_types_toggles_provider_and_cancels() {
+        let mut app = app_for_keys();
+        app.overlay = Overlay::Plugins;
+        app.plugins_marketplace_mode = true;
+        app.marketplaces = vec![market(Provider::Claude, "official")];
+        app.marketplaces_index = 0;
+
+        handle_plugins_key(&mut app, key(KeyCode::Char('a')));
+        let add = app.marketplace_input.as_ref().expect("a открыл ввод");
+        assert_eq!(
+            add.provider,
+            Provider::Claude,
+            "цель — провайдер выбранного"
+        );
+
+        handle_plugins_key(&mut app, key(KeyCode::Char('x')));
+        handle_plugins_key(&mut app, key(KeyCode::Char('y')));
+        assert_eq!(
+            app.marketplace_input.as_ref().unwrap().source,
+            "xy",
+            "печать наполнила адрес"
+        );
+
+        handle_plugins_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(
+            app.marketplace_input.as_ref().unwrap().provider,
+            Provider::Codex,
+            "Tab в вводе сменил провайдера, а не вышел из режима"
+        );
+
+        handle_plugins_key(&mut app, key(KeyCode::Backspace));
+        assert_eq!(app.marketplace_input.as_ref().unwrap().source, "x");
+
+        handle_plugins_key(&mut app, key(KeyCode::Esc));
+        assert!(app.marketplace_input.is_none(), "Esc закрыл ввод");
+        assert!(app.plugins_marketplace_mode, "но из режима не вышел");
+    }
+
+    /// Enter на источнике просит подтверждения удаления; Esc отменяет его, следующий Esc
+    /// возвращает к списку плагинов, не закрывая панель.
+    #[test]
+    fn marketplace_enter_confirms_remove_then_esc_steps_back() {
+        let mut app = app_for_keys();
+        app.overlay = Overlay::Plugins;
+        app.plugins_marketplace_mode = true;
+        app.run_hooks.spawn = |_tx, _body| {};
+        app.marketplaces = vec![market(Provider::Codex, "openai-bundled")];
+        app.marketplaces_index = 0;
+
+        handle_plugins_key(&mut app, key(KeyCode::Enter));
+        let confirm = app
+            .marketplace_confirm
+            .as_ref()
+            .expect("Enter → подтверждение");
+        assert_eq!(confirm.name, "openai-bundled");
+
+        handle_plugins_key(&mut app, key(KeyCode::Esc));
+        assert!(
+            app.marketplace_confirm.is_none(),
+            "Esc отменил подтверждение"
+        );
+        assert!(app.plugins_marketplace_mode, "остались в источниках");
+
+        handle_plugins_key(&mut app, key(KeyCode::Esc));
+        assert!(
+            !app.plugins_marketplace_mode,
+            "второй Esc вернул к плагинам"
+        );
+        assert_eq!(app.overlay, Overlay::Plugins, "панель не закрылась");
     }
 }
