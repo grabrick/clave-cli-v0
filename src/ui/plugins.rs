@@ -1,56 +1,79 @@
 use super::*;
 
-/// Панель `/plugins`: плагины обоих провайдеров раздельными секциями (Claude, затем Codex).
-/// Фаза 1 — только просмотр: статусы `●`установлен/`○`доступен, вкл/выкл, версия. Выделение
-/// сквозное по `plugins_index` (навигация идёт по объединённому списку `app.plugins`).
+/// Панель `/plugins`: таб-бар (Обзор/Установленные/Каталог/Источники) под шапкой, тело — по
+/// активному табу. Вход на «Обзор» (сводка), чтобы не вываливать сотни доступных плагинов сразу;
+/// списки — в «Установленных»/«Каталоге» (со скроллом и поиском), источники — в своём табе.
 pub(crate) fn draw_plugins_screen(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Clear, area);
 
-    // Режим источников — свой рендер (список marketplace обоих провайдеров + ввод/подтверждение).
-    if app.plugins_marketplace_mode {
-        draw_marketplace_screen(frame, area, app);
-        return;
-    }
+    let header = plugins_header_lines(app, area.width);
+    // Тело и подсказка зависят от таба; `cursor_row` нужен только списку (там скролл).
+    let (body, cursor_row, footer) = match app.plugins_tab {
+        PluginsTab::Overview => (overview_body(app), 0, vec![overview_footer(app)]),
+        PluginsTab::Installed | PluginsTab::Catalog => {
+            let (body, cursor_row) = plugins_body(app);
+            (body, cursor_row, vec![plugin_list_footer(app)])
+        }
+        PluginsTab::Sources => (marketplace_body(app), 0, sources_footer(app)),
+    };
+    render_paneled(frame, area, header, body, cursor_row, footer);
+}
 
-    // Хедер и подсказка/подтверждение зафиксированы; между ними — скроллируемое тело со
-    // списком (реальный каталог claude — сотни доступных, иначе Codex и установленные за краем).
-    let header_text = if app.plugins_query.is_empty() {
-        "› /plugins".to_string()
-    } else {
+/// Хедер панели: заголовок (+ поиск в Каталоге), таб-бар, разделитель, пустая строка.
+fn plugins_header_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let title = if app.plugins_tab == PluginsTab::Catalog && !app.plugins_query.is_empty() {
         format!(
             "› /plugins  {}: {}",
             app.lang.choose("поиск", "search"),
             app.plugins_query
         )
+    } else {
+        "› /plugins".to_string()
     };
-    let header_lines = vec![
+    vec![
         Line::styled(
-            header_text,
+            title,
             Style::default()
                 .fg(app.theme.accent())
                 .add_modifier(Modifier::BOLD),
         ),
-        separator_line(area.width, app.theme),
+        tab_bar_line(app),
+        separator_line(width, app.theme),
         Line::from(""),
-    ];
+    ]
+}
 
-    let footer_line = if let Some(pending) = &app.plugins_confirm {
-        confirm_line(pending, app.lang)
-    } else {
-        Line::from(Span::styled(
-            app.lang.choose(
-                "↑↓ выбор · Enter уст/удал · ^E вкл/выкл · ^U обновить · Tab источники · Esc",
-                "↑↓ move · Enter inst/rm · ^E on/off · ^U update · Tab sources · Esc",
-            ),
-            Style::default().fg(Color::DarkGray),
-        ))
-    };
+/// Таб-бар: метки всех табов, активный подсвечен.
+fn tab_bar_line(app: &App) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, tab) in PluginsTab::ALL.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let style = if *tab == app.plugins_tab {
+            Style::default()
+                .fg(Color::White)
+                .bg(app.theme.accent_bg())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(app.theme.accent_soft())
+        };
+        spans.push(Span::styled(format!(" {} ", tab.label(app.lang)), style));
+    }
+    Line::from(spans)
+}
 
-    let (body_lines, cursor_row) = plugins_body(app);
-
-    // Раскладка: хедер (3) сверху, подсказка (1) снизу, остальное — тело.
-    let header_h = 3u16.min(area.height);
-    let footer_h = if area.height > header_h { 1 } else { 0 };
+/// Общая раскладка: фиксированные хедер сверху и подсказка снизу, скроллируемое тело между.
+fn render_paneled(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    header: Vec<Line<'static>>,
+    body: Vec<Line<'static>>,
+    cursor_row: usize,
+    footer: Vec<Line<'static>>,
+) {
+    let header_h = (header.len() as u16).min(area.height);
+    let footer_h = (footer.len() as u16).min(area.height.saturating_sub(header_h));
     let body_h = area.height.saturating_sub(header_h + footer_h);
     let header_area = Rect {
         height: header_h,
@@ -66,14 +89,100 @@ pub(crate) fn draw_plugins_screen(frame: &mut Frame<'_>, area: Rect, app: &App) 
         height: footer_h,
         ..area
     };
-
-    let offset = scroll_offset(cursor_row, body_h as usize, body_lines.len());
-
-    frame.render_widget(Paragraph::new(header_lines), header_area);
-    frame.render_widget(Paragraph::new(body_lines).scroll((offset, 0)), body_area);
+    let offset = scroll_offset(cursor_row, body_h as usize, body.len());
+    frame.render_widget(Paragraph::new(header), header_area);
+    frame.render_widget(Paragraph::new(body).scroll((offset, 0)), body_area);
     if footer_h > 0 {
-        frame.render_widget(Paragraph::new(vec![footer_line]), footer_area);
+        frame.render_widget(Paragraph::new(footer), footer_area);
     }
+}
+
+/// Тело таба «Обзор»: сводка из трёх строк, выбранная подсвечена (Enter уводит в таб).
+fn overview_body(app: &App) -> Vec<Line<'static>> {
+    let counts = app.plugins_overview();
+    let sources_word = if app.marketplaces_loading && counts.sources == 0 {
+        app.lang.choose("загрузка…", "loading…").to_string()
+    } else {
+        counts.sources.to_string()
+    };
+    let rows = [
+        (
+            app.lang.choose("Установлено", "Installed"),
+            format!(
+                "{}   Claude {} · Codex {}",
+                counts.installed, counts.claude_installed, counts.codex_installed
+            ),
+        ),
+        (
+            app.lang.choose("Доступно", "Available"),
+            format!(
+                "{}   {} {}",
+                counts.available,
+                app.lang.choose("в источниках:", "in sources:"),
+                sources_word
+            ),
+        ),
+        (
+            app.lang.choose("Источники", "Sources"),
+            sources_word.clone(),
+        ),
+    ];
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            app.lang.choose("Плагины Clave", "Clave plugins"),
+            Style::default()
+                .fg(app.theme.accent())
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for (index, (label, value)) in rows.iter().enumerate() {
+        let selected = index == app.overview_index;
+        let style = if selected {
+            Style::default()
+                .fg(Color::White)
+                .bg(app.theme.accent_bg())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(app.theme.accent_soft())
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(app.theme.accent()),
+            ),
+            Span::styled(format!("{label:<12} {value}"), style),
+        ]));
+    }
+    lines
+}
+
+fn overview_footer(app: &App) -> Line<'static> {
+    Line::from(Span::styled(
+        app.lang.choose(
+            "↑↓ выбор · Enter — открыть · ↹ таб · 1–4 · Esc",
+            "↑↓ move · Enter — open · ↹ tab · 1–4 · Esc",
+        ),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+fn plugin_list_footer(app: &App) -> Line<'static> {
+    if let Some(pending) = &app.plugins_confirm {
+        return confirm_line(pending, app.lang);
+    }
+    let hint = match app.plugins_tab {
+        PluginsTab::Installed => app.lang.choose(
+            "↑↓ · Enter удалить · ^E вкл/выкл · ^U обновить · ↹ таб · Esc",
+            "↑↓ · Enter remove · ^E on/off · ^U update · ↹ tab · Esc",
+        ),
+        _ => app.lang.choose(
+            "↑↓ · Enter установить · ввод — поиск · ↹ таб · Esc",
+            "↑↓ · Enter install · type to search · ↹ tab · Esc",
+        ),
+    };
+    Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))
 }
 
 /// Строит строки тела панели (секции Claude/Codex со статусами) и позицию строки выделенного
@@ -129,22 +238,10 @@ fn scroll_offset(cursor_row: usize, viewport: usize, total: usize) -> u16 {
     cursor_row.saturating_sub(viewport - 1).min(max_offset) as u16
 }
 
-/// Рендер режима marketplace-источников: раздельные секции Claude/Codex, снизу — строка ввода
-/// нового адреса, строка подтверждения удаления или подсказки. Выделение сквозное по
-/// `marketplaces_index` (курсор идёт по объединённому списку `app.marketplaces`).
-fn draw_marketplace_screen(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let mut lines = vec![
-        Line::styled(
-            app.lang
-                .choose("› /plugins · источники", "› /plugins · sources"),
-            Style::default()
-                .fg(app.theme.accent())
-                .add_modifier(Modifier::BOLD),
-        ),
-        separator_line(area.width, app.theme),
-        Line::from(""),
-    ];
-
+/// Тело таба «Источники»: раздельные секции Claude/Codex со списком marketplace. Выделение
+/// сквозное по `marketplaces_index`. Ввод/подтверждение — в подсказке ([`sources_footer`]).
+fn marketplace_body(app: &App) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
     for provider in [Provider::Claude, Provider::Codex] {
         lines.push(section_header(provider, app.theme));
 
@@ -176,23 +273,24 @@ fn draw_marketplace_screen(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
         lines.push(Line::from(""));
     }
+    lines
+}
 
-    // Ввод адреса / подтверждение удаления перекрывают подсказки.
+/// Подсказка таба «Источники»: ввод адреса (2 строки), подтверждение удаления или обычные хинты.
+fn sources_footer(app: &App) -> Vec<Line<'static>> {
     if let Some(add) = &app.marketplace_input {
-        lines.extend(marketplace_input_lines(add, app.lang));
+        marketplace_input_lines(add, app.lang)
     } else if let Some(market) = &app.marketplace_confirm {
-        lines.push(marketplace_confirm_line(market, app.lang));
+        vec![marketplace_confirm_line(market, app.lang)]
     } else {
-        lines.push(Line::from(Span::styled(
+        vec![Line::from(Span::styled(
             app.lang.choose(
-                "↑↓ выбор · a добавить · Enter удалить · Tab плагины · Esc",
-                "↑↓ move · a add · Enter remove · Tab plugins · Esc",
+                "↑↓ выбор · a добавить · Enter удалить · ↹ таб · Esc",
+                "↑↓ move · a add · Enter remove · ↹ tab · Esc",
             ),
             Style::default().fg(Color::DarkGray),
-        )));
+        ))]
     }
-
-    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn marketplace_line(market: &Marketplace, selected: bool, theme: Theme) -> Line<'static> {
@@ -388,8 +486,8 @@ mod tests {
     }
 
     #[test]
-    fn shows_both_sections_with_statuses() {
-        let app = app_with(
+    fn installed_and_catalog_tabs_show_their_plugins_with_statuses() {
+        let mut app = app_with(
             vec![
                 PluginEntry {
                     provider: Provider::Claude,
@@ -410,21 +508,32 @@ mod tests {
             ],
             false,
         );
-        let screen = render(&app);
-        assert!(screen.contains("Claude"), "секция Claude: {screen}");
-        assert!(screen.contains("Codex"), "секция Codex: {screen}");
-        assert!(screen.contains("context7"), "плагин claude");
-        assert!(screen.contains("documents"), "плагин codex");
+
+        // Таб «Установленные» — только установленный, маркер ● и версия; доступного тут нет.
+        app.plugins_tab = PluginsTab::Installed;
+        let installed = render(&app);
+        assert!(installed.contains("context7"), "установленный: {installed}");
+        assert!(installed.contains("●"), "маркер установленного");
+        assert!(installed.contains("v1.2"), "версия установленного");
         assert!(
-            screen.contains("●") && screen.contains("○"),
-            "маркеры уст/дост"
+            !installed.contains("documents"),
+            "доступного нет в Установленных"
         );
-        assert!(screen.contains("v1.2"), "версия установленного");
+
+        // Таб «Каталог» — только доступный, маркер ○; установленного тут нет.
+        app.plugins_tab = PluginsTab::Catalog;
+        let catalog = render(&app);
+        assert!(catalog.contains("documents"), "доступный: {catalog}");
+        assert!(catalog.contains("○"), "маркер доступного");
+        assert!(
+            !catalog.contains("context7"),
+            "установленного нет в Каталоге"
+        );
     }
 
     #[test]
     fn empty_codex_section_shows_loading_while_pending() {
-        let app = app_with(
+        let mut app = app_with(
             vec![PluginEntry {
                 provider: Provider::Claude,
                 name: "context7".into(),
@@ -435,8 +544,52 @@ mod tests {
             }],
             true,
         );
+        app.plugins_tab = PluginsTab::Installed;
         let screen = render(&app);
         assert!(screen.contains("загрузка"), "codex ещё грузится: {screen}");
+    }
+
+    #[test]
+    fn overview_tab_shows_summary_counts() {
+        let mut app = app_with(
+            vec![
+                PluginEntry {
+                    provider: Provider::Claude,
+                    name: "context7".into(),
+                    marketplace: "m".into(),
+                    installed: true,
+                    enabled: true,
+                    version: None,
+                },
+                PluginEntry {
+                    provider: Provider::Codex,
+                    name: "documents".into(),
+                    marketplace: "m".into(),
+                    installed: false,
+                    enabled: false,
+                    version: None,
+                },
+            ],
+            false,
+        );
+        app.plugins_tab = PluginsTab::Overview;
+        let screen = render(&app);
+        assert!(
+            screen.contains("Плагины Clave"),
+            "заголовок обзора: {screen}"
+        );
+        assert!(screen.contains("Установлено"), "строка «Установлено»");
+        assert!(screen.contains("Доступно"), "строка «Доступно»");
+    }
+
+    #[test]
+    fn tab_bar_lists_all_tabs() {
+        let app = app_with(vec![], false); // вход — Обзор
+        let screen = render(&app);
+        for label in ["Обзор", "Установленные", "Каталог", "Источники"]
+        {
+            assert!(screen.contains(label), "таб «{label}» в баре: {screen}");
+        }
     }
 
     fn market(provider: Provider, name: &str, source: &str) -> Marketplace {
@@ -450,14 +603,17 @@ mod tests {
     #[test]
     fn marketplace_mode_shows_sources_in_both_sections() {
         let mut app = app_with(vec![], false);
-        app.plugins_marketplace_mode = true;
+        app.plugins_tab = PluginsTab::Sources;
         app.marketplaces = vec![
             market(Provider::Claude, "official", "anthropics/official"),
             market(Provider::Codex, "openai-bundled", "/local/openai"),
         ];
         let screen = render(&app);
 
-        assert!(screen.contains("источники"), "заголовок режима: {screen}");
+        assert!(
+            screen.contains("Источники"),
+            "таб источников активен: {screen}"
+        );
         assert!(
             screen.contains("Claude") && screen.contains("Codex"),
             "обе секции"
@@ -471,7 +627,7 @@ mod tests {
     #[test]
     fn marketplace_add_input_shows_target_provider_and_hint() {
         let mut app = app_with(vec![], false);
-        app.plugins_marketplace_mode = true;
+        app.plugins_tab = PluginsTab::Sources;
         app.marketplace_input = Some(MarketplaceAdd {
             provider: Provider::Claude,
             source: "anth".to_string(),
@@ -492,7 +648,7 @@ mod tests {
     #[test]
     fn marketplace_confirm_shows_remove_prompt() {
         let mut app = app_with(vec![], false);
-        app.plugins_marketplace_mode = true;
+        app.plugins_tab = PluginsTab::Sources;
         app.marketplace_confirm = Some(market(Provider::Codex, "openai-bundled", "/local"));
         let screen = render(&app);
 
@@ -505,7 +661,7 @@ mod tests {
     #[test]
     fn marketplace_empty_codex_shows_loading_while_pending() {
         let mut app = app_with(vec![], false);
-        app.plugins_marketplace_mode = true;
+        app.plugins_tab = PluginsTab::Sources;
         app.marketplaces_loading = true;
         app.marketplaces = vec![market(Provider::Claude, "official", "anthropics/official")];
         let screen = render(&app);
@@ -531,6 +687,7 @@ mod tests {
             })
             .collect();
         let mut app = app_with(plugins, false);
+        app.plugins_tab = PluginsTab::Catalog; // доступные — в Каталоге
         app.plugins_index = 39;
         let screen = render(&app);
         assert!(
@@ -568,6 +725,7 @@ mod tests {
             })
             .collect();
         let mut app = app_with(plugins, false);
+        app.plugins_tab = PluginsTab::Catalog;
         app.plugins_index = 0;
         let screen = render(&app);
         // Курсор наверху — виден первый, а не уехавший вниз.
