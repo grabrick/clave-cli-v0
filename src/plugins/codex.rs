@@ -16,6 +16,7 @@ pub(crate) fn parse_codex_plugins(json: &str) -> Vec<PluginEntry> {
         };
         out.extend(items.iter().filter_map(codex_entry));
     }
+    sort_plugins(&mut out);
     out
 }
 

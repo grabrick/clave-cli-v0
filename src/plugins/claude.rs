@@ -46,7 +46,9 @@ pub(crate) fn parse_claude_plugins(
             .or_insert_with(|| claude_entry(key, &installed, &enabled, Some(version.clone())));
     }
 
-    entries.into_values().collect()
+    let mut out: Vec<PluginEntry> = entries.into_values().collect();
+    sort_plugins(&mut out);
+    out
 }
 
 fn claude_entry(
@@ -303,5 +305,24 @@ mod tests {
             cmd_args(&claude_marketplace_remove_cmd("my-mkt")),
             ["plugin", "marketplace", "remove", "my-mkt"]
         );
+    }
+
+    #[test]
+    fn installed_plugins_sort_before_available() {
+        // «zebra» установлен, «alpha» только доступен. На реальном каталоге доступных — сотни,
+        // и установленный обязан быть ВВЕРХУ, несмотря на алфавит (иначе тонет и недостижим).
+        let catalog = r#"{"catalog":{"plugins":{
+            "alpha@m":{"version":"1"},
+            "zebra@m":{"version":"1"}
+        }}}"#;
+        let installed = r#"{"version":2,"plugins":{"zebra@m":[{"version":"1"}]}}"#;
+        let plugins = parse_claude_plugins(catalog, installed, "{}");
+        let names: Vec<&str> = plugins.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["zebra", "alpha"],
+            "установленный zebra выше доступного alpha"
+        );
+        assert!(plugins[0].installed && !plugins[1].installed);
     }
 }

@@ -25,3 +25,10 @@ pub(crate) enum PluginAction {
     Disable,
     Update,
 }
+
+/// Упорядочивает записи провайдера для панели: установленные — ВВЕРХ (на реальном каталоге
+/// доступных сотни, и установленные иначе тонут и недостижимы), внутри — по имени. Вызывается
+/// в конце каждого бэкенд-парсера, чтобы порядок был детерминирован и тестируем.
+pub(crate) fn sort_plugins(plugins: &mut [crate::PluginEntry]) {
+    plugins.sort_by(|a, b| (!a.installed, &a.name).cmp(&(!b.installed, &b.name)));
+}
