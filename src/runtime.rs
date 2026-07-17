@@ -1047,11 +1047,16 @@ mod tests {
             "восстановленный чат обязан попасть в transcript"
         );
 
-        // Пустой старт → transcript пуст (run_tui подставит welcome_lines).
-        let (_, _, fresh) = restore_or_create_chat(&dir, None, Language::Ru);
+        // Старт в ПУСТОМ каталоге → transcript пуст (run_tui подставит welcome_lines). Каталог
+        // отдельный: в `dir` уже лежит чат, и per-directory fallback его бы восстановил.
+        let empty_dir = env::temp_dir().join(format!("clave-startup-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&empty_dir);
+        fs::create_dir_all(&empty_dir).expect("temp dir");
+        let (_, _, fresh) = restore_or_create_chat(&empty_dir, None, Language::Ru);
         assert!(fresh.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&empty_dir);
     }
 
     /// App для тестов клавиатуры. Собираем через `App::from_config` на своих временных путях

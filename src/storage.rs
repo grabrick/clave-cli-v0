@@ -130,6 +130,51 @@ pub(crate) fn chats_dir() -> PathBuf {
     clave_state_dir().join("chats")
 }
 
+/// Папка чатов ДЛЯ КОНКРЕТНОЙ рабочей директории: `~/.clave/chats/<ключ>`. Чаты изолированы
+/// по каталогу запуска — открыв clave в другом проекте, пользователь видит его чаты, а не
+/// чужие. Раньше пул был общим на все каталоги, поэтому `/chats` и авто-восстановление при
+/// старте подсовывали чат из совсем другого проекта.
+pub(crate) fn chats_dir_for(work_dir: &Path) -> PathBuf {
+    chats_dir().join(dir_key(work_dir))
+}
+
+/// Имя папки для каталога: читаемый базовый компонент + стабильный хэш ПОЛНОГО канонического
+/// пути. Базовое имя — чтобы папку можно было опознать глазами; хэш — чтобы два одноимённых
+/// каталога в разных местах (`~/work/api` и `~/tmp/api`) не делили чаты.
+fn dir_key(work_dir: &Path) -> String {
+    let canonical = work_dir
+        .canonicalize()
+        .unwrap_or_else(|_| work_dir.to_path_buf());
+    let base: String = canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("root")
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+        .take(32)
+        .collect();
+    let base = if base.is_empty() {
+        "root".to_string()
+    } else {
+        base
+    };
+    format!(
+        "{base}-{}",
+        stable_hash_hex(canonical.to_string_lossy().as_bytes())
+    )
+}
+
+/// FNV-1a (64-бит) → 8 hex. Свой хэш, а НЕ `DefaultHasher`: его результат не гарантирован между
+/// версиями Rust, и апгрейд тулчейна «потерял» бы папку чатов каталога (ключ бы поехал).
+fn stable_hash_hex(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:08x}", (hash & 0xffff_ffff) as u32)
+}
+
 pub(crate) fn config_path() -> PathBuf {
     if let Ok(path) = env::var("CLAVE_CONFIG") {
         return PathBuf::from(path);
@@ -409,6 +454,7 @@ pub(crate) fn restore_or_create_chat(
     last_chat_id: Option<&str>,
     lang: Language,
 ) -> (String, PathBuf, Vec<String>) {
+    // 1. Точный resume по last_chat_id — если этот чат лежит В ЭТОЙ папке и непустой.
     if let Some(id) = last_chat_id {
         let id = sanitize_chat_id(id);
         if !id.is_empty() {
@@ -422,6 +468,20 @@ pub(crate) fn restore_or_create_chat(
         }
     }
 
+    // 2. Иначе — самый свежий непустой чат ЭТОЙ папки. Папка per-directory (чужие сюда не
+    //    попадают), а глобальный `last_chat_id` мог указывать на чат другого каталога — без
+    //    этого fallback возврат в проект открывал бы пустой чат вместо последнего.
+    for summary in list_saved_chats(chats_dir, usize::MAX) {
+        if let Some(path) = existing_chat_path(chats_dir, &summary.id) {
+            if let Ok(lines) = load_chat_transcript(&path) {
+                if !lines.is_empty() {
+                    return (summary.id, path, lines);
+                }
+            }
+        }
+    }
+
+    // 3. Пусто — новый чат.
     let chat_id = new_chat_id();
     let path = chat_path_for_id(chats_dir, &chat_id);
     let transcript = initial_transcript(lang);
@@ -675,12 +735,54 @@ mod tests {
         assert_eq!(rid, id);
         assert_eq!(lines, vec!["⏺ привет".to_string(), "ответ".to_string()]);
 
-        // None → создаём новый пустой
+        // None, но в ПАПКЕ есть непустой чат → возвращаемся в него (per-directory resume),
+        // а не открываем пустой: вернувшись в проект, пользователь продолжает последний чат.
+        // Глобальный last_chat_id мог указывать на чат другого каталога — тогда и срабатывает.
         let (nid, _, nlines) = restore_or_create_chat(&dir, None, Language::Ru);
-        assert_ne!(nid, id);
-        assert!(nlines.is_empty());
+        assert_eq!(nid, id, "fallback — последний чат ЭТОЙ папки");
+        assert!(!nlines.is_empty());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_creates_new_chat_when_folder_is_empty() {
+        let dir = env::temp_dir().join(format!("clave-restore-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+
+        // Пустая папка (новый каталог) → новый пустой чат, ничего чужого не подтягивается.
+        let (id, _, lines) = restore_or_create_chat(&dir, None, Language::Ru);
+        assert!(id.starts_with("chat-"));
+        assert!(lines.is_empty(), "пустая папка каталога → новый пустой чат");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chats_dir_is_isolated_per_working_directory() {
+        // Суть фикса: разные рабочие каталоги → разные папки чатов; один и тот же каталог →
+        // стабильно та же папка (иначе чат «терялся» бы между запусками в одном проекте).
+        let a = env::temp_dir().join(format!("clave-scope-a-{}", std::process::id()));
+        let b = env::temp_dir().join(format!("clave-scope-b-{}", std::process::id()));
+        let _ = fs::create_dir_all(&a);
+        let _ = fs::create_dir_all(&b);
+
+        let dir_a = chats_dir_for(&a);
+        let dir_b = chats_dir_for(&b);
+        assert_ne!(dir_a, dir_b, "у разных каталогов — разные папки чатов");
+        assert_eq!(
+            dir_a,
+            chats_dir_for(&a),
+            "тот же каталог — та же папка (ключ стабилен)"
+        );
+        assert!(
+            dir_a.starts_with(chats_dir()),
+            "папка каталога лежит под общим корнем ~/.clave/chats"
+        );
+
+        let _ = fs::remove_dir_all(&a);
+        let _ = fs::remove_dir_all(&b);
     }
 
     #[test]
