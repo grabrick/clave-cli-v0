@@ -138,6 +138,9 @@ pub(crate) struct App {
     // курсор по строкам сводки (Enter прыгает в соответствующий таб).
     pub(crate) plugins_tab: PluginsTab,
     pub(crate) overview_index: usize,
+    /// Провайдер, показываемый в списковых табах (Установленные/Каталог) — `←/→` переключает
+    /// Claude ⇄ Codex. Показываем по одному: каталог claude огромен и иначе прячет codex.
+    pub(crate) plugins_provider: Provider,
     pub(crate) marketplaces: Vec<Marketplace>,
     pub(crate) marketplaces_index: usize,
     pub(crate) marketplaces_loading: bool,
@@ -301,6 +304,7 @@ impl App {
             plugins_confirm: None,
             plugins_tab: PluginsTab::Overview,
             overview_index: 0,
+            plugins_provider: Provider::Claude,
             marketplaces: Vec::new(),
             marketplaces_index: 0,
             marketplaces_loading: false,

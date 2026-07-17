@@ -30,7 +30,7 @@ fn plugins_header_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     } else {
         "› /plugins".to_string()
     };
-    vec![
+    let mut lines = vec![
         Line::styled(
             title,
             Style::default()
@@ -38,9 +38,39 @@ fn plugins_header_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ),
         tab_bar_line(app),
-        separator_line(width, app.theme),
-        Line::from(""),
-    ]
+    ];
+    // В списковых табах — строка выбора провайдера (переключается ←/→).
+    if matches!(app.plugins_tab, PluginsTab::Installed | PluginsTab::Catalog) {
+        lines.push(provider_selector_line(app));
+    }
+    lines.push(separator_line(width, app.theme));
+    lines.push(Line::from(""));
+    lines
+}
+
+/// Строка выбора провайдера в списковых табах: `Claude`/`Codex`, активный подсвечен.
+fn provider_selector_line(app: &App) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("{}: ", app.lang.choose("Провайдер", "Provider")),
+        Style::default().fg(Color::DarkGray),
+    )];
+    for provider in [Provider::Claude, Provider::Codex] {
+        let label = match provider {
+            Provider::Claude => "Claude",
+            Provider::Codex => "Codex",
+        };
+        let style = if provider == app.plugins_provider {
+            Style::default()
+                .fg(Color::White)
+                .bg(app.theme.accent_bg())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(app.theme.accent_soft())
+        };
+        spans.push(Span::styled(format!(" {label} "), style));
+        spans.push(Span::raw(" "));
+    }
+    Line::from(spans)
 }
 
 /// Таб-бар: метки всех табов, активный подсвечен.
@@ -174,56 +204,45 @@ fn plugin_list_footer(app: &App) -> Line<'static> {
     }
     let hint = match app.plugins_tab {
         PluginsTab::Installed => app.lang.choose(
-            "↑↓ · Enter удалить · ^E вкл/выкл · ^U обновить · ↹ таб · Esc",
-            "↑↓ · Enter remove · ^E on/off · ^U update · ↹ tab · Esc",
+            "↑↓ · ←→ провайдер · Enter удалить · ^E вкл/выкл · ^U обновить · ↹ таб · Esc",
+            "↑↓ · ←→ provider · Enter remove · ^E on/off · ^U update · ↹ tab · Esc",
         ),
         _ => app.lang.choose(
-            "↑↓ · Enter установить · ввод — поиск · ↹ таб · Esc",
-            "↑↓ · Enter install · type to search · ↹ tab · Esc",
+            "↑↓ · ←→ провайдер · Enter установить · поиск · ↹ таб · Esc",
+            "↑↓ · ←→ provider · Enter install · search · ↹ tab · Esc",
         ),
     };
     Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))
 }
 
-/// Строит строки тела панели (секции Claude/Codex со статусами) и позицию строки выделенного
-/// плагина в этом списке — по ней прокрутка держит курсор в видимой области.
+/// Строит строки тела спискового таба (плагины ОДНОГО провайдера — он выбран в шапке) и позицию
+/// строки выделенного плагина — по ней прокрутка держит курсор в видимой области.
 fn plugins_body(app: &App) -> (Vec<Line<'static>>, usize) {
-    // Индекс берём из ОТФИЛЬТРОВАННОГО списка, чтобы выделение совпадало с навигацией/поиском.
+    // Список уже отфильтрован по табу+провайдеру+поиску, порядок совпадает с навигацией.
     let filtered = app.filtered_plugins();
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut cursor_row = 0;
-    for provider in [Provider::Claude, Provider::Codex] {
-        lines.push(section_header(provider, app.theme));
 
-        let items: Vec<(usize, &PluginEntry)> = filtered
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.provider == provider)
-            .map(|(index, entry)| (index, *entry))
-            .collect();
+    if filtered.is_empty() {
+        let msg = if app.plugins_provider == Provider::Codex && app.plugins_loading {
+            app.lang.choose("загрузка…", "loading…")
+        } else if !app.plugins_query.is_empty() {
+            app.lang.choose("ничего не найдено", "nothing found")
+        } else {
+            app.lang.choose("нет плагинов", "no plugins")
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  ⎿ {msg}"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
 
-        if items.is_empty() {
-            let msg = if provider == Provider::Codex && app.plugins_loading {
-                app.lang.choose("загрузка…", "loading…")
-            } else if !app.plugins_query.is_empty() {
-                app.lang.choose("ничего не найдено", "nothing found")
-            } else {
-                app.lang.choose("нет плагинов", "no plugins")
-            };
-            lines.push(Line::from(Span::styled(
-                format!("  ⎿ {msg}"),
-                Style::default().fg(Color::DarkGray),
-            )));
+    for (index, entry) in filtered.iter().enumerate() {
+        let selected = index == app.plugins_index;
+        if selected {
+            cursor_row = lines.len();
         }
-
-        for (index, entry) in items {
-            let selected = index == app.plugins_index;
-            if selected {
-                cursor_row = lines.len();
-            }
-            lines.push(plugin_line(entry, selected, app.theme, app.lang));
-        }
-        lines.push(Line::from(""));
+        lines.push(plugin_line(entry, selected, app.theme, app.lang));
     }
     (lines, cursor_row)
 }
@@ -520,8 +539,9 @@ mod tests {
             "доступного нет в Установленных"
         );
 
-        // Таб «Каталог» — только доступный, маркер ○; установленного тут нет.
+        // Таб «Каталог» + провайдер Codex — доступный documents с маркером ○.
         app.plugins_tab = PluginsTab::Catalog;
+        app.plugins_provider = Provider::Codex;
         let catalog = render(&app);
         assert!(catalog.contains("documents"), "доступный: {catalog}");
         assert!(catalog.contains("○"), "маркер доступного");
@@ -545,6 +565,7 @@ mod tests {
             true,
         );
         app.plugins_tab = PluginsTab::Installed;
+        app.plugins_provider = Provider::Codex; // codex ещё грузится → секция пуста
         let screen = render(&app);
         assert!(screen.contains("загрузка"), "codex ещё грузится: {screen}");
     }
@@ -590,6 +611,52 @@ mod tests {
         {
             assert!(screen.contains(label), "таб «{label}» в баре: {screen}");
         }
+    }
+
+    #[test]
+    fn catalog_provider_toggle_reaches_codex() {
+        let mut app = app_with(
+            vec![
+                PluginEntry {
+                    provider: Provider::Claude,
+                    name: "claude-avail".into(),
+                    marketplace: "m".into(),
+                    installed: false,
+                    enabled: false,
+                    version: None,
+                },
+                PluginEntry {
+                    provider: Provider::Codex,
+                    name: "codex-avail".into(),
+                    marketplace: "m".into(),
+                    installed: false,
+                    enabled: false,
+                    version: None,
+                },
+            ],
+            false,
+        );
+        app.plugins_tab = PluginsTab::Catalog;
+
+        // Провайдер Claude: строка выбора видна, claude-плагин показан, codex скрыт.
+        let claude_view = render(&app);
+        assert!(
+            claude_view.contains("Провайдер"),
+            "строка выбора: {claude_view}"
+        );
+        assert!(claude_view.contains("claude-avail"), "claude-плагин виден");
+        assert!(
+            !claude_view.contains("codex-avail"),
+            "codex скрыт под Claude, а не погребён снизу"
+        );
+
+        // ←/→ на Codex — теперь codex-плагин достижим сразу.
+        app.plugins_provider = Provider::Codex;
+        let codex_view = render(&app);
+        assert!(
+            codex_view.contains("codex-avail"),
+            "codex достижим сменой провайдера: {codex_view}"
+        );
     }
 
     fn market(provider: Provider, name: &str, source: &str) -> Marketplace {
