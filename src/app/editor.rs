@@ -227,6 +227,28 @@ fn byte_at_column(input: &str, start: usize, end: usize, target_col: usize) -> u
 mod tests {
     use super::*;
 
+    /// Изолированный App на временных путях: `App::new()` читал бы настоящий конфиг ~/.clave
+    /// и будил бы auth-пробы — тесты стали бы флейкими и зависели бы от машины.
+    fn editor_app() -> App {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "clave-editor-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        App::from_config(
+            AppConfig {
+                onboarding_done: true,
+                ..AppConfig::default()
+            },
+            dir.join("config.json"),
+            dir.join("history"),
+            dir.clone(),
+        )
+    }
+
     #[test]
     fn byte_at_column_uses_display_width() {
         // "aあb": a=col0, あ=cols1..2, b=col3. Колонка 3 → байт на 'b'.
@@ -238,7 +260,7 @@ mod tests {
 
     #[test]
     fn history_round_trip_restores_draft() {
-        let mut app = App::new();
+        let mut app = editor_app();
         app.history = vec!["old command".to_string()];
         app.input = "my draft".to_string();
         app.cursor = app.input.len();
@@ -250,7 +272,7 @@ mod tests {
 
     #[test]
     fn arrow_up_moves_cursor_in_multiline_not_history() {
-        let mut app = App::new();
+        let mut app = editor_app();
         app.history = vec!["old".to_string()];
         app.input = "ab\ncde".to_string();
         app.cursor = app.input.len();
@@ -266,7 +288,7 @@ mod tests {
 
     #[test]
     fn arrow_down_moves_cursor_in_multiline_not_history() {
-        let mut app = App::new();
+        let mut app = editor_app();
         app.input = "abc\nde".to_string();
         app.cursor = 1;
         app.input_down();
