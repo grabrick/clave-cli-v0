@@ -208,7 +208,9 @@ impl App {
     pub(crate) fn new() -> Self {
         let config_path = config_path();
         let history_path = history_path();
-        let chats_dir = chats_dir();
+        // Папка чатов — на каталог запуска: в разных проектах разные чаты (иначе clave
+        // подсовывал чат из другого каталога — общий пул на всё окружение).
+        let chats_dir = chats_dir_for(&launch_work_dir());
         let mut config = load_config(&config_path);
         if env::var("CLAVE_SKIP_ONBOARDING").ok().as_deref() == Some("1") {
             config.onboarding_done = true;
