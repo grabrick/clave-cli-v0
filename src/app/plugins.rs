@@ -64,6 +64,62 @@ pub(crate) struct MarketplaceAdd {
     pub(crate) source: String,
 }
 
+/// Таб панели `/plugins`. Вход — на «Обзор» (сводка), чтобы не вываливать сотни доступных
+/// плагинов сразу; список смотрят в «Установленных» и «Каталоге», источники — в своём табе.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PluginsTab {
+    Overview,
+    Installed,
+    Catalog,
+    Sources,
+}
+
+impl PluginsTab {
+    pub(crate) const ALL: [PluginsTab; 4] = [
+        PluginsTab::Overview,
+        PluginsTab::Installed,
+        PluginsTab::Catalog,
+        PluginsTab::Sources,
+    ];
+
+    /// Следующий/предыдущий таб по кругу — для `Tab`/`Shift+Tab`.
+    pub(crate) fn next(self) -> PluginsTab {
+        let index = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    pub(crate) fn prev(self) -> PluginsTab {
+        let index = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    pub(crate) fn label(self, lang: Language) -> &'static str {
+        match self {
+            PluginsTab::Overview => lang.choose("Обзор", "Overview"),
+            PluginsTab::Installed => lang.choose("Установленные", "Installed"),
+            PluginsTab::Catalog => lang.choose("Каталог", "Catalog"),
+            PluginsTab::Sources => lang.choose("Источники", "Sources"),
+        }
+    }
+}
+
+/// Сводка для таба «Обзор»: сколько установлено (с разбивкой по провайдерам), доступно и
+/// источников. Чистые числа — считаются из `app.plugins`/`app.marketplaces`, тестируемо.
+pub(crate) struct PluginsOverview {
+    pub(crate) installed: usize,
+    pub(crate) claude_installed: usize,
+    pub(crate) codex_installed: usize,
+    pub(crate) available: usize,
+    pub(crate) sources: usize,
+}
+
+/// Строки «Обзора» по порядку: клик (Enter) уводит в соответствующий таб.
+pub(crate) const OVERVIEW_ROWS: [PluginsTab; 3] = [
+    PluginsTab::Installed,
+    PluginsTab::Catalog,
+    PluginsTab::Sources,
+];
+
 impl App {
     /// Открывает панель плагинов. Claude-список читается СИНХРОННО из конфигов (мгновенно),
     /// codex-список догружается АСИНХРОННО воркером (спавн CLI занимает время).
@@ -71,14 +127,18 @@ impl App {
         self.plugins = load_claude_plugins(&self.claude_home);
         self.plugins_index = 0;
         self.plugins_loading = true;
-        // Панель всегда открывается на списке плагинов, а не в оставшемся с прошлого раза
-        // режиме источников с недозакрытым вводом.
-        self.plugins_marketplace_mode = false;
+        // Панель всегда открывается на «Обзоре», без залипшего таба/ввода с прошлого раза.
+        self.plugins_tab = PluginsTab::Overview;
+        self.overview_index = 0;
+        self.plugins_query.clear();
         self.marketplace_input = None;
         self.marketplace_confirm = None;
+        self.plugins_confirm = None;
         self.overlay = Overlay::Plugins;
         self.status = self.lang.choose("плагины", "plugins").to_string();
         self.spawn_codex_plugins_load();
+        // Источники грузим сразу — «Обзор» показывает их число, не дожидаясь входа в таб.
+        self.load_marketplaces();
     }
 
     /// Асинхронная догрузка codex: спавн через раннер-хук (в тестах подменяется no-op),
@@ -100,16 +160,71 @@ impl App {
         self.plugins_loading = false;
     }
 
-    /// Плагины с учётом инкрементального поиска (по имени, без регистра).
+    /// Плагины активного таба: «Установленные» → установленные, «Каталог» → доступные (с
+    /// инкрементальным поиском по имени). Прочие табы (Обзор/Источники) список не показывают.
     pub(crate) fn filtered_plugins(&self) -> Vec<&PluginEntry> {
-        if self.plugins_query.is_empty() {
-            return self.plugins.iter().collect();
+        let base: Vec<&PluginEntry> = match self.plugins_tab {
+            PluginsTab::Installed => self.plugins.iter().filter(|p| p.installed).collect(),
+            PluginsTab::Catalog => self.plugins.iter().filter(|p| !p.installed).collect(),
+            PluginsTab::Overview | PluginsTab::Sources => return Vec::new(),
+        };
+        // Поиск живёт только в Каталоге (там сотни плагинов); Установленных единицы.
+        if self.plugins_tab == PluginsTab::Catalog && !self.plugins_query.is_empty() {
+            let needle = self.plugins_query.to_lowercase();
+            return base
+                .into_iter()
+                .filter(|p| p.name.to_lowercase().contains(&needle))
+                .collect();
         }
-        let needle = self.plugins_query.to_lowercase();
-        self.plugins
-            .iter()
-            .filter(|p| p.name.to_lowercase().contains(&needle))
-            .collect()
+        base
+    }
+
+    /// Сводка для «Обзора»: числа установленного/доступного/источников.
+    pub(crate) fn plugins_overview(&self) -> PluginsOverview {
+        let installed: Vec<&PluginEntry> = self.plugins.iter().filter(|p| p.installed).collect();
+        PluginsOverview {
+            installed: installed.len(),
+            claude_installed: installed
+                .iter()
+                .filter(|p| p.provider == Provider::Claude)
+                .count(),
+            codex_installed: installed
+                .iter()
+                .filter(|p| p.provider == Provider::Codex)
+                .count(),
+            available: self.plugins.iter().filter(|p| !p.installed).count(),
+            sources: self.marketplaces.len(),
+        }
+    }
+
+    /// Переключить таб (`Tab`/`Shift+Tab`/цифра/Enter в Обзоре). Курсоры сбрасываем, а ввод и
+    /// подтверждения не тащим между табами (иначе строка ввода источника всплыла бы в Каталоге).
+    pub(crate) fn set_plugins_tab(&mut self, tab: PluginsTab) {
+        self.plugins_tab = tab;
+        self.plugins_index = 0;
+        self.marketplaces_index = 0;
+        self.marketplace_input = None;
+        self.marketplace_confirm = None;
+        self.plugins_confirm = None;
+        // Поиск осмыслен только в Каталоге — уходя из него, сбрасываем.
+        if tab != PluginsTab::Catalog {
+            self.plugins_query.clear();
+        }
+    }
+
+    pub(crate) fn plugins_tab_next(&mut self) {
+        self.set_plugins_tab(self.plugins_tab.next());
+    }
+
+    pub(crate) fn plugins_tab_prev(&mut self) {
+        self.set_plugins_tab(self.plugins_tab.prev());
+    }
+
+    /// Enter в «Обзоре» — прыжок в таб выбранной строки.
+    pub(crate) fn overview_enter(&mut self) {
+        if let Some(tab) = OVERVIEW_ROWS.get(self.overview_index) {
+            self.set_plugins_tab(*tab);
+        }
     }
 
     /// Выбранный в панели плагин (по курсору в отфильтрованном списке).
@@ -198,20 +313,7 @@ impl App {
         self.spawn_codex_plugins_load();
     }
 
-    // ── Режим marketplace-источников ────────────────────────────────────────────────────────
-
-    /// Tab в панели: переключает вид плагины ⇄ источники. При входе в режим источников —
-    /// загружает их (claude синхронно, codex асинхронно). Любой незавершённый ввод/подтверждение
-    /// снимаем, чтобы вид не открылся в подвешенном состоянии.
-    pub(crate) fn toggle_marketplace_mode(&mut self) {
-        self.plugins_marketplace_mode = !self.plugins_marketplace_mode;
-        self.marketplace_input = None;
-        self.marketplace_confirm = None;
-        if self.plugins_marketplace_mode {
-            self.marketplaces_index = 0;
-            self.load_marketplaces();
-        }
-    }
+    // ── Marketplace-источники (таб «Источники») ─────────────────────────────────────────────
 
     /// Claude-источники читаем синхронно из конфига, codex догружаем воркером (спавн CLI долгий).
     fn load_marketplaces(&mut self) {
@@ -437,8 +539,8 @@ mod tests {
         let _ = fs::create_dir_all(&home);
         seed_claude_home(&home);
         let (mut app, dir) = plugins_app(&home);
-        // Осталось с прошлого открытия: панель обязана сбросить это и открыться на плагинах.
-        app.plugins_marketplace_mode = true;
+        // Осталось с прошлого открытия: панель обязана сбросить это и открыться на Обзоре.
+        app.plugins_tab = PluginsTab::Sources;
         app.marketplace_input = Some(MarketplaceAdd {
             provider: Provider::Codex,
             source: "хвост".into(),
@@ -449,8 +551,8 @@ mod tests {
         assert_eq!(app.overlay, Overlay::Plugins);
         assert!(app.plugins_loading, "codex ещё догружается");
         assert!(
-            !app.plugins_marketplace_mode && app.marketplace_input.is_none(),
-            "панель открывается на плагинах, без залипшего режима источников"
+            app.plugins_tab == PluginsTab::Overview && app.marketplace_input.is_none(),
+            "панель открывается на Обзоре, без залипшего таба/ввода источников"
         );
         assert_eq!(count_of(&app, Provider::Claude), 1, "claude уже виден");
         assert!(
@@ -494,6 +596,7 @@ mod tests {
         seed_claude_home(&home);
         let (mut app, dir) = plugins_app(&home);
         app.open_plugins_panel(); // context7 установлен
+        app.plugins_tab = PluginsTab::Installed; // таб установленных — там он и виден
 
         app.plugins_index = 0;
         app.plugin_enter();
@@ -521,6 +624,7 @@ mod tests {
         seed_claude_home(&home);
         let (mut app, dir) = plugins_app(&home);
         app.open_plugins_panel();
+        app.plugins_tab = PluginsTab::Installed;
         app.plugins_index = 0;
 
         app.plugin_toggle(); // context7 включён → выключить, без подтверждения (обратимо)
@@ -559,10 +663,82 @@ mod tests {
                 version: None,
             },
         ];
+        app.plugins_tab = PluginsTab::Catalog; // поиск живёт в Каталоге (доступные)
         app.plugins_query = "doc".into();
         let filtered = app.filtered_plugins();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "documents");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn plugin_entry(provider: Provider, name: &str, installed: bool) -> PluginEntry {
+        PluginEntry {
+            provider,
+            name: name.to_string(),
+            marketplace: "m".into(),
+            installed,
+            enabled: installed,
+            version: None,
+        }
+    }
+
+    #[test]
+    fn filtered_plugins_splits_installed_and_available_by_tab() {
+        let (mut app, dir) = plugins_app(&env::temp_dir());
+        app.plugins = vec![
+            plugin_entry(Provider::Claude, "inst", true),
+            plugin_entry(Provider::Codex, "avail", false),
+        ];
+
+        app.plugins_tab = PluginsTab::Installed;
+        let inst = app.filtered_plugins();
+        assert_eq!(inst.len(), 1, "Установленные — только installed");
+        assert_eq!(inst[0].name, "inst");
+
+        app.plugins_tab = PluginsTab::Catalog;
+        let avail = app.filtered_plugins();
+        assert_eq!(avail.len(), 1, "Каталог — только доступные");
+        assert_eq!(avail[0].name, "avail");
+
+        // Обзор и Источники список плагинов не показывают.
+        app.plugins_tab = PluginsTab::Overview;
+        assert!(app.filtered_plugins().is_empty());
+        app.plugins_tab = PluginsTab::Sources;
+        assert!(app.filtered_plugins().is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plugins_overview_counts_by_provider_and_availability() {
+        let (mut app, dir) = plugins_app(&env::temp_dir());
+        app.plugins = vec![
+            plugin_entry(Provider::Claude, "a", true),
+            plugin_entry(Provider::Claude, "b", true),
+            plugin_entry(Provider::Codex, "c", true),
+            plugin_entry(Provider::Claude, "d", false),
+            plugin_entry(Provider::Codex, "e", false),
+        ];
+        app.marketplaces = vec![codex_market("m1"), codex_market("m2")];
+
+        let overview = app.plugins_overview();
+        assert_eq!(overview.installed, 3);
+        assert_eq!(overview.claude_installed, 2);
+        assert_eq!(overview.codex_installed, 1);
+        assert_eq!(overview.available, 2);
+        assert_eq!(overview.sources, 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overview_enter_jumps_to_selected_row_tab() {
+        let (mut app, dir) = plugins_app(&env::temp_dir());
+        // Строки Обзора: 0 Установленные · 1 Каталог · 2 Источники.
+        app.overview_index = 1;
+        app.overview_enter();
+        assert_eq!(app.plugins_tab, PluginsTab::Catalog);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -576,27 +752,32 @@ mod tests {
     }
 
     #[test]
-    fn toggle_marketplace_mode_enters_reads_claude_and_marks_loading() {
+    fn open_reads_marketplaces_and_tab_navigation_cycles() {
         let home = env::temp_dir().join(format!("clave-mkt-home-{}", std::process::id()));
         let _ = fs::create_dir_all(&home);
         seed_claude_home(&home);
         let (mut app, dir) = plugins_app(&home);
 
-        app.toggle_marketplace_mode();
+        app.open_plugins_panel();
 
-        assert!(app.plugins_marketplace_mode, "вошли в режим источников");
-        assert!(app.marketplaces_loading, "codex ещё догружается");
+        // Источники читаются СРАЗУ при открытии — «Обзор» показывает их число.
+        assert!(app.marketplaces_loading, "codex-источники ещё догружаются");
         assert_eq!(
             app.marketplaces.len(),
             1,
-            "claude-источник прочитан из конфига"
+            "claude-источник прочитан при открытии"
         );
         assert_eq!(app.marketplaces[0].name, "official");
         assert_eq!(app.marketplaces[0].provider, Provider::Claude);
+        assert_eq!(app.plugins_tab, PluginsTab::Overview, "вход — на Обзоре");
 
-        // Повторный Tab — выходим обратно к плагинам.
-        app.toggle_marketplace_mode();
-        assert!(!app.plugins_marketplace_mode, "Tab вернул к плагинам");
+        // Tab/Shift+Tab листают бар по кругу.
+        app.plugins_tab_next();
+        assert_eq!(app.plugins_tab, PluginsTab::Installed);
+        app.plugins_tab_prev();
+        assert_eq!(app.plugins_tab, PluginsTab::Overview);
+        app.set_plugins_tab(PluginsTab::Sources);
+        assert_eq!(app.plugins_tab, PluginsTab::Sources);
 
         let _ = fs::remove_dir_all(&home);
         let _ = fs::remove_dir_all(&dir);
@@ -608,7 +789,7 @@ mod tests {
         let _ = fs::create_dir_all(&home);
         seed_claude_home(&home);
         let (mut app, dir) = plugins_app(&home);
-        app.toggle_marketplace_mode();
+        app.open_plugins_panel();
 
         app.marketplaces_loaded(vec![codex_market("openai-bundled")]);
 

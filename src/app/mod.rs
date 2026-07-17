@@ -133,10 +133,11 @@ pub(crate) struct App {
     /// (установка/удаление меняют окружение — подтверждаем перед спавном).
     pub(crate) plugins_query: String,
     pub(crate) plugins_confirm: Option<PendingPluginAction>,
-    // Режим marketplace-источников внутри той же панели (Tab переключает плагины ⇄ источники).
-    // Источники обоих провайдеров — двумя секциями, как плагины; `marketplaces_loading` — флаг
-    // догрузки codex (claude читается синхронно из `known_marketplaces.json`).
-    pub(crate) plugins_marketplace_mode: bool,
+    // Активный таб панели (Обзор/Установленные/Каталог/Источники) — Tab листает бар. Каталог
+    // клоды огромен, поэтому вход на «Обзор» со сводкой, а список — по табам. `overview_index` —
+    // курсор по строкам сводки (Enter прыгает в соответствующий таб).
+    pub(crate) plugins_tab: PluginsTab,
+    pub(crate) overview_index: usize,
     pub(crate) marketplaces: Vec<Marketplace>,
     pub(crate) marketplaces_index: usize,
     pub(crate) marketplaces_loading: bool,
@@ -298,7 +299,8 @@ impl App {
             claude_home: default_claude_home(),
             plugins_query: String::new(),
             plugins_confirm: None,
-            plugins_marketplace_mode: false,
+            plugins_tab: PluginsTab::Overview,
+            overview_index: 0,
             marketplaces: Vec::new(),
             marketplaces_index: 0,
             marketplaces_loading: false,
