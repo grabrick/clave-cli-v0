@@ -115,7 +115,12 @@ fn print_event(event: &WorkerEvent) {
         | WorkerEvent::PlanReady(..)
         | WorkerEvent::Cancelled
         | WorkerEvent::Failed(_)
-        | WorkerEvent::AuthMissing(_) => {}
+        | WorkerEvent::AuthMissing(_)
+        // События панели /plugins в headless-прогоне не возникают — печатать нечего.
+        | WorkerEvent::PluginsLoaded(_)
+        | WorkerEvent::PluginActionDone
+        | WorkerEvent::MarketplacesLoaded(_)
+        | WorkerEvent::MarketplaceActionDone => {}
     }
     let _ = io::stdout().flush();
 }
