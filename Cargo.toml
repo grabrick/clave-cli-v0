@@ -22,3 +22,6 @@ libc = "0.2"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[dev-dependencies]
+vt100 = "0.16.2"
