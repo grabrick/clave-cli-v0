@@ -348,6 +348,28 @@ pub(crate) fn footer_transition_color(theme: Theme, elapsed_ms: u128, entering: 
 mod tests {
     use super::*;
 
+    /// Изолированный App на временных путях: `App::new()` читал бы настоящий конфиг ~/.clave
+    /// и будил бы auth-пробы — тесты стали бы флейкими и зависели бы от машины.
+    fn bare_app() -> App {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "clave-uifooter-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        App::from_config(
+            AppConfig {
+                onboarding_done: true,
+                ..AppConfig::default()
+            },
+            dir.join("config.json"),
+            dir.join("history"),
+            dir.clone(),
+        )
+    }
+
     const MODE: &str = "чат";
     const SWITCH: &str = "shift+tab";
     const HINTS: &str = "? подсказки · / команды";
@@ -487,7 +509,7 @@ mod tests {
     /// приложения, а не пустота и не посторонняя строка.
     #[test]
     fn footer_right_target_is_one_of_the_app_segments() {
-        let app = App::new();
+        let app = bare_app();
         let target = footer_right_target(&app);
 
         assert!(!target.is_empty());
@@ -501,7 +523,7 @@ mod tests {
     /// берёт язык, тему и усилия из конфига на диске, и без этого тест зависел бы от машины.
     /// Переменные окружения не трогаем — соседние тесты в этом же процессе рендерят футер.
     fn segments_app() -> App {
-        let mut app = App::new();
+        let mut app = bare_app();
         app.lang = Language::Ru;
         app.status = "готов".to_string();
         app.mode = Mode::CodexClaude;
@@ -595,7 +617,7 @@ mod tests {
 
     #[test]
     fn git_segment_is_prefixed_and_capped_by_columns() {
-        let mut app = App::new();
+        let mut app = bare_app();
 
         app.git_ref = None;
         assert_eq!(footer_git_segment(&app), None);

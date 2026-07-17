@@ -203,9 +203,34 @@ mod tests {
             .join("")
     }
 
+    /// Изолированный App на временных путях: `App::new()` читал бы настоящий конфиг
+    /// пользователя (~/.clave) и будил бы auth-пробы — тесты стали бы флейкими и могли
+    /// бы дописать в реальный чат.
+    fn loader_app() -> App {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "clave-loader-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut app = App::from_config(
+            AppConfig {
+                onboarding_done: true,
+                ..AppConfig::default()
+            },
+            dir.join("config.json"),
+            dir.join("history"),
+            dir.clone(),
+        );
+        app.onboarding = None;
+        app
+    }
+
     #[test]
     fn loader_shows_token_estimate_when_known() {
-        let mut app = App::new();
+        let mut app = loader_app();
         app.run_started_at = Some(Instant::now());
         app.run_label = "Claude".to_string();
         app.run_token_estimate = Some(1200);
@@ -224,7 +249,7 @@ mod tests {
 
     #[test]
     fn loader_surfaces_reasoning_until_answer_starts() {
-        let mut app = App::new();
+        let mut app = loader_app();
         app.run_started_at = Some(Instant::now());
         app.live_reasoning = "сначала пойму задачу\nтеперь сверю с файлами".to_string();
         // Пока ответа нет — лоадер прямо говорит «Рассуждаю» и показывает хвост мысли.
@@ -246,7 +271,7 @@ mod tests {
 
     #[test]
     fn loader_shimmers_only_during_active_work() {
-        let mut app = App::new();
+        let mut app = loader_app();
         app.run_started_at = Some(Instant::now());
         // Тишина ожидания: фраза статична (фраза = один спан + деталь).
         let idle = loader_line(&app);
@@ -278,7 +303,7 @@ mod tests {
 
     #[test]
     fn idle_loader_line_shows_verb_and_elapsed() {
-        let app = App::new();
+        let app = loader_app();
         let line = idle_loader_line(&app, Duration::from_secs(112));
         let text = line_text(&line);
         assert!(text.starts_with("✻ "), "inactive icon: {text}");
@@ -310,7 +335,7 @@ mod tests {
     // активность через live_answer — потому мутант и выжил).
     #[test]
     fn loader_shimmers_on_tool_activity_alone() {
-        let mut app = App::new();
+        let mut app = loader_app();
         app.run_started_at = Some(Instant::now());
         // reasoning/answer пусты, активности нет → статичная фраза (мало спанов).
         let idle = loader_line(&app);
@@ -352,7 +377,7 @@ mod tests {
     // ЧАСТЬ 3 — 128:5 замена тела на vec![] / vec![Default::default()].
     #[test]
     fn loader_activity_lines_render_each_activity() {
-        let mut app = App::new();
+        let mut app = loader_app();
         app.run_activity = vec!["reading main.rs".to_string()].into();
         let lines = loader_activity_lines(&app, 80);
         assert!(

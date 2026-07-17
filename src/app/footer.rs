@@ -207,7 +207,10 @@ mod tests {
     #[test]
     fn git_ref_is_read_on_events_only() {
         let dir = temp_repo("no-poll");
-        let mut app = App::new();
+        // ВАЖНО: from_config на временных путях, а не App::new(). App::new() открывает
+        // НАСТОЯЩИЙ чат пользователя (~/.clave), и drain_worker_events ниже дописывал бы в
+        // него «Готово»/«Остановлено»/«boom» на каждом прогоне тестов — утечка в реальные данные.
+        let mut app = footer_app();
         app.work_dir = dir.to_string_lossy().to_string();
         app.git_ref_detector = counting_detector;
         DETECTOR_CALLS.store(0, Ordering::SeqCst);

@@ -608,6 +608,34 @@ mod tests {
         parser.screen().contents()
     }
 
+    // Регрессия: сохранённая история печатается в скроллбэк ОДИН раз, а не заново на
+    // каждый кадр. При наборе в композере (меняется только живой блок) строка истории не
+    // должна перепечатываться — иначе в терминале копится по копии за кадр.
+    #[test]
+    fn idle_chat_history_prints_once_across_input_edits() {
+        let mut app = render_app();
+        app.transcript = vec![
+            "⏺ Готово.".to_string(),
+            "⏹ Выполнение остановлено.".to_string(),
+            "boom".to_string(),
+        ];
+        app.scrollback_count = 0;
+        app.running = false;
+        let mut r = LiveRenderer::new();
+        let mut all = String::new();
+        for i in 0..6 {
+            app.input = "x".repeat(i); // имитируем набор в композере
+            let mut out: Vec<u8> = Vec::new();
+            r.render_to(&mut out, &mut app, 80, 20).unwrap();
+            all.push_str(&String::from_utf8_lossy(&out));
+        }
+        let printed = all.matches("boom").count();
+        assert_eq!(
+            printed, 1,
+            "история перепечатывается каждый кадр → накопление дублей"
+        );
+    }
+
     // Инвариант inline-рендера через терминал-эмулятор (vt100): инкрементальная отрисовка
     // серии кадров ОБЯЗАНА совпасть с чистой перерисовкой того же состояния с нуля. Любой
     // мусор от промаха MoveUp/Clear (недостёртый дубль или стёртое лишнее — обкатка BUG-001/003)
