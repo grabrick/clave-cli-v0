@@ -12,7 +12,9 @@ pub(crate) fn draw_plugins_screen(frame: &mut Frame<'_>, area: Rect, app: &App) 
         return;
     }
 
-    let header = if app.plugins_query.is_empty() {
+    // Хедер и подсказка/подтверждение зафиксированы; между ними — скроллируемое тело со
+    // списком (реальный каталог claude — сотни доступных, иначе Codex и установленные за краем).
+    let header_text = if app.plugins_query.is_empty() {
         "› /plugins".to_string()
     } else {
         format!(
@@ -21,9 +23,9 @@ pub(crate) fn draw_plugins_screen(frame: &mut Frame<'_>, area: Rect, app: &App) 
             app.plugins_query
         )
     };
-    let mut lines = vec![
+    let header_lines = vec![
         Line::styled(
-            header,
+            header_text,
             Style::default()
                 .fg(app.theme.accent())
                 .add_modifier(Modifier::BOLD),
@@ -32,8 +34,55 @@ pub(crate) fn draw_plugins_screen(frame: &mut Frame<'_>, area: Rect, app: &App) 
         Line::from(""),
     ];
 
+    let footer_line = if let Some(pending) = &app.plugins_confirm {
+        confirm_line(pending, app.lang)
+    } else {
+        Line::from(Span::styled(
+            app.lang.choose(
+                "↑↓ выбор · Enter уст/удал · ^E вкл/выкл · ^U обновить · Tab источники · Esc",
+                "↑↓ move · Enter inst/rm · ^E on/off · ^U update · Tab sources · Esc",
+            ),
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+
+    let (body_lines, cursor_row) = plugins_body(app);
+
+    // Раскладка: хедер (3) сверху, подсказка (1) снизу, остальное — тело.
+    let header_h = 3u16.min(area.height);
+    let footer_h = if area.height > header_h { 1 } else { 0 };
+    let body_h = area.height.saturating_sub(header_h + footer_h);
+    let header_area = Rect {
+        height: header_h,
+        ..area
+    };
+    let body_area = Rect {
+        y: area.y + header_h,
+        height: body_h,
+        ..area
+    };
+    let footer_area = Rect {
+        y: area.y + header_h + body_h,
+        height: footer_h,
+        ..area
+    };
+
+    let offset = scroll_offset(cursor_row, body_h as usize, body_lines.len());
+
+    frame.render_widget(Paragraph::new(header_lines), header_area);
+    frame.render_widget(Paragraph::new(body_lines).scroll((offset, 0)), body_area);
+    if footer_h > 0 {
+        frame.render_widget(Paragraph::new(vec![footer_line]), footer_area);
+    }
+}
+
+/// Строит строки тела панели (секции Claude/Codex со статусами) и позицию строки выделенного
+/// плагина в этом списке — по ней прокрутка держит курсор в видимой области.
+fn plugins_body(app: &App) -> (Vec<Line<'static>>, usize) {
     // Индекс берём из ОТФИЛЬТРОВАННОГО списка, чтобы выделение совпадало с навигацией/поиском.
     let filtered = app.filtered_plugins();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut cursor_row = 0;
     for provider in [Provider::Claude, Provider::Codex] {
         lines.push(section_header(provider, app.theme));
 
@@ -59,30 +108,25 @@ pub(crate) fn draw_plugins_screen(frame: &mut Frame<'_>, area: Rect, app: &App) 
         }
 
         for (index, entry) in items {
-            lines.push(plugin_line(
-                entry,
-                index == app.plugins_index,
-                app.theme,
-                app.lang,
-            ));
+            let selected = index == app.plugins_index;
+            if selected {
+                cursor_row = lines.len();
+            }
+            lines.push(plugin_line(entry, selected, app.theme, app.lang));
         }
         lines.push(Line::from(""));
     }
+    (lines, cursor_row)
+}
 
-    // Строка подтверждения перекрывает подсказки, пока действие ждёт да/отмену.
-    if let Some(pending) = &app.plugins_confirm {
-        lines.push(confirm_line(pending, app.lang));
-    } else {
-        lines.push(Line::from(Span::styled(
-            app.lang.choose(
-                "↑↓ выбор · Enter уст/удал · ^E вкл/выкл · ^U обновить · Tab источники · Esc",
-                "↑↓ move · Enter inst/rm · ^E on/off · ^U update · Tab sources · Esc",
-            ),
-            Style::default().fg(Color::DarkGray),
-        )));
+/// Смещение прокрутки тела: пока выделенная строка (`cursor_row`) помещается в окно высотой
+/// `viewport`, смещения нет; ниже — окно едет за курсором, но не дальше конца списка (`total`).
+fn scroll_offset(cursor_row: usize, viewport: usize, total: usize) -> u16 {
+    if viewport == 0 || total <= viewport {
+        return 0;
     }
-
-    frame.render_widget(Paragraph::new(lines), area);
+    let max_offset = total - viewport;
+    cursor_row.saturating_sub(viewport - 1).min(max_offset) as u16
 }
 
 /// Рендер режима marketplace-источников: раздельные секции Claude/Codex, снизу — строка ввода
@@ -469,6 +513,67 @@ mod tests {
         assert!(
             screen.contains("загрузка"),
             "секция codex грузится: {screen}"
+        );
+    }
+
+    #[test]
+    fn selected_far_plugin_scrolls_into_view() {
+        // Список длиннее экрана: выделенный на дне плагин обязан прокрутиться в видимую область.
+        // Реальный каталог claude — сотни доступных; без вьюпорта видны только первые буквы.
+        let plugins: Vec<PluginEntry> = (0..40)
+            .map(|i| PluginEntry {
+                provider: Provider::Claude,
+                name: format!("plugin-{i:02}"),
+                marketplace: "m".into(),
+                installed: false,
+                enabled: false,
+                version: None,
+            })
+            .collect();
+        let mut app = app_with(plugins, false);
+        app.plugins_index = 39;
+        let screen = render(&app);
+        assert!(
+            screen.contains("plugin-39"),
+            "дальний выделенный плагин должен прокрутиться в вид:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn scroll_offset_keeps_cursor_in_view() {
+        // Список помещается целиком — прокрутки нет.
+        assert_eq!(scroll_offset(0, 10, 5), 0);
+        assert_eq!(scroll_offset(4, 10, 5), 0);
+        // Курсор в пределах первого окна — смещения нет.
+        assert_eq!(scroll_offset(9, 10, 100), 0);
+        // Курсор ниже окна — оно едет ровно настолько, чтобы курсор был виден снизу.
+        assert_eq!(scroll_offset(10, 10, 100), 1);
+        assert_eq!(scroll_offset(20, 10, 100), 11);
+        // У самого дна — окно упирается в конец, не дальше.
+        assert_eq!(scroll_offset(99, 10, 100), 90);
+        // Вырожденное окно — защита от переполнения.
+        assert_eq!(scroll_offset(5, 0, 100), 0);
+    }
+
+    #[test]
+    fn top_plugin_visible_and_no_scroll_when_fits() {
+        let plugins: Vec<PluginEntry> = (0..40)
+            .map(|i| PluginEntry {
+                provider: Provider::Claude,
+                name: format!("plugin-{i:02}"),
+                marketplace: "m".into(),
+                installed: false,
+                enabled: false,
+                version: None,
+            })
+            .collect();
+        let mut app = app_with(plugins, false);
+        app.plugins_index = 0;
+        let screen = render(&app);
+        // Курсор наверху — виден первый, а не уехавший вниз.
+        assert!(
+            screen.contains("plugin-00"),
+            "верхний плагин виден:\n{screen}"
         );
     }
 }
