@@ -172,6 +172,29 @@ fn inline_md_spans(text: &str) -> Vec<Span<'static>> {
                 }
             }
         }
+        // *Курсив* — одиночная звёздочка (двойную `**` уже разобрали выше). Содержимое
+        // должно прилегать к непробельным символам, иначе это оператор (`2 * 3`), а не
+        // разметка; внутренних звёздочек не допускаем, чтобы не проглотить соседний акцент.
+        if bytes[i] == b'*' {
+            if let Some(close) = text[i + 1..].find('*') {
+                let inner = &text[i + 1..i + 1 + close];
+                if !inner.is_empty()
+                    && !inner.contains('*')
+                    && !inner.starts_with(char::is_whitespace)
+                    && !inner.ends_with(char::is_whitespace)
+                {
+                    if !buf.is_empty() {
+                        spans.push(Span::raw(std::mem::take(&mut buf)));
+                    }
+                    for mut span in inline_code_spans(inner) {
+                        span.style = span.style.add_modifier(Modifier::ITALIC);
+                        spans.push(span);
+                    }
+                    i += 1 + close + 1;
+                    continue;
+                }
+            }
+        }
         // Обычный символ — копим в буфер, шагаем по границе UTF-8.
         let ch = text[i..].chars().next().unwrap();
         buf.push(ch);
@@ -596,6 +619,40 @@ pub(crate) fn history_rich_render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_md_renders_single_asterisk_italic() {
+        // *курсив* (одиночная звёздочка) — italic-спан без звёздочек (обкатка BUG-002 markdown).
+        let spans = inline_md_spans("тут *важное* слово");
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            text, "тут важное слово",
+            "звёздочки курсива должны исчезнуть"
+        );
+        assert!(
+            spans.iter().any(|s| s.content.as_ref() == "важное"
+                && s.style.add_modifier.contains(Modifier::ITALIC)),
+            "«важное» обязано стать курсивом"
+        );
+        // Скобка-обёртка как в обкатке: *(Замечу)* → курсив без звёздочек.
+        let paren: String = inline_md_spans("*(Замечу)* далее")
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(paren, "(Замечу) далее");
+        // Оператор умножения с пробелами — НЕ разметка, звёздочки остаются.
+        let mult: String = inline_md_spans("2 * 3 * 4")
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(mult, "2 * 3 * 4", "оператор умножения не курсив");
+        // **жирный** и `код` по-прежнему работают.
+        let bold: String = inline_md_spans("**жир** и `код`")
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(bold, "жир и код");
+    }
 
     fn plain(line: &Line<'_>) -> String {
         line.spans
