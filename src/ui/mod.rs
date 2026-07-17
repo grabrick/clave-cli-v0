@@ -10,6 +10,7 @@ pub(crate) mod helpers;
 pub(crate) mod loader;
 pub(crate) mod onboarding;
 pub(crate) mod plan_gate;
+pub(crate) mod plugins;
 pub(crate) mod prompt;
 pub(crate) mod search;
 pub(crate) mod settings;
@@ -25,6 +26,7 @@ pub(crate) use helpers::*;
 pub(crate) use loader::*;
 pub(crate) use onboarding::*;
 pub(crate) use plan_gate::*;
+pub(crate) use plugins::*;
 pub(crate) use prompt::*;
 pub(crate) use search::*;
 pub(crate) use settings::*;
@@ -95,6 +97,7 @@ pub(crate) fn draw_modal(frame: &mut Frame<'_>, app: &App) {
         Overlay::Effort => draw_effort_screen(frame, area, app),
         Overlay::Settings => draw_settings_screen(frame, area, app),
         Overlay::Chats => draw_chats_screen(frame, area, app),
+        Overlay::Plugins => draw_plugins_screen(frame, area, app),
         _ => {}
     }
 }

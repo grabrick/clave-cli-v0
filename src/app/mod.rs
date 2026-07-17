@@ -12,6 +12,7 @@ mod external;
 mod footer;
 mod onboarding;
 mod plan;
+mod plugins;
 mod runs;
 mod search;
 mod settings;
@@ -24,6 +25,7 @@ pub(crate) use events::*;
 pub(crate) use external::*;
 pub(crate) use onboarding::*;
 pub(crate) use plan::*;
+pub(crate) use plugins::*;
 pub(crate) use settings::*;
 
 pub(crate) struct App {
@@ -119,6 +121,30 @@ pub(crate) struct App {
     pub(crate) overlay: Overlay,
     pub(crate) chats_picker: Vec<ChatSummary>,
     pub(crate) chats_index: usize,
+    // Плагин-менеджер (/plugins): загруженный список обоих провайдеров + курсор + флаг
+    // догрузки codex (claude читается синхронно, codex — асинхронно через воркер).
+    pub(crate) plugins: Vec<PluginEntry>,
+    pub(crate) plugins_index: usize,
+    pub(crate) plugins_loading: bool,
+    /// Каталог конфигов claude (по умолчанию `~/.claude`). Инъектируется в тестах, чтобы
+    /// НЕ читать реальный пользовательский каталог (урок BUG-006).
+    pub(crate) claude_home: PathBuf,
+    /// Инкрементальный поиск в панели плагинов и отложенное действие, ждущее подтверждения
+    /// (установка/удаление меняют окружение — подтверждаем перед спавном).
+    pub(crate) plugins_query: String,
+    pub(crate) plugins_confirm: Option<PendingPluginAction>,
+    // Режим marketplace-источников внутри той же панели (Tab переключает плагины ⇄ источники).
+    // Источники обоих провайдеров — двумя секциями, как плагины; `marketplaces_loading` — флаг
+    // догрузки codex (claude читается синхронно из `known_marketplaces.json`).
+    pub(crate) plugins_marketplace_mode: bool,
+    pub(crate) marketplaces: Vec<Marketplace>,
+    pub(crate) marketplaces_index: usize,
+    pub(crate) marketplaces_loading: bool,
+    /// Ввод адреса нового источника (`Some` — строка ввода открыта; несёт целевого провайдера,
+    /// Tab в вводе его переключает) и отложенное удаление, ждущее подтверждения (удаление
+    /// источника необратимо-затратно, как и удаление плагина).
+    pub(crate) marketplace_input: Option<MarketplaceAdd>,
+    pub(crate) marketplace_confirm: Option<Marketplace>,
     pub(crate) search_query: String,
     pub(crate) search_index: usize,
     pub(crate) last_chat_message: Option<String>,
@@ -264,6 +290,18 @@ impl App {
             overlay: Overlay::None,
             chats_picker: Vec::new(),
             chats_index: 0,
+            plugins: Vec::new(),
+            plugins_index: 0,
+            plugins_loading: false,
+            claude_home: default_claude_home(),
+            plugins_query: String::new(),
+            plugins_confirm: None,
+            plugins_marketplace_mode: false,
+            marketplaces: Vec::new(),
+            marketplaces_index: 0,
+            marketplaces_loading: false,
+            marketplace_input: None,
+            marketplace_confirm: None,
             search_query: String::new(),
             search_index: 0,
             last_chat_message: None,

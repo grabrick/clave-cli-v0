@@ -5,6 +5,7 @@ pub(crate) enum Overlay {
     Effort,
     Settings,
     Chats,
+    Plugins,
     Shortcuts,
     Search,
 }
@@ -17,7 +18,10 @@ impl Overlay {
     /// Полноэкранные модалки — рисуются во временном alt-screen (инвариант 4).
     /// Палитра/?/search/gate — НЕ модалки, они inline в живом viewport.
     pub(crate) fn is_modal(self) -> bool {
-        matches!(self, Overlay::Effort | Overlay::Settings | Overlay::Chats)
+        matches!(
+            self,
+            Overlay::Effort | Overlay::Settings | Overlay::Chats | Overlay::Plugins
+        )
     }
 }
 

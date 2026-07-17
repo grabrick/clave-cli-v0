@@ -16,6 +16,14 @@ pub(crate) enum WorkerEvent {
     Failed(String),
     /// Провайдер не залогинен — проверка ушла в воркер, чтобы не морозить UI.
     AuthMissing(Provider),
+    /// Список плагинов codex догружен воркером (claude читается синхронно при открытии панели).
+    PluginsLoaded(Vec<PluginEntry>),
+    /// Действие над плагином (install/uninstall/enable/…) завершено — обновляем список.
+    PluginActionDone,
+    /// Список marketplace-источников codex догружен воркером (claude читается синхронно).
+    MarketplacesLoaded(Vec<Marketplace>),
+    /// Добавление/удаление источника завершено — перезагружаем список источников.
+    MarketplaceActionDone,
 }
 
 pub(crate) enum ChatRunResult {
@@ -379,6 +387,10 @@ impl App {
                     self.restore_unsent_to_input();
                     self.prompt_provider_login(provider);
                 }
+                WorkerEvent::PluginsLoaded(plugins) => self.plugins_loaded(plugins),
+                WorkerEvent::PluginActionDone => self.plugin_action_done(),
+                WorkerEvent::MarketplacesLoaded(markets) => self.marketplaces_loaded(markets),
+                WorkerEvent::MarketplaceActionDone => self.marketplace_action_done(),
             }
         }
     }

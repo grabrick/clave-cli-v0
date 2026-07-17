@@ -316,6 +316,7 @@ impl App {
                     self.resume_chat(rest.trim());
                 }
             }
+            "/plugins" => self.open_plugins_panel(),
             "/clear" => {
                 let arg = rest.trim();
                 if arg.is_empty() {
@@ -556,6 +557,7 @@ impl App {
                 | "/new"
                 | "/chats"
                 | "/resume"
+                | "/plugins"
                 | "/color"
                 | "/effort"
                 | "/settings"
