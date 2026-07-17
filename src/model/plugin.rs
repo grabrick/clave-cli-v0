@@ -38,6 +38,16 @@ pub(crate) struct Marketplace {
     pub(crate) source: String,
 }
 
+/// Описание плагина для области деталей выбранного в панели. Держим ОТДЕЛЬНО от `PluginEntry`
+/// (карта `qualified_name → PluginDetail` на App), чтобы не тащить необязательное описание в
+/// каждую запись и не трогать 23 её литерала. Есть только у claude (`marketplace_entry`), у codex
+/// в API описаний нет.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PluginDetail {
+    pub(crate) description: String,
+    pub(crate) author: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

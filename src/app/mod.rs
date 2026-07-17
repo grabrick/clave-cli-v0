@@ -144,6 +144,9 @@ pub(crate) struct App {
     pub(crate) plugins: Vec<PluginEntry>,
     pub(crate) plugins_index: usize,
     pub(crate) plugins_loading: bool,
+    /// Описания плагинов (claude) для области деталей выбранного: `qualified_name → PluginDetail`.
+    /// Отдельно от `plugins`, чтобы не тащить описание в каждую запись. У codex описаний нет.
+    pub(crate) plugin_details: std::collections::BTreeMap<String, PluginDetail>,
     /// Каталог конфигов claude (по умолчанию `~/.claude`). Инъектируется в тестах, чтобы
     /// НЕ читать реальный пользовательский каталог (урок BUG-006).
     pub(crate) claude_home: PathBuf,
@@ -319,6 +322,7 @@ impl App {
             plugins: Vec::new(),
             plugins_index: 0,
             plugins_loading: false,
+            plugin_details: std::collections::BTreeMap::new(),
             claude_home: default_claude_home(),
             plugins_query: String::new(),
             plugins_confirm: None,
