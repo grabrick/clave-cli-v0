@@ -604,6 +604,89 @@ mod tests {
         String::from_utf8_lossy(&out).into_owned()
     }
 
+    fn vt_visible(parser: &vt100::Parser) -> String {
+        parser.screen().contents()
+    }
+
+    // Инвариант inline-рендера через терминал-эмулятор (vt100): инкрементальная отрисовка
+    // серии кадров ОБЯЗАНА совпасть с чистой перерисовкой того же состояния с нуля. Любой
+    // мусор от промаха MoveUp/Clear (недостёртый дубль или стёртое лишнее — обкатка BUG-001/003)
+    // даёт расхождение. Гоняем у нижнего края маленького терминала и с ШИРОКИМИ (CJK) символами
+    // в контенте — так проверяется, что высота блока считается по реальной ширине ячеек, а не по
+    // числу символов. Оффскрин-буфер frame() такое показать не мог — оттого баг и уцелел в тестах.
+    #[test]
+    fn inline_render_matches_clean_redraw_across_stream() {
+        let (cols, rows) = (72u16, 10u16);
+        let mut parser = vt100::Parser::new(rows, cols, 1000);
+        let mut r = LiveRenderer::new();
+        let mut app = render_app();
+
+        macro_rules! tick {
+            () => {{
+                let mut out: Vec<u8> = Vec::new();
+                r.render_to(&mut out, &mut app, cols, rows).unwrap();
+                parser.process(&out);
+            }};
+        }
+
+        // Три хода чата: реплика → reasoning-стрим → ответ-стрим → завершение. Широкие CJK-
+        // символы (中文) clave и терминал одинаково считают по 2 клетки — проверяем, что высота
+        // и вертикальное позиционирование опираются на ячейки.
+        for turn in 0..3 {
+            app.live_turn = Some(format!("метка{turn} 中文 проверь контекст"));
+            app.running = true;
+            app.live_answer.clear();
+            app.live_reasoning.clear();
+            tick!();
+
+            for step in 0..6 {
+                app.live_reasoning
+                    .push_str(&format!("думаю шаг {turn}.{step}\n"));
+                tick!();
+            }
+            app.live_reasoning.clear();
+            for line in 0..8 {
+                app.live_answer
+                    .push_str(&format!("ответ {turn}.{line} 中文 строка\n"));
+                tick!();
+            }
+
+            if let Some(t) = app.live_turn.take() {
+                app.push_system(t);
+            }
+            let answer_lines: Vec<String> = app
+                .live_answer
+                .split('\n')
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect();
+            for line in answer_lines {
+                app.push_system(line);
+            }
+            app.live_answer.clear();
+            app.running = false;
+            tick!();
+        }
+
+        let incremental = vt_visible(&parser);
+
+        // Та же лента, нарисованная с нуля новым рендерером во второй эмулятор.
+        app.scrollback_count = 0;
+        app.flush_state = TranscriptRenderState::default();
+        let mut clean_parser = vt100::Parser::new(rows, cols, 1000);
+        let mut clean = LiveRenderer::new();
+        let mut out: Vec<u8> = Vec::new();
+        clean.render_to(&mut out, &mut app, cols, rows).unwrap();
+        clean_parser.process(&out);
+        let from_scratch = vt_visible(&clean_parser);
+
+        assert_eq!(
+            incremental, from_scratch,
+            "инкрементальный рендер разошёлся с чистой перерисовкой (промах MoveUp/Clear)\n\
+             === инкрементально ===\n{incremental}\n=== с нуля ===\n{from_scratch}\n==="
+        );
+    }
+
     /// Приложение с ПОЛНОСТЬЮ детерминированным футером: правый слот берётся из полей
     /// (а не из стенных часов), панели и верхний слот погашены — значит футер это
     /// последняя строка блока, и её можно сверять посимвольно.
