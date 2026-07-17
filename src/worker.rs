@@ -1523,6 +1523,25 @@ fn claude_thinking_delta(value: &serde_json::Value) -> Option<String> {
         .map(String::from)
 }
 
+/// Начало нового text-блока в стриме claude (`content_block_start` с `content_block.type ==
+/// "text"`). В многошаговом режиме (FullAccess) каждый шаг между `tool_use` открывает свой
+/// text-блок; на их границе нужен разделитель абзаца, иначе тексты слипаются впритык.
+fn claude_text_block_start(value: &serde_json::Value) -> bool {
+    let block = match value.get("type").and_then(|v| v.as_str()) {
+        Some("stream_event") => match value.get("event") {
+            Some(event) => event,
+            None => return false,
+        },
+        _ => value,
+    };
+    block.get("type").and_then(|v| v.as_str()) == Some("content_block_start")
+        && block
+            .get("content_block")
+            .and_then(|c| c.get("type"))
+            .and_then(|v| v.as_str())
+            == Some("text")
+}
+
 /// Потоково читает claude stream-json: токены ответа эмитит как StreamDelta (живой
 /// вывод), активность tool_use — в лоадер, и возвращает финальное result-событие.
 pub(crate) fn spawn_claude_activity_reader(
@@ -1534,11 +1553,21 @@ pub(crate) fn spawn_claude_activity_reader(
     thread::spawn(move || {
         let reader = BufReader::new(reader);
         let mut result_line = String::new();
+        // Был ли уже text-блок: на границе следующего вставляем разделитель абзаца, чтобы
+        // тексты соседних шагов (между tool_use в FullAccess) не слипались впритык.
+        let mut seen_text_block = false;
         for line in reader.lines().map_while(Result::ok) {
             touch_activity(&last_activity);
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
+            if claude_text_block_start(&value) {
+                if seen_text_block {
+                    let _ = tx.send(WorkerEvent::StreamDelta("\n\n".to_string()));
+                }
+                seen_text_block = true;
+                continue;
+            }
             if let Some(delta) = claude_text_delta(&value) {
                 let _ = tx.send(WorkerEvent::StreamDelta(delta));
                 continue;
@@ -1820,6 +1849,39 @@ mod tests {
         let text = serde_json::json!({"type":"stream_event","event":{
             "type":"content_block_delta","delta":{"type":"text_delta","text":"ответ"}}});
         assert_eq!(claude_thinking_delta(&text), None);
+    }
+
+    #[test]
+    fn adjacent_turn_text_blocks_get_a_paragraph_break() {
+        // FullAccess: между шагами (tool_use) claude открывает НОВЫЙ text-блок. Их тексты
+        // обязаны разделяться абзацем — иначе «файл.Файл» слипается впритык (обкатка BUG-002).
+        let jsonl = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Читаю файл."}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Файл про кошек."}}}"#,
+        ]
+        .join("\n");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = spawn_claude_activity_reader(
+            std::io::Cursor::new(jsonl),
+            tx,
+            Language::Ru,
+            std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+        );
+        handle.join().unwrap();
+        let streamed: String = rx
+            .into_iter()
+            .filter_map(|e| match e {
+                WorkerEvent::StreamDelta(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            streamed, "Читаю файл.\n\nФайл про кошек.",
+            "тексты соседних turn-блоков должны разделяться абзацем, а не слипаться"
+        );
     }
 
     #[test]
