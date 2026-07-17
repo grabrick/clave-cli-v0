@@ -40,6 +40,19 @@ pub(crate) fn load_claude_marketplaces(claude_home: &Path) -> Vec<Marketplace> {
     parse_claude_marketplaces(&known)
 }
 
+/// Читает описания плагинов claude из каталог-кэша (для области деталей). Файла нет → пусто.
+pub(crate) fn load_claude_plugin_details(
+    claude_home: &Path,
+) -> std::collections::BTreeMap<String, PluginDetail> {
+    let catalog = fs::read_to_string(
+        claude_home
+            .join("plugins")
+            .join("plugin-catalog-cache.json"),
+    )
+    .unwrap_or_default();
+    parse_claude_plugin_details(&catalog)
+}
+
 /// Спавнит `codex plugin marketplace list --json`, возвращает stdout (пусто при ошибке —
 /// секция codex покажется пустой, без паники).
 fn run_codex_marketplace_list() -> String {
@@ -125,6 +138,7 @@ impl App {
     /// codex-список догружается АСИНХРОННО воркером (спавн CLI занимает время).
     pub(crate) fn open_plugins_panel(&mut self) {
         self.plugins = load_claude_plugins(&self.claude_home);
+        self.plugin_details = load_claude_plugin_details(&self.claude_home);
         self.plugins_index = 0;
         self.plugins_loading = true;
         // Панель всегда открывается на «Обзоре», без залипшего таба/ввода с прошлого раза.
@@ -321,6 +335,7 @@ impl App {
     /// Действие завершено — перезагружаем список (статусы install/enabled могли измениться).
     pub(crate) fn plugin_action_done(&mut self) {
         self.plugins = load_claude_plugins(&self.claude_home);
+        self.plugin_details = load_claude_plugin_details(&self.claude_home);
         self.plugins_index = 0;
         self.plugins_loading = true;
         self.spawn_codex_plugins_load();

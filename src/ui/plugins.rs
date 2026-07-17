@@ -12,7 +12,7 @@ pub(crate) fn draw_plugins_screen(frame: &mut Frame<'_>, area: Rect, app: &App) 
         PluginsTab::Overview => (overview_body(app), 0, vec![overview_footer(app)]),
         PluginsTab::Installed | PluginsTab::Catalog => {
             let (body, cursor_row) = plugins_body(app);
-            (body, cursor_row, vec![plugin_list_footer(app)])
+            (body, cursor_row, plugin_list_footer(app, area.width))
         }
         PluginsTab::Sources => (marketplace_body(app), 0, sources_footer(app)),
     };
@@ -198,10 +198,13 @@ fn overview_footer(app: &App) -> Line<'static> {
     ))
 }
 
-fn plugin_list_footer(app: &App) -> Line<'static> {
+/// Низ списковых табов: область деталей выбранного плагина (описание/автор) + строка подсказки.
+/// Пока действие ждёт подтверждения — вместо всего этого строка подтверждения.
+fn plugin_list_footer(app: &App, width: u16) -> Vec<Line<'static>> {
     if let Some(pending) = &app.plugins_confirm {
-        return confirm_line(pending, app.lang);
+        return vec![confirm_line(pending, app.lang)];
     }
+    let mut lines = plugin_detail_lines(app, width);
     let hint = match app.plugins_tab {
         PluginsTab::Installed => app.lang.choose(
             "↑↓ · ←→ провайдер · Enter удалить · ^E вкл/выкл · ^U обновить · ↹ таб · Esc",
@@ -212,7 +215,77 @@ fn plugin_list_footer(app: &App) -> Line<'static> {
             "↑↓ · ←→ provider · Enter install · search · ↹ tab · Esc",
         ),
     };
-    Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines
+}
+
+/// Область деталей выбранного плагина: разделитель, имя, описание (перенос до 2 строк), автор.
+/// Пусто, если у выбранного описания нет (codex или отсутствует в кэше) — тогда просто подсказка.
+fn plugin_detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let Some(entry) = app.filtered_plugins().get(app.plugins_index).copied() else {
+        return Vec::new();
+    };
+    let Some(detail) = app.plugin_details.get(&entry.qualified_name()) else {
+        return Vec::new();
+    };
+    let mut lines = vec![
+        separator_line(width, app.theme),
+        Line::from(Span::styled(
+            format!("● {}", entry.name),
+            Style::default()
+                .fg(app.theme.accent())
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    for line in wrap_text(&detail.description, width.saturating_sub(2) as usize, 2) {
+        lines.push(Line::from(Span::styled(
+            format!("  {line}"),
+            Style::default().fg(app.theme.accent_soft()),
+        )));
+    }
+    if let Some(author) = &detail.author {
+        lines.push(Line::from(Span::styled(
+            format!("  ↳ {author}"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines
+}
+
+/// Жадный перенос текста по словам в строки шириной `width`, не больше `max_lines`. Если текст
+/// длиннее — последняя строка усечётся с «…». Для описания плагина в области деталей.
+fn wrap_text(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+    let mut all: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let fits = current.chars().count() + 1 + word.chars().count() <= width;
+        if current.is_empty() {
+            current.push_str(word);
+        } else if fits {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            all.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        all.push(current);
+    }
+    if all.len() > max_lines {
+        all.truncate(max_lines);
+        if let Some(last) = all.last_mut() {
+            let trimmed: String = last.chars().take(width.saturating_sub(1)).collect();
+            *last = format!("{trimmed}…");
+        }
+    }
+    all
 }
 
 /// Строит строки тела спискового таба (плагины ОДНОГО провайдера — он выбран в шапке) и позицию
@@ -657,6 +730,53 @@ mod tests {
             codex_view.contains("codex-avail"),
             "codex достижим сменой провайдера: {codex_view}"
         );
+    }
+
+    #[test]
+    fn detail_area_shows_description_and_author_of_selected() {
+        let mut app = app_with(
+            vec![PluginEntry {
+                provider: Provider::Claude,
+                name: "context7".into(),
+                marketplace: "official".into(),
+                installed: false,
+                enabled: false,
+                version: None,
+            }],
+            false,
+        );
+        app.plugins_tab = PluginsTab::Catalog;
+        app.plugins_index = 0;
+        app.plugin_details.insert(
+            "context7@official".to_string(),
+            PluginDetail {
+                description: "Up-to-date library docs for any prompt".into(),
+                author: Some("upstash".into()),
+            },
+        );
+
+        let screen = render(&app);
+        assert!(
+            screen.contains("Up-to-date library docs"),
+            "описание выбранного плагина в деталях: {screen}"
+        );
+        assert!(screen.contains("upstash"), "автор в деталях: {screen}");
+    }
+
+    #[test]
+    fn wrap_text_wraps_and_truncates_with_ellipsis() {
+        // Длинный текст → ровно max_lines, последняя усечена «…».
+        let lines = wrap_text("one two three four five six seven", 9, 2);
+        assert_eq!(lines.len(), 2, "не больше max_lines: {lines:?}");
+        assert!(lines[0].chars().count() <= 9, "строка в пределах ширины");
+        assert!(
+            lines.last().unwrap().ends_with('…'),
+            "усечение многоточием: {lines:?}"
+        );
+        // Короткий — одна строка без усечения.
+        assert_eq!(wrap_text("hi there", 20, 2), vec!["hi there".to_string()]);
+        // Вырожденная ширина — пусто, без паники.
+        assert!(wrap_text("x", 0, 2).is_empty());
     }
 
     fn market(provider: Provider, name: &str, source: &str) -> Marketplace {

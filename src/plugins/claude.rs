@@ -176,6 +176,52 @@ pub(crate) fn claude_marketplace_remove_cmd(name: &str) -> Command {
     cmd
 }
 
+/// Разбирает описания плагинов из `plugin-catalog-cache.json` для области деталей панели: адрес у
+/// каждой записи — вложенный `marketplace_entry` с `description`/`author`. Ключ карты — тот же
+/// `name@marketplace`, что у [`parse_claude_plugins`], чтобы деталь искалась по `qualified_name`.
+/// Записи без описания пропускаем (нечего показывать); битый JSON → пустая карта.
+pub(crate) fn parse_claude_plugin_details(catalog_json: &str) -> BTreeMap<String, PluginDetail> {
+    let mut out = BTreeMap::new();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(catalog_json) else {
+        return out;
+    };
+    let Some(plugins) = value
+        .get("catalog")
+        .and_then(|c| c.get("plugins"))
+        .and_then(|p| p.as_object())
+    else {
+        return out;
+    };
+    for (key, meta) in plugins {
+        let entry = meta.get("marketplace_entry");
+        let description = entry
+            .and_then(|e| e.get("description"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if description.is_empty() {
+            continue;
+        }
+        // `author` — объект `{ "name", "email"? }`, а не строка: берём имя.
+        let author = entry
+            .and_then(|e| e.get("author"))
+            .and_then(|a| a.get("name"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        out.insert(
+            key.clone(),
+            PluginDetail {
+                description,
+                author,
+            },
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +351,38 @@ mod tests {
             cmd_args(&claude_marketplace_remove_cmd("my-mkt")),
             ["plugin", "marketplace", "remove", "my-mkt"]
         );
+    }
+
+    #[test]
+    fn parse_details_reads_description_and_author_from_marketplace_entry() {
+        // Реальный формат: описание/автор вложены в marketplace_entry.
+        let catalog = r#"{"catalog":{"plugins":{
+            "42crunch@official":{"version":"1.9.0","marketplace_entry":{
+                "description":"  Audit OpenAPI specs  ","author":{"name":"42Crunch","email":"x@y"}}},
+            "nodesc@official":{"version":"1.0","marketplace_entry":{"author":{"name":"x"}}}
+        }}}"#;
+        let details = parse_claude_plugin_details(catalog);
+
+        let d = details
+            .get("42crunch@official")
+            .expect("описание разобрано");
+        assert_eq!(d.description, "Audit OpenAPI specs", "описание тримится");
+        assert_eq!(
+            d.author.as_deref(),
+            Some("42Crunch"),
+            "автор — из author.name"
+        );
+        assert!(
+            !details.contains_key("nodesc@official"),
+            "без описания запись пропущена — показывать нечего"
+        );
+    }
+
+    #[test]
+    fn parse_details_broken_input_is_empty() {
+        assert!(parse_claude_plugin_details("").is_empty());
+        assert!(parse_claude_plugin_details("{ битый").is_empty());
+        assert!(parse_claude_plugin_details("{}").is_empty());
     }
 
     #[test]

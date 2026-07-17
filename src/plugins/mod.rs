@@ -8,7 +8,7 @@ pub(crate) mod codex;
 
 pub(crate) use claude::{
     claude_action_cmd, claude_marketplace_add_cmd, claude_marketplace_remove_cmd,
-    parse_claude_marketplaces, parse_claude_plugins,
+    parse_claude_marketplaces, parse_claude_plugin_details, parse_claude_plugins,
 };
 pub(crate) use codex::{
     codex_action_cmd, codex_marketplace_add_cmd, codex_marketplace_remove_cmd,
