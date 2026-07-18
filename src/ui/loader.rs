@@ -1,6 +1,37 @@
 use super::*;
 
+/// Статичное приглашение на гейтах тандема: воркер ЖИВ, но ждёт ТЕБЯ, а не считает.
+/// Без шиммера/таймера/токенов — иначе «Пишу ответ… 18m» читается как работа, и
+/// пользователь ждёт вместо ответа (ровно это и произошло).
+fn tandem_gate_loader(app: &App, phrase: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("✳ {phrase}"),
+        Style::default()
+            .fg(app.theme.accent())
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
 pub(crate) fn loader_line(app: &App) -> Line<'static> {
+    if app.tandem_input_gate {
+        return tandem_gate_loader(
+            app,
+            app.lang.choose(
+                "Нужны уточнения — набери ответ и Enter",
+                "Needs input — type your answer and press Enter",
+            ),
+        );
+    }
+    if app.tandem_gate {
+        return tandem_gate_loader(
+            app,
+            app.lang.choose(
+                "Нет консенсуса — Enter исполнить · Esc отмена",
+                "No consensus — Enter execute · Esc cancel",
+            ),
+        );
+    }
+
     let elapsed = app
         .run_started_at
         .map(|started| started.elapsed())
@@ -235,6 +266,33 @@ mod tests {
         );
         app.onboarding = None;
         app
+    }
+
+    #[test]
+    fn loader_shows_gate_prompt_instead_of_writing_while_waiting() {
+        // Регресс: на паузе «нужны уточнения» лоадер писал «Пишу ответ… 18m» (live_answer
+        // не был пуст) — пользователь думал, что идёт работа, и ждал вместо ответа.
+        let mut app = loader_app();
+        app.run_started_at = Some(Instant::now());
+        app.live_answer = "черновой стрим шага".to_string();
+        app.tandem_input_gate = true;
+        let text = line_text(&loader_line(&app));
+        assert!(
+            text.contains("Нужны уточнения"),
+            "лоадер зовёт ответить: {text}"
+        );
+        assert!(
+            !text.contains("Пишу ответ"),
+            "паузу не выдаём за работу: {text}"
+        );
+
+        // Гейт «нет консенсуса» — то же ясное «твой ход».
+        let mut approval = loader_app();
+        approval.live_answer = "стрим".to_string();
+        approval.tandem_gate = true;
+        let t2 = line_text(&loader_line(&approval));
+        assert!(t2.contains("Нет консенсуса"), "{t2}");
+        assert!(!t2.contains("Пишу ответ"), "{t2}");
     }
 
     #[test]

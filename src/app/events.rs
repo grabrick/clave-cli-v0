@@ -451,6 +451,10 @@ impl App {
                     // накопленные шаги (иначе гейт всплыл бы без контекста дебатов) и показываем
                     // промпт прямо в ленте; ответ уйдёт в воркер по каналу из handle_input_key.
                     self.tandem_gate = true;
+                    // Гасим ЖИВОЙ стрим последнего шага: иначе его сырой текст (с маркером)
+                    // висит отдельным блоком-дублем, а лоадер пишет «Пишу ответ», хотя ждём тебя.
+                    self.live_answer.clear();
+                    self.live_reasoning.clear();
                     self.flush_reveal_buffer();
                     self.push_system(self.lang.choose(
                         "⚠ Консенсус не достигнут за раунды. Enter — исполнить последнюю версию · Esc — отмена, файлы не тронуты.",
@@ -465,6 +469,9 @@ impl App {
                     // Исполнителю не хватает данных — вопросы уже в шаге. Проявляем накопленное
                     // и открываем ввод-гейт: пользователь печатает ответ, Enter — отправить.
                     self.tandem_input_gate = true;
+                    // Тот же дубль-стрим гасим и здесь (см. TandemNeedsApproval).
+                    self.live_answer.clear();
+                    self.live_reasoning.clear();
                     self.flush_reveal_buffer();
                     self.status = self
                         .lang
