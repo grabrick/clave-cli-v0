@@ -18,7 +18,44 @@ pub(crate) fn load_claude_plugins(claude_home: &Path) -> Vec<PluginEntry> {
     let installed =
         fs::read_to_string(plugins_dir.join("installed_plugins.json")).unwrap_or_default();
     let settings = fs::read_to_string(claude_home.join("settings.json")).unwrap_or_default();
-    parse_claude_plugins(&catalog, &installed, &settings)
+
+    // Официальный каталог-кэш + плагины КАЖДОГО стороннего маркетплейса из его манифеста: кэш их
+    // не содержит, и без этого сторонние источники в Каталоге не видны. Дедуп по qualified_name
+    // (официальный маркетплейс есть и в кэше, и в манифесте — берём из кэша, он с версиями).
+    let mut plugins = parse_claude_plugins(&catalog, &installed, &settings);
+    let mut seen: std::collections::HashSet<String> =
+        plugins.iter().map(|p| p.qualified_name()).collect();
+    for (marketplace, manifest) in read_marketplace_manifests(claude_home) {
+        for entry in parse_marketplace_plugins(&manifest, &marketplace, &installed, &settings) {
+            if seen.insert(entry.qualified_name()) {
+                plugins.push(entry);
+            }
+        }
+    }
+    sort_plugins(&mut plugins);
+    plugins
+}
+
+/// Читает манифесты всех сторонних маркетплейсов: `(имя_каталога, содержимое marketplace.json)`.
+/// Каталога `plugins/marketplaces/` нет → пусто. Имя каталога = имя маркетплейса для установки.
+fn read_marketplace_manifests(claude_home: &Path) -> Vec<(String, String)> {
+    let dir = claude_home.join("plugins").join("marketplaces");
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if let Ok(manifest) =
+            fs::read_to_string(path.join(".claude-plugin").join("marketplace.json"))
+        {
+            out.push((name.to_string(), manifest));
+        }
+    }
+    out
 }
 
 /// Спавнит `codex plugin list --available --json`, возвращает stdout (или пусто при ошибке —
@@ -40,7 +77,8 @@ pub(crate) fn load_claude_marketplaces(claude_home: &Path) -> Vec<Marketplace> {
     parse_claude_marketplaces(&known)
 }
 
-/// Читает описания плагинов claude из каталог-кэша (для области деталей). Файла нет → пусто.
+/// Читает описания плагинов claude для области деталей: официальный каталог-кэш + манифесты
+/// сторонних маркетплейсов. Официальные описания приоритетнее (не перекрываются манифестом).
 pub(crate) fn load_claude_plugin_details(
     claude_home: &Path,
 ) -> std::collections::BTreeMap<String, PluginDetail> {
@@ -50,7 +88,13 @@ pub(crate) fn load_claude_plugin_details(
             .join("plugin-catalog-cache.json"),
     )
     .unwrap_or_default();
-    parse_claude_plugin_details(&catalog)
+    let mut details = parse_claude_plugin_details(&catalog);
+    for (marketplace, manifest) in read_marketplace_manifests(claude_home) {
+        for (key, detail) in parse_marketplace_details(&manifest, &marketplace) {
+            details.entry(key).or_insert(detail);
+        }
+    }
+    details
 }
 
 /// Множество плагинов claude с доступным обновлением (installed-версия ≠ catalog). Оба файла
@@ -508,6 +552,12 @@ impl App {
     pub(crate) fn marketplace_action_done(&mut self) {
         self.marketplaces_index = 0;
         self.load_marketplaces();
+        // Источник добавлен/удалён — его плагины появились/ушли: обновляем и Каталог.
+        self.plugins = load_claude_plugins(&self.claude_home);
+        self.plugin_details = load_claude_plugin_details(&self.claude_home);
+        self.plugin_updates = load_claude_plugin_updates(&self.claude_home);
+        self.plugins_loading = true;
+        self.spawn_codex_plugins_load();
     }
 }
 
