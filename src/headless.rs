@@ -121,6 +121,9 @@ fn print_event(event: &WorkerEvent) {
         WorkerEvent::TandemNeedsInput(_) => {
             println!("⚠ Исполнителю нужны уточнения — в headless некому ответить, продолжаю.");
         }
+        // TandemStepEnd — сигнал живому региону UI фиксировать шаг; в headless региона нет
+        // (шаги печатаются построчно сразу), печатать нечего.
+        WorkerEvent::TandemStepEnd => {}
         WorkerEvent::Done(_)
         | WorkerEvent::ChatDone(..)
         | WorkerEvent::PlanReady(..)
