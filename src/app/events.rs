@@ -27,9 +27,10 @@ pub(crate) enum WorkerEvent {
     /// Тандем не достиг консенсуса: воркер заблокирован и ждёт решения пользователя
     /// (исполнить последнюю версию / отменить). Открывает гейт `tandem_gate`.
     TandemNeedsApproval,
-    /// Исполнителю не хватает данных: воркер заблокирован и ждёт ТЕКСТОВЫЙ ответ
-    /// пользователя (вопросы уже показаны). Открывает ввод-гейт `tandem_input_gate`.
-    TandemNeedsInput,
+    /// Исполнителю не хватает данных: воркер заблокирован и ждёт ответ пользователя
+    /// (вопросы уже показаны). `Some` — закрытый вопрос, открываем селектор выбора;
+    /// `None` — открытый вопрос, текстовый ввод-гейт.
+    TandemNeedsInput(Option<AskPrompt>),
 }
 
 pub(crate) enum ChatRunResult {
@@ -422,21 +423,30 @@ impl App {
                         .choose("нет консенсуса — Enter/Esc", "no consensus — Enter/Esc")
                         .to_string();
                 }
-                WorkerEvent::TandemNeedsInput => {
-                    // Исполнителю не хватает данных — вопросы уже в шаге. Проявляем накопленное
-                    // и открываем ввод-гейт: пользователь печатает ответ, Enter — отправить.
-                    self.tandem_input_gate = true;
-                    // Тот же дубль-стрим гасим и здесь (см. TandemNeedsApproval).
+                WorkerEvent::TandemNeedsInput(prompt) => {
+                    // Исполнителю не хватает данных — вопросы уже в шаге. Гасим дубль-стрим
+                    // (см. TandemNeedsApproval) и проявляем накопленное.
                     self.live_answer.clear();
                     self.live_reasoning.clear();
                     self.flush_reveal_buffer();
-                    self.status = self
-                        .lang
-                        .choose(
-                            "нужны уточнения — ответь и Enter",
-                            "needs input — answer + Enter",
-                        )
-                        .to_string();
+                    match prompt {
+                        // Закрытый вопрос → тот же селектор, что в чате, но выбор питает тандем.
+                        Some(prompt) => {
+                            self.open_tandem_choice(prompt);
+                            self.status = self.lang.choose("выбор", "choose").to_string();
+                        }
+                        // Открытый вопрос → текстовый ввод-гейт.
+                        None => {
+                            self.tandem_input_gate = true;
+                            self.status = self
+                                .lang
+                                .choose(
+                                    "нужны уточнения — ответь и Enter",
+                                    "needs input — answer + Enter",
+                                )
+                                .to_string();
+                        }
+                    }
                 }
             }
         }
@@ -918,7 +928,9 @@ mod tests {
         app.running = true;
         app.reveal_buffer = vec!["🅐 вопросы к тебе".to_string()];
 
-        app.tx.send(WorkerEvent::TandemNeedsInput).expect("send");
+        app.tx
+            .send(WorkerEvent::TandemNeedsInput(None))
+            .expect("send");
         app.drain_worker_events();
         assert!(app.tandem_input_gate, "событие открывает ввод-гейт");
         assert!(app.reveal_buffer.is_empty(), "вопросы проявлены");

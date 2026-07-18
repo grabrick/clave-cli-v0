@@ -393,6 +393,7 @@ mod tests {
             answers,
             step,
             confirm_cursor: 0,
+            feeds_tandem: false,
         }
     }
 

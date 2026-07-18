@@ -36,18 +36,27 @@ impl App {
         self.tandem_input_gate
     }
 
-    /// Enter на ввод-гейте: отправить набранный ответ заблокированному воркеру — тот
-    /// вольёт его в ленту и пере-предложит. Пустой ответ не отправляем (ждём текст).
+    /// Enter на ввод-гейте: отправить НАБРАННЫЙ ответ. Пустой не шлём (ждём текст).
     pub(crate) fn tandem_submit_input(&mut self) {
         let answer = self.input.trim().to_string();
+        if answer.is_empty() {
+            return;
+        }
+        self.input.clear();
+        self.cursor = 0;
+        self.resume_tandem_with(answer);
+    }
+
+    /// Разблокировать паузу тандема ответом (текст ИЛИ выбор из селектора): шлём его в
+    /// заблокированный воркер по каналу — тот вольёт его в ленту и пере-предложит.
+    pub(crate) fn resume_tandem_with(&mut self, answer: String) {
+        let answer = answer.trim().to_string();
         if answer.is_empty() {
             return;
         }
         if let Some(tx) = self.tandem_input_tx.as_ref() {
             let _ = tx.send(answer);
         }
-        self.input.clear();
-        self.cursor = 0;
         self.tandem_input_gate = false;
         self.status = self
             .lang
