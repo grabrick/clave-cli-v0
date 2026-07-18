@@ -348,7 +348,19 @@ fn build_dynamic(app: &App, width: u16, full_h: u16) -> (Vec<Line<'static>>, u16
         // мелькать в ленте до того, как откроется панель (на ChatDone).
         let visible = live_answer_visible(&app.live_answer);
         if !visible.is_empty() {
-            let shown = format!("⏺ {visible}");
+            // Живой стрим показываем ХВОСТОМ (последние N строк текста). Иначе большое
+            // сообщение (шаги тандема длинные, плюс минуты стрима) раздувает живой блок почти
+            // на весь экран, ручной рендерер упирается в границу прокрутки — курсор
+            // рассинхронивается и старый блок с лоадером застревает в скроллбэке (три
+            // «Пишу ответ…»). Полный текст всё равно уедет в ленту готовым блоком.
+            const LIVE_STREAM_MAX_LINES: usize = 10;
+            let text_lines: Vec<&str> = visible.lines().collect();
+            let tail = if text_lines.len() > LIVE_STREAM_MAX_LINES {
+                text_lines[text_lines.len() - LIVE_STREAM_MAX_LINES..].join("\n")
+            } else {
+                visible.to_string()
+            };
+            let shown = format!("⏺ {tail}");
             let mut state = TranscriptRenderState::default();
             top.extend(shown.split('\n').flat_map(|line| {
                 history_line_render(line, app.lang, width, app.theme, &mut state)
@@ -972,6 +984,34 @@ mod tests {
         assert!(
             text_of(&lines[16]).starts_with('›'),
             "курсор стоит на поле ввода"
+        );
+    }
+
+    /// Очень длинный живой стрим ограничен ХВОСТОМ (последние ~10 строк): большое сообщение
+    /// (шаги тандема длинные) не раздувает живой блок почти на всё окно. Иначе ручной
+    /// рендерер упирался в границу прокрутки, курсор рассинхронивался и старый блок с
+    /// лоадером застревал в скроллбэке (три «Пишу ответ…»). Полный текст уедет в ленту.
+    #[test]
+    fn very_long_live_answer_is_capped_to_a_tail() {
+        let mut app = footer_app();
+        app.running = true;
+        app.live_answer = (0..40)
+            .map(|i| format!("строка {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let (lines, _, _) = build_dynamic(&app, 80, 24);
+
+        // Без лимита блок раздулся бы почти на всё окно (~23 из 24); с ним — компактный.
+        assert!(
+            lines.len() < 21,
+            "живой блок остаётся компактным, а не почти на весь экран: {}",
+            lines.len()
+        );
+        let joined: String = lines.iter().map(text_of).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains("строка 39"),
+            "показан хвост стрима: {joined}"
         );
     }
 
