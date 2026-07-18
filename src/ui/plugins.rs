@@ -11,7 +11,7 @@ pub(crate) fn draw_plugins_screen(frame: &mut Frame<'_>, area: Rect, app: &App) 
     let (body, cursor_row, footer) = match app.plugins_tab {
         PluginsTab::Overview => (overview_body(app), 0, vec![overview_footer(app)]),
         PluginsTab::Installed | PluginsTab::Catalog => {
-            let (body, cursor_row) = plugins_body(app);
+            let (body, cursor_row) = plugins_body(app, area.width);
             (body, cursor_row, plugin_list_footer(app, area.width))
         }
         PluginsTab::Sources => (marketplace_body(app), 0, sources_footer(app)),
@@ -290,7 +290,7 @@ fn wrap_text(text: &str, width: usize, max_lines: usize) -> Vec<String> {
 
 /// Строит строки тела спискового таба (плагины ОДНОГО провайдера — он выбран в шапке) и позицию
 /// строки выделенного плагина — по ней прокрутка держит курсор в видимой области.
-fn plugins_body(app: &App) -> (Vec<Line<'static>>, usize) {
+fn plugins_body(app: &App, width: u16) -> (Vec<Line<'static>>, usize) {
     // Список уже отфильтрован по табу+провайдеру+поиску, порядок совпадает с навигацией.
     let filtered = app.filtered_plugins();
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -315,7 +315,7 @@ fn plugins_body(app: &App) -> (Vec<Line<'static>>, usize) {
         if selected {
             cursor_row = lines.len();
         }
-        lines.push(plugin_line(entry, selected, app.theme, app.lang));
+        lines.push(plugin_line(entry, selected, app.theme, width));
     }
     (lines, cursor_row)
 }
@@ -487,30 +487,26 @@ fn section_header(provider: Provider, theme: Theme) -> Line<'static> {
     ))
 }
 
-fn plugin_line(entry: &PluginEntry, selected: bool, theme: Theme, lang: Language) -> Line<'static> {
-    let marker = if entry.installed { "●" } else { "○" };
-    let toggle = if !entry.installed {
-        String::new()
+/// Строка плагина. У установленного точка кодирует СОСТОЯНИЕ: `●` включён (акцент), `○` выключен
+/// (серый). У доступного (Каталог) состояния нет — точки нет, только имя. Версия — приглушённой у
+/// правого края отдельной колонкой. Без слов «вкл/выкл» и «уст.» — их несут точка и сам таб.
+fn plugin_line(entry: &PluginEntry, selected: bool, theme: Theme, width: u16) -> Line<'static> {
+    let prefix = if selected { "› " } else { "  " };
+    let (marker, marker_style) = if !entry.installed {
+        ("", Style::default())
     } else if entry.enabled {
-        format!(" {}", lang.choose("✓вкл", "✓on"))
+        ("● ", Style::default().fg(theme.accent()))
     } else {
-        format!(" {}", lang.choose("✕выкл", "✕off"))
+        ("○ ", Style::default().fg(Color::DarkGray))
     };
+    let name = truncate_chars(&entry.name, 44);
     let version = entry
         .version
         .as_deref()
-        .map(|v| format!(" v{v}"))
+        .map(|v| format!("v{v}"))
         .unwrap_or_default();
-    let status = if entry.installed {
-        lang.choose("уст.", "inst.")
-    } else {
-        lang.choose("дост.", "avail.")
-    };
-    let text = format!(
-        "{marker} {}{toggle}{version}  {status}",
-        truncate_chars(&entry.name, 32)
-    );
-    let style = if selected {
+
+    let name_style = if selected {
         Style::default()
             .fg(Color::White)
             .bg(theme.accent_bg())
@@ -518,13 +514,23 @@ fn plugin_line(entry: &PluginEntry, selected: bool, theme: Theme, lang: Language
     } else {
         Style::default().fg(theme.accent_soft())
     };
-    Line::from(vec![
-        Span::styled(
-            if selected { "› " } else { "  " },
-            Style::default().fg(theme.accent()),
-        ),
-        Span::styled(text, style),
-    ])
+
+    let mut spans = vec![
+        Span::styled(prefix, Style::default().fg(theme.accent())),
+        Span::styled(marker, marker_style),
+        Span::styled(name.clone(), name_style),
+    ];
+    // Версия отдельной колонкой у правого края (приглушённая).
+    if !version.is_empty() {
+        let used = prefix.chars().count()
+            + marker.chars().count()
+            + name.chars().count()
+            + version.chars().count();
+        let pad = (width as usize).saturating_sub(used + 1).max(1);
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(version, Style::default().fg(Color::DarkGray)));
+    }
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -601,27 +607,67 @@ mod tests {
             false,
         );
 
-        // Таб «Установленные» — только установленный, маркер ● и версия; доступного тут нет.
+        // Таб «Установленные» — только установленный, включённый → точка ● и версия.
         app.plugins_tab = PluginsTab::Installed;
         let installed = render(&app);
         assert!(installed.contains("context7"), "установленный: {installed}");
-        assert!(installed.contains("●"), "маркер установленного");
+        assert!(installed.contains("●"), "точка включённого");
         assert!(installed.contains("v1.2"), "версия установленного");
         assert!(
             !installed.contains("documents"),
             "доступного нет в Установленных"
         );
 
-        // Таб «Каталог» + провайдер Codex — доступный documents с маркером ○.
+        // Таб «Каталог» + провайдер Codex — доступный documents (у доступных точки состояния нет).
         app.plugins_tab = PluginsTab::Catalog;
         app.plugins_provider = Provider::Codex;
         let catalog = render(&app);
         assert!(catalog.contains("documents"), "доступный: {catalog}");
-        assert!(catalog.contains("○"), "маркер доступного");
         assert!(
             !catalog.contains("context7"),
             "установленного нет в Каталоге"
         );
+    }
+
+    #[test]
+    fn installed_dot_encodes_enabled_state_without_status_words() {
+        let mut app = app_with(
+            vec![
+                PluginEntry {
+                    provider: Provider::Claude,
+                    name: "on-plugin".into(),
+                    marketplace: "m".into(),
+                    installed: true,
+                    enabled: true,
+                    version: Some("1.0".into()),
+                },
+                PluginEntry {
+                    provider: Provider::Claude,
+                    name: "off-plugin".into(),
+                    marketplace: "m".into(),
+                    installed: true,
+                    enabled: false,
+                    version: None,
+                },
+            ],
+            false,
+        );
+        app.plugins_tab = PluginsTab::Installed;
+        let screen = render(&app);
+
+        // Точка кодирует состояние: включённый ●, выключенный ○.
+        assert!(screen.contains("●"), "включённый — полная точка: {screen}");
+        assert!(screen.contains("○"), "выключенный — пустая точка: {screen}");
+        // В самой строке плагина нет слов-статусов «вкл»/«уст.» (их несут точка и таб).
+        let on_line = screen
+            .lines()
+            .find(|line| line.contains("on-plugin"))
+            .unwrap_or_default();
+        assert!(
+            !on_line.contains("вкл") && !on_line.contains("уст"),
+            "строка плагина без слов-статусов: {on_line:?}"
+        );
+        assert!(on_line.contains("v1.0"), "версия в строке: {on_line:?}");
     }
 
     #[test]
