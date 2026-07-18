@@ -1002,6 +1002,8 @@ fn emit_tandem_step(tx: &Sender<WorkerEvent>, marker: &str, who: &str, phase: &s
     for line in text.trim().lines() {
         let _ = tx.send(WorkerEvent::ChatLine(line.to_string()));
     }
+    // Шаг выведен полностью — фиксируем его в ленте сразу (не копим до гейта/конца).
+    let _ = tx.send(WorkerEvent::TandemStepEnd);
 }
 
 fn tandem_notice(tx: &Sender<WorkerEvent>, text: String) {
@@ -1012,6 +1014,7 @@ fn tandem_notice(tx: &Sender<WorkerEvent>, text: String) {
 /// Идёт отдельной строкой после шага, с отступом — как продолжение блока шага.
 fn emit_tandem_status(tx: &Sender<WorkerEvent>, text: &str) {
     let _ = tx.send(WorkerEvent::ChatLine(format!("  {text}")));
+    let _ = tx.send(WorkerEvent::TandemStepEnd);
 }
 
 fn opt_usage(total: RunUsage) -> Option<RunUsage> {
@@ -2864,7 +2867,7 @@ mod tests {
     }
 
     #[test]
-    fn emit_tandem_step_streams_header_and_body() {
+    fn emit_tandem_step_streams_header_body_then_commit_signal() {
         let (tx, rx) = mpsc::channel();
         emit_tandem_step(
             &tx,
@@ -2874,17 +2877,23 @@ mod tests {
             "  первая\nвторая  ",
         );
         drop(tx);
-        let lines: Vec<String> = rx
+        let events: Vec<WorkerEvent> = rx.iter().collect();
+        let lines: Vec<&str> = events
             .iter()
-            .map(|event| match event {
-                WorkerEvent::ChatLine(line) => line,
-                _ => panic!("ожидали ChatLine"),
+            .filter_map(|event| match event {
+                WorkerEvent::ChatLine(line) => Some(line.as_str()),
+                _ => None,
             })
             .collect();
         assert_eq!(
             lines,
             ["", "🅐 Claude · раунд 1 · Исполнитель", "первая", "вторая"],
             "разделитель ПЕРЕД шагом, заголовок, затем тело"
+        );
+        // Шаг завершается сигналом «зафиксировать в ленте сразу».
+        assert!(
+            matches!(events.last(), Some(WorkerEvent::TandemStepEnd)),
+            "последним идёт TandemStepEnd: {events:?}"
         );
     }
 

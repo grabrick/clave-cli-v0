@@ -123,6 +123,7 @@ impl App {
         self.tandem_gate_tx = Some(gate_tx);
         self.tandem_input_gate = false;
         self.tandem_input_tx = Some(input_tx);
+        self.is_tandem_run = true;
         self.last_ctrl_c_at = None;
         self.status = self.lang.choose("тандем...", "tandem...").to_string();
         self.push_system(format!("◆ {task}"));
