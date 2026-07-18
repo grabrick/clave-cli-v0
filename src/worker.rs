@@ -484,9 +484,13 @@ pub(crate) fn tandem_propose_prompt(task: &str, transcript: &str, lang: Language
          the task: which files, what changes, and why. Address the critic's prior objections \
          if any. Do NOT modify files or run commands — this is discussion.\n\n\
          If the task is unclear, missing, or you lack information to propose a CONCRETE \
-         approach, do NOT invent one. End with EXACTLY one line `TANDEM: NEED_INPUT` and, \
-         just above it, your specific questions to the user (numbered, concrete). The user \
-         will answer and the debate will continue.\n\n\
+         approach, do NOT invent one. Ask the user: put your specific questions (numbered, \
+         concrete) and then EXACTLY one final line `TANDEM: NEED_INPUT`. If a question has a \
+         small set of discrete answers (e.g. feature/bugfix/refactor), ALSO emit — just \
+         before that final line — exactly one ```clave-ask block of JSON \
+         {{\"question\":\"...\",\"multi\":false,\"options\":[{{\"label\":\"...\",\"note\":\"...\"}}]}} \
+         (≥ 2 options; or {{\"questions\":[{{...}}]}} for several, up to 4) so the user can pick; \
+         omit the block for open questions. The user answers and the debate continues.\n\n\
          {principles}\n\n{discipline}\n\n\
          {hint}\n\n\
          Task:\n{task}\n\n\
@@ -1104,7 +1108,11 @@ where
             tandem_accumulate(&mut total, &step.usage);
             // Показываем ДО кода возврата (при ошибке причина — в выводе) и БЕЗ протокольных
             // маркеров: сырой `TANDEM: …` — служебный сигнал, не для глаз пользователя.
-            let display = strip_tandem_markers(&step.text);
+            // Закрытый вопрос? Исполнитель прикладывает блок ```clave-ask — прозу показываем,
+            // сам JSON-блок уводим в селектор (иначе мелькал бы в ленте). Обычное предложение
+            // блока не содержит → prose = весь текст, ask_prompt = None.
+            let (prose, ask_prompt) = parse_clave_ask(&step.text);
+            let display = strip_tandem_markers(&prose);
             emit_tandem_step(
                 tx,
                 "🅐",
@@ -1115,16 +1123,24 @@ where
 
             if step.code == 0 && tandem_needs_input(&step.text) {
                 // Исполнитель просит уточнений: вопросы — в ленту как контекст, дальше ждём
-                // текстовый ответ пользователя (по каналу), затем пере-предлагаем с ним.
+                // ответ пользователя (по каналу) — текстом или выбором из селектора, если
+                // приложен блок — затем пере-предлагаем с ним.
                 transcript.push(exec_role, lang.choose("вопрос", "question"), &display);
                 emit_tandem_status(
                     tx,
-                    lang.choose(
-                        "⚠ Нужны уточнения — ответь и Enter",
-                        "⚠ Needs input — answer and press Enter",
-                    ),
+                    if ask_prompt.is_some() {
+                        lang.choose(
+                            "⚠ Нужен выбор — стрелки, Enter (или свой ответ)",
+                            "⚠ Choose — arrows, Enter (or type your own)",
+                        )
+                    } else {
+                        lang.choose(
+                            "⚠ Нужны уточнения — ответь и Enter",
+                            "⚠ Needs input — answer and press Enter",
+                        )
+                    },
                 );
-                let _ = tx.send(WorkerEvent::TandemNeedsInput);
+                let _ = tx.send(WorkerEvent::TandemNeedsInput(ask_prompt));
                 let answer = loop {
                     if cancel_rx.try_recv().is_ok() {
                         return Ok(TandemResult::Cancelled);
@@ -3067,6 +3083,7 @@ mod tests {
         chat: Vec<String>,
         needs_approval: bool,
         needs_input: bool,
+        needs_choice: bool,
     }
 
     /// Прогоняет оркестратор на СЦЕНАРИИ шагов (None = отмена внутри шага).
@@ -3141,12 +3158,16 @@ mod tests {
         let mut chat = Vec::new();
         let mut needs_approval = false;
         let mut needs_input = false;
+        let mut needs_choice = false;
         for event in rx.iter() {
             match event {
                 WorkerEvent::Line(line) => notices.push(line),
                 WorkerEvent::ChatLine(line) => chat.push(line),
                 WorkerEvent::TandemNeedsApproval => needs_approval = true,
-                WorkerEvent::TandemNeedsInput => needs_input = true,
+                WorkerEvent::TandemNeedsInput(prompt) => {
+                    needs_input = true;
+                    needs_choice = prompt.is_some();
+                }
                 _ => {}
             }
         }
@@ -3157,6 +3178,7 @@ mod tests {
             chat,
             needs_approval,
             needs_input,
+            needs_choice,
         }
     }
 
@@ -3442,6 +3464,48 @@ mod tests {
             TandemResult::Completed(code, _) => assert_eq!(code, 0),
             TandemResult::Cancelled => panic!("не отменяли"),
         }
+    }
+
+    #[test]
+    fn tandem_offers_choice_selector_for_closed_questions() {
+        // Закрытый вопрос: исполнитель прикладывает блок ```clave-ask + NEED_INPUT. Событие
+        // несёт AskPrompt (→ селектор), проза показана, а JSON-блок НЕ течёт в ленту.
+        let block = "Какую задачу решаем?\n\
+             ```clave-ask\n\
+             {\"question\":\"Тип?\",\"multi\":false,\"options\":[{\"label\":\"фича\"},{\"label\":\"багфикс\"}]}\n\
+             ```\n\
+             TANDEM: NEED_INPUT";
+        let run = fake_tandem_full(
+            vec![
+                step(block),
+                step("Понял — предлагаю X"),
+                step("TANDEM: CONSENSUS"),
+                step("сделал"),
+                step("ревью\nTANDEM: CONSENSUS"),
+            ],
+            2,
+            None,
+            TandemGate::Execute,
+            &["Выбрано: «багфикс»"],
+        );
+        assert!(run.needs_input, "запрос ввода поднят");
+        assert!(
+            run.needs_choice,
+            "закрытый вопрос → в событии AskPrompt (селектор)"
+        );
+        assert!(
+            !run.chat
+                .iter()
+                .any(|l| l.contains("clave-ask") || l.contains("\"options\"")),
+            "JSON-блок выбора не течёт в ленту: {:?}",
+            run.chat
+        );
+        assert!(
+            run.chat.iter().any(|l| l.contains("Какую задачу решаем")),
+            "проза вопроса показана: {:?}",
+            run.chat
+        );
+        assert!(matches!(run.result, TandemResult::Completed(0, _)));
     }
 
     #[test]

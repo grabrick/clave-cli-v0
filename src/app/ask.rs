@@ -28,6 +28,9 @@ pub(crate) struct AskState {
     pub(crate) answers: Vec<AnswerState>,
     pub(crate) step: usize,
     pub(crate) confirm_cursor: usize,
+    /// Выбор питает ПАУЗУ ТАНДЕМА (заблокированный воркер), а не новый чат-прогон: на
+    /// подтверждении шлём результат в `tandem_input_tx`, а не в `start_chat`.
+    pub(crate) feeds_tandem: bool,
 }
 
 impl AskState {
@@ -42,6 +45,7 @@ impl AskState {
             answers,
             step: 0,
             confirm_cursor: 0,
+            feeds_tandem: false,
         }
     }
 
@@ -119,6 +123,14 @@ impl App {
             self.ask = Some(AskState::new(prompt));
             self.status = self.lang.choose("выбор", "choose").to_string();
         }
+    }
+
+    /// Открывает селектор для ЗАКРЫТОГО вопроса тандема: тот же визард, но выбор пойдёт в
+    /// паузу тандема (`feeds_tandem`), а не в новый чат-прогон.
+    pub(crate) fn open_tandem_choice(&mut self, prompt: AskPrompt) {
+        let mut state = AskState::new(prompt);
+        state.feeds_tandem = true;
+        self.ask = Some(state);
     }
 
     pub(crate) fn reset_ask(&mut self) {
@@ -274,6 +286,7 @@ impl App {
         }
 
         // ── одиночный вопрос: формируем сообщение и отправляем ──
+        let feeds_tandem = state.feeds_tandem;
         let q = &state.prompt.questions[0];
         let a = &state.answers[0];
         let message = if a.cursor == q.options.len() {
@@ -304,7 +317,11 @@ impl App {
             format!("{} {}", self.lang.choose("Выбрано:", "Selected:"), joined)
         };
         self.ask = None;
-        self.start_chat(message);
+        if feeds_tandem {
+            self.resume_tandem_with(message);
+        } else {
+            self.start_chat(message);
+        }
     }
 
     /// Собирает ответы на все вопросы в одно сообщение и отправляет модели.
@@ -312,6 +329,7 @@ impl App {
         let Some(state) = &self.ask else {
             return;
         };
+        let feeds_tandem = state.feeds_tandem;
         let mut lines = Vec::new();
         for (i, q) in state.prompt.questions.iter().enumerate() {
             let chosen = state.chosen(i);
@@ -325,18 +343,26 @@ impl App {
         let header = self.lang.choose("Ответы:", "Answers:");
         let message = format!("{header}\n{}", lines.join("\n"));
         self.ask = None;
-        self.start_chat(message);
+        if feeds_tandem {
+            self.resume_tandem_with(message);
+        } else {
+            self.start_chat(message);
+        }
     }
 
-    /// Esc: закрыть селектор и дать ответить текстом (вопрос остаётся в ленте).
-    /// Для локального вопроса приложения текстом отвечать некому — значит это отмена
-    /// самого действия (напр. `/dev` не стартует вовсе).
+    /// Esc: закрыть селектор. Для тандемного выбора Esc отменяет тандем (мы на дебатах —
+    /// файлы не тронуты); для локального вопроса приложения (напр. `/dev`) отвечать текстом
+    /// некому — это отмена самого действия; для обычного — просто закрыть.
     pub(crate) fn ask_cancel(&mut self) {
+        let feeds_tandem = self.ask.as_ref().is_some_and(|s| s.feeds_tandem);
         if self.ask.take().is_some() {
             if self.ask_intent.take().is_some() {
                 self.push_system(self.lang.choose("⏹ /dev отменён.", "⏹ /dev cancelled."));
                 self.status = self.lang.choose("отменено", "cancelled").to_string();
                 return;
+            }
+            if feeds_tandem {
+                self.tandem_input_cancel();
             }
             self.status = self.lang.choose("закрыто", "closed").to_string();
         }
@@ -404,6 +430,36 @@ mod tests {
 
     fn state(app: &mut App) -> &mut AskState {
         app.ask.as_mut().expect("селектор открыт")
+    }
+
+    #[test]
+    fn tandem_choice_selection_feeds_the_worker_not_a_new_chat() {
+        // Тот же селектор, но открыт для тандема: выбор ОБЯЗАН уйти в заблокированный воркер
+        // (tandem_input_tx), а не запустить новый чат-прогон через start_chat.
+        let mut app = app_for_ask();
+        let (in_tx, in_rx) = std::sync::mpsc::channel::<String>();
+        app.tandem_input_tx = Some(in_tx);
+
+        app.open_tandem_choice(AskPrompt {
+            questions: vec![question("Тип?", false, &["фича", "багфикс"], true)],
+        });
+        assert!(
+            state(&mut app).feeds_tandem,
+            "селектор помечен как тандемный"
+        );
+        state(&mut app).answers[0].cursor = 1; // «багфикс»
+        app.ask_submit();
+
+        assert_eq!(
+            in_rx.try_recv().ok().as_deref(),
+            Some("Выбрано: «багфикс»"),
+            "выбор питает паузу тандема, а не новый чат"
+        );
+        assert!(app.ask.is_none(), "селектор закрыт");
+        assert!(
+            app.pending_messages.is_empty() && !app.running,
+            "нового чат-прогона не заводим"
+        );
     }
 
     /// Главный контракт селектора: то, что человек выбрал, ОБЯЗАНО уйти модели. Пустышка
