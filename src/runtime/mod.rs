@@ -11,6 +11,8 @@ pub(crate) use welcome::*;
 pub(crate) enum Launch {
     Usage,
     Version,
+    /// Неинтерактивный прогон для супервайзера: `--run <режим> ...`.
+    Headless,
     /// Неизвестный флаг — с его именем, чтобы назвать пользователю.
     UnknownFlag(String),
     /// Задача натуральным языком → встроенный движок.
@@ -22,7 +24,7 @@ pub(crate) enum Launch {
 
 /// Разбор аргументов в РЕШЕНИЕ — отдельно от его исполнения.
 ///
-/// Шов ради тестов: `main_entry` дальше запускает TUI или движок, и проверить разбор
+/// Шов ради тестов: `main_entry` дальше запускает TUI, движок или headless, и проверить разбор
 /// на живом процессе значило бы на каждый флаг поднимать настоящий clave. Мутационный прогон
 /// показал, что этого не делает никто: восемь подмен в условиях (`==` → `!=`, `||` → `&&`,
 /// удалённый `!`) проходили бесследно. Цена — `--help` перестаёт работать, а задача уходит не
@@ -31,8 +33,12 @@ pub(crate) fn launch_for(args: &[String]) -> Launch {
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         return Launch::Usage;
     }
+    // Идентификация бинаря (clave-dev снимает её как known-good: первая строка `--version`).
     if args.iter().any(|arg| arg == "-V" || arg == "--version") {
         return Launch::Version;
+    }
+    if args.first().map(String::as_str) == Some("--run") {
+        return Launch::Headless;
     }
     // `--resume`/`-r`: открыть TUI сразу на списке сохранённых чатов (иначе флаг ушёл бы в
     // UnknownFlag ниже — resume существовал только как команда `/resume` внутри TUI).
@@ -64,6 +70,7 @@ pub(crate) fn main_entry() -> AnyResult<()> {
             println!("{APP_COMMAND} v{}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        Launch::Headless => crate::headless::run_headless(&args[1..]),
         Launch::UnknownFlag(flag) => {
             eprintln!("clave: unknown option '{flag}'\n");
             print_usage();
@@ -1930,6 +1937,7 @@ mod tests {
         assert_eq!(launch_for(&argv(&["--help"])), Launch::Usage);
         assert_eq!(launch_for(&argv(&["-V"])), Launch::Version);
         assert_eq!(launch_for(&argv(&["--version"])), Launch::Version);
+        assert_eq!(launch_for(&argv(&["--run", "tandem"])), Launch::Headless);
         assert_eq!(launch_for(&argv(&["напиши тест"])), Launch::Engine);
         // --resume / -r открывают TUI на списке сохранённых чатов (иначе флаг уехал бы в
         // UnknownFlag — resume был только командой /resume внутри TUI).
