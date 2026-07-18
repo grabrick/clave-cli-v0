@@ -316,3 +316,149 @@ pub(crate) fn tandem_confirm_prompt(task: &str, transcript: &str, lang: Language
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_prompt_forbids_file_changes() {
+        let p = plan_prompt("add a feature", "", Language::En);
+        assert!(p.contains("Do NOT modify"));
+        assert!(p.contains("add a feature"));
+    }
+
+    #[test]
+    fn execute_prompt_embeds_full_plan() {
+        let p = execute_prompt(
+            "add a feature",
+            "1. first step\n2. second step",
+            "",
+            Language::En,
+        );
+        assert!(p.contains("Approved plan"));
+        assert!(p.contains("first step"));
+        assert!(p.contains("second step"));
+    }
+
+    #[test]
+    fn refine_prompt_carries_feedback_and_prev_plan() {
+        let p = refine_prompt(
+            "add a feature",
+            "1. old step",
+            "make it simpler",
+            "",
+            Language::En,
+        );
+        assert!(p.contains("old step"));
+        assert!(p.contains("make it simpler"));
+        assert!(p.contains("Do NOT modify"));
+    }
+
+    #[test]
+    fn tandem_prompts_carry_role_and_signal_rules() {
+        let ch = tandem_challenge_prompt("do x", "", 2, 3, Language::En);
+        assert!(ch.contains("CRITIC"));
+        assert!(ch.contains("TANDEM: CONSENSUS"));
+        assert!(ch.contains("Do NOT agree out of politeness"));
+        // Сходимость: критик знает про блокеры-vs-не-блокеры и про бюджет раундов —
+        // иначе перфекционизм крутил бы дебаты вечно.
+        assert!(ch.contains("BLOCKING"), "критик отделяет блокеры: {ch}");
+        assert!(
+            ch.contains("round 2 of 3"),
+            "критик осознаёт бюджет раундов: {ch}"
+        );
+
+        let ex = tandem_execute_prompt("do x", "approach", Language::En);
+        assert!(ex.contains("EXECUTOR"));
+        assert!(ex.contains("edit files"));
+
+        let fix = tandem_fix_prompt("do x", "", "fix the bug", Language::En);
+        assert!(fix.contains("fix the bug"));
+    }
+
+    #[test]
+    fn tandem_prompts_carry_engineering_principles() {
+        let marker = "Stay lean on dependencies";
+        let exec = [
+            tandem_propose_prompt("t", "", Language::En),
+            tandem_execute_prompt("t", "", Language::En),
+            tandem_fix_prompt("t", "", "r", Language::En),
+        ];
+        for (i, p) in exec.iter().enumerate() {
+            assert!(p.contains(marker), "executor prompt #{i} has principles");
+            assert!(
+                p.contains("Reach for the minimal change first"),
+                "executor prompt #{i} has executor discipline"
+            );
+        }
+        let crit = [
+            tandem_challenge_prompt("t", "", 1, 2, Language::En),
+            tandem_review_prompt("t", "", Language::En),
+            tandem_confirm_prompt("t", "", Language::En),
+        ];
+        for (i, p) in crit.iter().enumerate() {
+            assert!(p.contains(marker), "critic prompt #{i} has principles");
+            assert!(
+                p.contains("do NOT trust the other agent's answer"),
+                "critic prompt #{i} has critic discipline"
+            );
+            // Сходимость доезжает во ВСЕ критик-промпты (дебаты/ревью/подтверждение),
+            // иначе перфекционизм не давал бы консенсуса.
+            assert!(
+                p.contains("CONVERGE decisively"),
+                "critic prompt #{i} has convergence discipline"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_prompt_carries_message_context_and_ask_rules() {
+        let p = chat_prompt(
+            "почини баг",
+            "⏺ прошлый ответ",
+            Language::Ru,
+            ChatMode::Discussion,
+        );
+        assert!(p.contains("почини баг"));
+        assert!(p.contains("⏺ прошлый ответ"));
+        assert!(p.contains("clave-ask"), "правила блока вопросов на месте");
+        // Пустой контекст помечается явно, а не уезжает пустой строкой.
+        assert!(chat_prompt("x", "   ", Language::En, ChatMode::Discussion).contains("(empty)"));
+    }
+
+    #[test]
+    fn tandem_lang_hint_switches_language() {
+        assert!(tandem_lang_hint(Language::Ru).contains("русском"));
+        assert!(tandem_lang_hint(Language::En).contains("English"));
+    }
+
+    #[test]
+    fn recent_chat_context_keeps_tail_in_order_without_echo() {
+        let transcript: Vec<String> = [
+            "первая",
+            "⏺ Отправляю запрос",
+            "вторая",
+            "⏺ Sending request",
+            "третья",
+            "четвёртая",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        // Берём ХВОСТ и отдаём в исходном порядке.
+        assert_eq!(recent_chat_context(&transcript, 2), "третья\nчетвёртая");
+        // Эхо собственных запросов в контекст не попадает — ни русское, ни английское.
+        assert_eq!(
+            recent_chat_context(&transcript, 10),
+            "первая\nвторая\nтретья\nчетвёртая"
+        );
+
+        // Длинные строки режутся на 240 символах (промпт не должен раздуваться).
+        let long = vec!["я".repeat(300)];
+        let cut = recent_chat_context(&long, 1);
+        assert_eq!(cut.chars().count(), 240);
+        assert!(cut.ends_with('…'));
+    }
+}
