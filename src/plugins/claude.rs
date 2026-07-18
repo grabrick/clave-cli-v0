@@ -222,6 +222,41 @@ pub(crate) fn parse_claude_plugin_details(catalog_json: &str) -> BTreeMap<String
     out
 }
 
+/// Множество плагинов (`qualified_name`), у которых доступно обновление: установленная версия
+/// ИЗВЕСТНА и отличается от версии в каталоге (каталог — последняя известная). «unknown»/пустая
+/// версия или отсутствие версии в каталоге → не судим (в множество не попадает).
+pub(crate) fn parse_claude_plugin_updates(
+    catalog_json: &str,
+    installed_json: &str,
+) -> BTreeSet<String> {
+    let installed = claude_installed_versions(installed_json);
+    let mut out = BTreeSet::new();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(catalog_json) else {
+        return out;
+    };
+    let Some(plugins) = value
+        .get("catalog")
+        .and_then(|c| c.get("plugins"))
+        .and_then(|p| p.as_object())
+    else {
+        return out;
+    };
+    for (key, meta) in plugins {
+        let catalog_version = meta.get("version").and_then(|v| v.as_str()).unwrap_or("");
+        let installed_version = installed.get(key).map(String::as_str).unwrap_or("");
+        if installed_version.is_empty()
+            || installed_version == "unknown"
+            || catalog_version.is_empty()
+        {
+            continue;
+        }
+        if installed_version != catalog_version {
+            out.insert(key.clone());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +418,35 @@ mod tests {
         assert!(parse_claude_plugin_details("").is_empty());
         assert!(parse_claude_plugin_details("{ битый").is_empty());
         assert!(parse_claude_plugin_details("{}").is_empty());
+    }
+
+    #[test]
+    fn plugin_updates_flag_installed_versions_behind_catalog() {
+        let catalog = r#"{"catalog":{"plugins":{
+            "old@m":{"version":"2.0.0"},
+            "fresh@m":{"version":"1.0.0"},
+            "unk@m":{"version":"3.0.0"}
+        }}}"#;
+        let installed = r#"{"version":2,"plugins":{
+            "old@m":[{"version":"1.0.0"}],
+            "fresh@m":[{"version":"1.0.0"}],
+            "unk@m":[{"version":"unknown"}]
+        }}"#;
+        let updates = parse_claude_plugin_updates(catalog, installed);
+
+        assert!(
+            updates.contains("old@m"),
+            "installed 1.0.0 ≠ catalog 2.0.0 → апдейт"
+        );
+        assert!(!updates.contains("fresh@m"), "версии совпали → без апдейта");
+        assert!(
+            !updates.contains("unk@m"),
+            "unknown-версия не судится (нечего сравнивать)"
+        );
+        assert!(
+            parse_claude_plugin_updates("", "").is_empty(),
+            "битый вход — пусто"
+        );
     }
 
     #[test]
