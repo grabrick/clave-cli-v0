@@ -7,6 +7,10 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
+# release.yml намеренно кастомизирован (self-dev-guard как зависимость `plan` — сторожит тест
+# tests/test_rules_are_enforced.py). cargo-dist 0.32 генерирует guard иначе и падает на проверке
+# «CI out of date»; allow-dirty говорит ему не сверять CI-файл и использовать наш как есть.
+allow-dirty = ["ci"]
 # Релиз собирается по тегу с ЛЮБОЙ ветки, мимо prod-guard.yml (тот сторожит только main).
 # Этот job проверяет дерево до всего остального: тег на develop не должен опубликовать бинарь
 # с входом самопиления внутри.
