@@ -53,6 +53,17 @@ pub(crate) fn load_claude_plugin_details(
     parse_claude_plugin_details(&catalog)
 }
 
+/// Множество плагинов claude с доступным обновлением (installed-версия ≠ catalog). Оба файла
+/// отсутствуют → пусто.
+pub(crate) fn load_claude_plugin_updates(claude_home: &Path) -> std::collections::BTreeSet<String> {
+    let plugins_dir = claude_home.join("plugins");
+    let catalog =
+        fs::read_to_string(plugins_dir.join("plugin-catalog-cache.json")).unwrap_or_default();
+    let installed =
+        fs::read_to_string(plugins_dir.join("installed_plugins.json")).unwrap_or_default();
+    parse_claude_plugin_updates(&catalog, &installed)
+}
+
 /// Спавнит `codex plugin marketplace list --json`, возвращает stdout (пусто при ошибке —
 /// секция codex покажется пустой, без паники).
 fn run_codex_marketplace_list() -> String {
@@ -139,7 +150,9 @@ impl App {
     pub(crate) fn open_plugins_panel(&mut self) {
         self.plugins = load_claude_plugins(&self.claude_home);
         self.plugin_details = load_claude_plugin_details(&self.claude_home);
+        self.plugin_updates = load_claude_plugin_updates(&self.claude_home);
         self.plugins_index = 0;
+        self.plugins_reselect = None;
         self.plugins_loading = true;
         // Панель всегда открывается на «Обзоре», без залипшего таба/ввода с прошлого раза.
         self.plugins_tab = PluginsTab::Overview;
@@ -169,10 +182,15 @@ impl App {
         );
     }
 
-    /// Приём догруженного codex-списка: добавляем к уже показанному claude, снимаем флаг.
+    /// Приём догруженного codex-списка: добавляем к уже показанному claude, снимаем флаг. Если
+    /// действие было над codex-плагином — теперь он в списке, возвращаем на него курсор (финально).
     pub(crate) fn plugins_loaded(&mut self, mut codex: Vec<PluginEntry>) {
         self.plugins.append(&mut codex);
         self.plugins_loading = false;
+        if self.plugins_reselect.is_some() {
+            self.restore_plugins_selection();
+            self.plugins_reselect = None;
+        }
     }
 
     /// Плагины активного таба: «Установленные» → установленные, «Каталог» → доступные — и только
@@ -314,6 +332,8 @@ impl App {
 
     /// Спавнит команду действия провайдера; по завершении шлёт `PluginActionDone` → refresh.
     fn run_plugin_action(&mut self, action: PluginAction, entry: &PluginEntry) {
+        // Запоминаем плагин, чтобы после refresh вернуть курсор на него (вкл/выкл его не двигают).
+        self.plugins_reselect = Some(entry.qualified_name());
         let mut cmd = match entry.provider {
             Provider::Claude => claude_action_cmd(action, entry),
             Provider::Codex => codex_action_cmd(action, entry),
@@ -332,13 +352,34 @@ impl App {
         );
     }
 
-    /// Действие завершено — перезагружаем список (статусы install/enabled могли измениться).
+    /// Действие завершено — перезагружаем список (статусы install/enabled могли измениться) и
+    /// возвращаем курсор на тот же плагин (claude уже перезагружен; codex догрузится событием).
     pub(crate) fn plugin_action_done(&mut self) {
         self.plugins = load_claude_plugins(&self.claude_home);
         self.plugin_details = load_claude_plugin_details(&self.claude_home);
-        self.plugins_index = 0;
+        self.plugin_updates = load_claude_plugin_updates(&self.claude_home);
         self.plugins_loading = true;
+        self.restore_plugins_selection();
         self.spawn_codex_plugins_load();
+    }
+
+    /// Возвращает курсор на плагин из `plugins_reselect`, если он ещё в текущем (таб+провайдер)
+    /// списке; иначе прижимает индекс к длине (плагин удалён или сменил таб). Для codex цель
+    /// найдётся только после `plugins_loaded` — до тех пор `plugins_reselect` сохраняется.
+    fn restore_plugins_selection(&mut self) {
+        if let Some(name) = self.plugins_reselect.clone() {
+            if let Some(pos) = self
+                .filtered_plugins()
+                .iter()
+                .position(|p| p.qualified_name() == name)
+            {
+                self.plugins_index = pos;
+                self.plugins_reselect = None;
+                return;
+            }
+        }
+        let last = self.filtered_plugins().len().saturating_sub(1);
+        self.plugins_index = self.plugins_index.min(last);
     }
 
     // ── Marketplace-источники (таб «Источники») ─────────────────────────────────────────────
@@ -779,6 +820,35 @@ mod tests {
         app.overview_index = 1;
         app.overview_enter();
         assert_eq!(app.plugins_tab, PluginsTab::Catalog);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn action_returns_cursor_to_the_same_plugin_not_the_top() {
+        let (mut app, dir) = plugins_app(&env::temp_dir());
+        app.plugins_tab = PluginsTab::Installed;
+        app.plugins = vec![
+            plugin_entry(Provider::Claude, "aaa", true),
+            plugin_entry(Provider::Claude, "bbb", true),
+            plugin_entry(Provider::Claude, "ccc", true),
+        ];
+        // Действие над средним плагином запомнило его; refresh сбросил бы курсор на 0.
+        app.plugins_reselect = Some("bbb@m".to_string());
+        app.plugins_index = 0;
+        app.restore_plugins_selection();
+        assert_eq!(
+            app.plugins_index, 1,
+            "курсор вернулся на bbb, а не на первый"
+        );
+        assert!(app.plugins_reselect.is_none(), "цель снята после возврата");
+
+        // Плагин ушёл из списка (удалён) → индекс прижат к длине, без паники.
+        app.plugins = vec![plugin_entry(Provider::Claude, "aaa", true)];
+        app.plugins_index = 5;
+        app.plugins_reselect = Some("gone@m".to_string());
+        app.restore_plugins_selection();
+        assert_eq!(app.plugins_index, 0, "прижат к длине списка");
 
         let _ = fs::remove_dir_all(&dir);
     }

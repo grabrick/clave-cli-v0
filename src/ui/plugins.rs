@@ -315,7 +315,8 @@ fn plugins_body(app: &App, width: u16) -> (Vec<Line<'static>>, usize) {
         if selected {
             cursor_row = lines.len();
         }
-        lines.push(plugin_line(entry, selected, app.theme, width));
+        let has_update = app.plugin_updates.contains(&entry.qualified_name());
+        lines.push(plugin_line(entry, selected, app.theme, width, has_update));
     }
     (lines, cursor_row)
 }
@@ -490,7 +491,13 @@ fn section_header(provider: Provider, theme: Theme) -> Line<'static> {
 /// Строка плагина. У установленного точка кодирует СОСТОЯНИЕ: `●` включён (акцент), `○` выключен
 /// (серый). У доступного (Каталог) состояния нет — точки нет, только имя. Версия — приглушённой у
 /// правого края отдельной колонкой. Без слов «вкл/выкл» и «уст.» — их несут точка и сам таб.
-fn plugin_line(entry: &PluginEntry, selected: bool, theme: Theme, width: u16) -> Line<'static> {
+fn plugin_line(
+    entry: &PluginEntry,
+    selected: bool,
+    theme: Theme,
+    width: u16,
+    has_update: bool,
+) -> Line<'static> {
     let prefix = if selected { "› " } else { "  " };
     let (marker, marker_style) = if !entry.installed {
         ("", Style::default())
@@ -520,15 +527,26 @@ fn plugin_line(entry: &PluginEntry, selected: bool, theme: Theme, width: u16) ->
         Span::styled(marker, marker_style),
         Span::styled(name.clone(), name_style),
     ];
-    // Версия отдельной колонкой у правого края (приглушённая).
+    // Версия отдельной колонкой у правого края. Есть обновление → бейдж «↑ vX» жёлтым, иначе
+    // версия приглушённая.
     if !version.is_empty() {
+        let (vtext, vstyle) = if has_update {
+            (
+                format!("↑ {version}"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (version.clone(), Style::default().fg(Color::DarkGray))
+        };
         let used = prefix.chars().count()
             + marker.chars().count()
             + name.chars().count()
-            + version.chars().count();
+            + vtext.chars().count();
         let pad = (width as usize).saturating_sub(used + 1).max(1);
         spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(Span::styled(version, Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(vtext, vstyle));
     }
     Line::from(spans)
 }
@@ -775,6 +793,47 @@ mod tests {
         assert!(
             codex_view.contains("codex-avail"),
             "codex достижим сменой провайдера: {codex_view}"
+        );
+    }
+
+    #[test]
+    fn update_available_shows_arrow_badge_in_the_row() {
+        let mut app = app_with(
+            vec![PluginEntry {
+                provider: Provider::Claude,
+                name: "outdated".into(),
+                marketplace: "m".into(),
+                installed: true,
+                enabled: true,
+                version: Some("2.3.0".into()),
+            }],
+            false,
+        );
+        app.plugins_tab = PluginsTab::Installed;
+
+        // Есть обновление → в СТРОКЕ плагина стрелка ↑ и версия (подсказка «↑↓» не в счёт).
+        app.plugin_updates.insert("outdated@m".to_string());
+        let with_update = render(&app);
+        let up_line = with_update
+            .lines()
+            .find(|line| line.contains("outdated"))
+            .unwrap_or_default();
+        assert!(
+            up_line.contains("↑"),
+            "бейдж обновления в строке: {up_line:?}"
+        );
+        assert!(up_line.contains("v2.3.0"), "версия в строке: {up_line:?}");
+
+        // Нет обновления → в строке стрелки нет.
+        app.plugin_updates.clear();
+        let plain = render(&app);
+        let plain_line = plain
+            .lines()
+            .find(|line| line.contains("outdated"))
+            .unwrap_or_default();
+        assert!(
+            !plain_line.contains("↑"),
+            "без апдейта стрелки в строке нет: {plain_line:?}"
         );
     }
 

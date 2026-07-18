@@ -129,6 +129,11 @@ pub(crate) struct App {
     /// Описания плагинов (claude) для области деталей выбранного: `qualified_name → PluginDetail`.
     /// Отдельно от `plugins`, чтобы не тащить описание в каждую запись. У codex описаний нет.
     pub(crate) plugin_details: std::collections::BTreeMap<String, PluginDetail>,
+    /// Плагины с доступным обновлением (installed-версия ≠ catalog) — бейдж «↑» в списке.
+    pub(crate) plugin_updates: std::collections::BTreeSet<String>,
+    /// Плагин (`qualified_name`), на который вернуть курсор после действия: вкл/выкл оставляет
+    /// его в списке, а без этого `plugin_action_done` прыгал бы на первый.
+    pub(crate) plugins_reselect: Option<String>,
     /// Каталог конфигов claude (по умолчанию `~/.claude`). Инъектируется в тестах, чтобы
     /// НЕ читать реальный пользовательский каталог (урок BUG-006).
     pub(crate) claude_home: PathBuf,
@@ -303,6 +308,8 @@ impl App {
             plugins_index: 0,
             plugins_loading: false,
             plugin_details: std::collections::BTreeMap::new(),
+            plugin_updates: std::collections::BTreeSet::new(),
+            plugins_reselect: None,
             claude_home: default_claude_home(),
             plugins_query: String::new(),
             plugins_confirm: None,
