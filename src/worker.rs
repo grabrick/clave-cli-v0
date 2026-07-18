@@ -422,25 +422,32 @@ pub(crate) fn tandem_needs_input(text: &str) -> bool {
     false
 }
 
-/// Если строка — протокольный сигнал `TANDEM: CONSENSUS|CONTINUE|NEED_INPUT`, возвращает
-/// её человеческий ХВОСТ после маркера (для CONTINUE — сводку возражений, для CONSENSUS —
-/// оговорку), иначе None. Управление читает сигнал из СЫРОГО текста отдельно.
+/// Если строка — протокольный сигнал `TANDEM: <СЛОВО>`, возвращает её человеческий ХВОСТ
+/// после маркера (для CONTINUE — сводку возражений, для CONSENSUS — оговорку), иначе None.
+/// Срезаем ЛЮБОЙ маркер, а не три известных: модель порой сочиняет свой (`TANDEM: CLOSED`),
+/// и он не должен протечь в ленту. Детекция самого СИГНАЛА (parse_tandem_signal /
+/// tandem_needs_input) остаётся строгой — доверяем только каноничным словам.
 fn tandem_marker_tail(line: &str) -> Option<String> {
     let cleaned = line.trim().trim_matches(['*', '`', '>', ' ']);
-    let lower = cleaned.to_lowercase();
-    let after_colon = lower.strip_prefix("tandem:")?.trim_start();
-    for kw in ["consensus", "continue", "need_input"] {
-        if after_colon.starts_with(kw) {
-            // Префикс `TANDEM:` + пробелы + keyword — весь ASCII, поэтому байт-смещения в
-            // `lower` и `cleaned` совпадают до конца keyword; хвост берём из оригинала (регистр цел).
-            let kw_end = (lower.len() - after_colon.len()) + kw.len();
-            let tail = cleaned.get(kw_end..).unwrap_or("").trim();
-            // ведущую пунктуацию-связку («— », «: ») к хвосту не тащим
-            let tail = tail.trim_start_matches(['—', '-', ':', ' ']);
-            return Some(tail.to_string());
-        }
+    // «TANDEM:» — ровно 7 ASCII-байт в любом регистре; `get` не паникует на границе символа.
+    if !cleaned
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("tandem:"))
+    {
+        return None;
     }
-    None
+    let after_colon = cleaned[7..].trim_start();
+    // Первое «слово» (буквы/подчёркивание) после двоеточия — сам маркер; срезаем его.
+    let word_len = after_colon
+        .find(|c: char| !c.is_ascii_alphabetic() && c != '_')
+        .unwrap_or(after_colon.len());
+    if word_len == 0 {
+        return None; // после «TANDEM:» сразу не-слово — это не сигнал
+    }
+    let tail = after_colon[word_len..]
+        .trim()
+        .trim_start_matches(['—', '-', ':', ' ']);
+    Some(tail.to_string())
 }
 
 /// Текст шага для показа/ленты: срезает протокольные строки-сигналы, сохраняя человеческий
@@ -485,9 +492,9 @@ pub(crate) fn tandem_propose_prompt(task: &str, transcript: &str, lang: Language
          if any. Do NOT modify files or run commands — this is discussion.\n\n\
          If the task is unclear, missing, or you lack information to propose a CONCRETE \
          approach, do NOT invent one. Ask the user: put your specific questions (numbered, \
-         concrete) and then EXACTLY one final line `TANDEM: NEED_INPUT`. If a question has a \
-         small set of discrete answers (e.g. feature/bugfix/refactor), ALSO emit — just \
-         before that final line — exactly one ```clave-ask block of JSON \
+         concrete) and then EXACTLY one final line `TANDEM: NEED_INPUT`. When a question has a \
+         small, discrete set of answers (e.g. feature/bugfix/refactor, yes/no, option A/B), you \
+         MUST — just before that final line — emit exactly one ```clave-ask block of JSON \
          {{\"question\":\"...\",\"multi\":false,\"options\":[{{\"label\":\"...\",\"note\":\"...\"}}]}} \
          (≥ 2 options; or {{\"questions\":[{{...}}]}} for several, up to 4) so the user can pick; \
          omit the block for open questions. The user answers and the debate continues.\n\n\
@@ -513,7 +520,8 @@ pub(crate) fn tandem_challenge_prompt(task: &str, transcript: &str, lang: Langua
          Study the code (read-only) and STRICTLY evaluate the executor's proposed approach: \
          gaps, risks, what is missing, better alternatives. Do NOT agree out of politeness. \
          End with EXACTLY one line: `TANDEM: CONSENSUS` only if the approach is genuinely \
-         correct and complete, otherwise `TANDEM: CONTINUE` followed by concrete objections.\n\n\
+         correct and complete, otherwise `TANDEM: CONTINUE` followed by concrete objections. \
+         Use ONLY these two markers — never invent variants (no CLOSED/DONE/etc.).\n\n\
          {principles}\n\n{discipline}\n\n\
          {hint}\n\n\
          Task:\n{task}\n\n\
@@ -557,7 +565,8 @@ pub(crate) fn tandem_review_prompt(task: &str, transcript: &str, lang: Language)
         "You are {APP_NAME}, the CRITIC. The executor applied the approach. Inspect the REAL \
          result (read the changed files). Does it match what was agreed, is it correct, any \
          bugs or omissions? End with EXACTLY one line: `TANDEM: CONSENSUS` if the result is \
-         good, otherwise `TANDEM: CONTINUE` followed by what to fix.\n\n\
+         good, otherwise `TANDEM: CONTINUE` followed by what to fix. Use ONLY these two markers \
+         — never invent variants (no CLOSED/DONE/etc.).\n\n\
          {principles}\n\n{discipline}\n\n\
          {hint}\n\n\
          Task:\n{task}\n\n\
@@ -605,7 +614,8 @@ pub(crate) fn tandem_confirm_prompt(task: &str, transcript: &str, lang: Language
     format!(
         "You are {APP_NAME}, the CRITIC. The executor applied fixes. Briefly verify whether \
          your issues are resolved (read the changed files). End with EXACTLY one line: \
-         `TANDEM: CONSENSUS` if resolved, otherwise `TANDEM: CONTINUE` with what remains.\n\n\
+         `TANDEM: CONSENSUS` if resolved, otherwise `TANDEM: CONTINUE` with what remains. \
+         Use ONLY these two markers — never invent variants (no CLOSED/DONE/etc.).\n\n\
          {principles}\n\n{discipline}\n\n\
          {hint}\n\n\
          Task:\n{task}\n\n\
@@ -3414,6 +3424,16 @@ mod tests {
         );
         assert_eq!(strip_tandem_markers("**TANDEM: CONSENSUS**"), "");
         assert_eq!(strip_tandem_markers("обычный ответ"), "обычный ответ");
+
+        // Выдуманный моделью маркер тоже прячем (со своим хвостом) — не только три известных.
+        assert_eq!(strip_tandem_markers("итог\nTANDEM: CLOSED"), "итог");
+        assert_eq!(
+            strip_tandem_markers("правка\nTANDEM: DONE — всё готово"),
+            "правка\nвсё готово"
+        );
+        // Но детекция СИГНАЛА строгая: выдуманный CLOSED — это НЕ консенсус.
+        assert!(!parse_tandem_signal("бла\nTANDEM: CLOSED"));
+        assert!(!tandem_needs_input("бла\nTANDEM: CLOSED"));
     }
 
     #[test]
