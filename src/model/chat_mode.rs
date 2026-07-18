@@ -21,6 +21,27 @@ impl ChatMode {
         }
     }
 
+    /// Стабильный ключ для конфига (не зависит от языка/лейбла) — режим должен переживать
+    /// перезапуск инструмента, а не сбрасываться на Discussion.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ChatMode::Discussion => "discussion",
+            ChatMode::Plan => "plan",
+            ChatMode::FullAccess => "full",
+            ChatMode::Tandem => "tandem",
+        }
+    }
+
+    pub(crate) fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "discussion" => Some(ChatMode::Discussion),
+            "plan" => Some(ChatMode::Plan),
+            "full" => Some(ChatMode::FullAccess),
+            "tandem" => Some(ChatMode::Tandem),
+            _ => None,
+        }
+    }
+
     pub(crate) fn label(self, lang: Language) -> &'static str {
         match self {
             ChatMode::Discussion => lang.choose(">> Обсуждение", ">> Discussion"),
