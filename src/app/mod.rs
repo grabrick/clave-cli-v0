@@ -101,6 +101,10 @@ pub(crate) struct App {
     pub(crate) tandem_gate: bool,
     /// Канал ответа заблокированному воркеру тандема (Enter → Execute, Esc → Abort).
     pub(crate) tandem_gate_tx: Option<Sender<TandemGate>>,
+    /// Активен ли ввод-гейт тандема «нужны уточнения»: воркер ждёт текстовый ответ.
+    pub(crate) tandem_input_gate: bool,
+    /// Канал текстового ответа заблокированному воркеру тандема (Enter отправляет инпут).
+    pub(crate) tandem_input_tx: Option<Sender<String>>,
     pub(crate) last_ctrl_c_at: Option<Instant>,
     pub(crate) footer_notice: Option<(String, Instant)>,
     pub(crate) footer_right_text: String,
@@ -293,6 +297,8 @@ impl App {
             cancel_tx: None,
             tandem_gate: false,
             tandem_gate_tx: None,
+            tandem_input_gate: false,
+            tandem_input_tx: None,
             last_ctrl_c_at: None,
             footer_notice: None,
             footer_right_text: String::new(),

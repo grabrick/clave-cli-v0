@@ -405,6 +405,58 @@ pub(crate) fn parse_tandem_signal(text: &str) -> bool {
     false
 }
 
+/// Исполнитель запросил ввод: последняя значимая строка — сигнал `TANDEM: NEED_INPUT`.
+/// Тогда задача/данные неясны, и продолжать дебаты бессмысленно — надо спросить пользователя.
+pub(crate) fn tandem_needs_input(text: &str) -> bool {
+    for line in text.lines().rev() {
+        let cleaned = line.trim().trim_matches(['*', '`', '>', ' ']);
+        if cleaned.is_empty() {
+            continue;
+        }
+        let upper = cleaned.to_uppercase();
+        let Some(rest) = upper.strip_prefix("TANDEM:") else {
+            return false; // значимая строка, но не сигнал → не запрос ввода
+        };
+        return rest.trim() == "NEED_INPUT";
+    }
+    false
+}
+
+/// Если строка — протокольный сигнал `TANDEM: CONSENSUS|CONTINUE|NEED_INPUT`, возвращает
+/// её человеческий ХВОСТ после маркера (для CONTINUE — сводку возражений, для CONSENSUS —
+/// оговорку), иначе None. Управление читает сигнал из СЫРОГО текста отдельно.
+fn tandem_marker_tail(line: &str) -> Option<String> {
+    let cleaned = line.trim().trim_matches(['*', '`', '>', ' ']);
+    let lower = cleaned.to_lowercase();
+    let after_colon = lower.strip_prefix("tandem:")?.trim_start();
+    for kw in ["consensus", "continue", "need_input"] {
+        if after_colon.starts_with(kw) {
+            // Префикс `TANDEM:` + пробелы + keyword — весь ASCII, поэтому байт-смещения в
+            // `lower` и `cleaned` совпадают до конца keyword; хвост берём из оригинала (регистр цел).
+            let kw_end = (lower.len() - after_colon.len()) + kw.len();
+            let tail = cleaned.get(kw_end..).unwrap_or("").trim();
+            // ведущую пунктуацию-связку («— », «: ») к хвосту не тащим
+            let tail = tail.trim_start_matches(['—', '-', ':', ' ']);
+            return Some(tail.to_string());
+        }
+    }
+    None
+}
+
+/// Текст шага для показа/ленты: срезает протокольные строки-сигналы, сохраняя человеческий
+/// хвост (сводку возражений после CONTINUE). Пустые строки-маркеры уходят целиком.
+fn strip_tandem_markers(text: &str) -> String {
+    let mut kept = Vec::new();
+    for line in text.lines() {
+        match tandem_marker_tail(line) {
+            Some(tail) if tail.is_empty() => {} // чистый маркер → выкидываем строку
+            Some(tail) => kept.push(tail),
+            None => kept.push(line.to_string()),
+        }
+    }
+    kept.join("\n").trim().to_string()
+}
+
 fn tandem_lang_hint(lang: Language) -> &'static str {
     lang.choose(
         "Отвечай на русском, если пользователь не просит другой язык.",
@@ -431,6 +483,10 @@ pub(crate) fn tandem_propose_prompt(task: &str, transcript: &str, lang: Language
          Study the working directory (read files, search). Propose a concrete approach to \
          the task: which files, what changes, and why. Address the critic's prior objections \
          if any. Do NOT modify files or run commands — this is discussion.\n\n\
+         If the task is unclear, missing, or you lack information to propose a CONCRETE \
+         approach, do NOT invent one. End with EXACTLY one line `TANDEM: NEED_INPUT` and, \
+         just above it, your specific questions to the user (numbered, concrete). The user \
+         will answer and the debate will continue.\n\n\
          {principles}\n\n{discipline}\n\n\
          {hint}\n\n\
          Task:\n{task}\n\n\
@@ -938,6 +994,12 @@ fn tandem_notice(tx: &Sender<WorkerEvent>, text: String) {
     let _ = tx.send(WorkerEvent::Line(text));
 }
 
+/// Человеческая статус-строка в ленту (вместо сырого `TANDEM: …`): «✓ Консенсус» и т.п.
+/// Идёт отдельной строкой после шага, с отступом — как продолжение блока шага.
+fn emit_tandem_status(tx: &Sender<WorkerEvent>, text: &str) {
+    let _ = tx.send(WorkerEvent::ChatLine(format!("  {text}")));
+}
+
 fn opt_usage(total: RunUsage) -> Option<RunUsage> {
     if total == RunUsage::default() {
         None
@@ -959,6 +1021,7 @@ pub(crate) fn run_tandem(
     work_dir: &Path,
     cancel_rx: Receiver<()>,
     gate_rx: Receiver<TandemGate>,
+    input_rx: Receiver<String>,
     tx: Sender<WorkerEvent>,
     lang: Language,
 ) -> io::Result<TandemResult> {
@@ -977,6 +1040,7 @@ pub(crate) fn run_tandem(
         rounds,
         &cancel_rx,
         &gate_rx,
+        &input_rx,
         &tx,
         lang,
     )
@@ -996,6 +1060,7 @@ fn run_tandem_with<R>(
     rounds: usize,
     cancel_rx: &Receiver<()>,
     gate_rx: &Receiver<TandemGate>,
+    input_rx: &Receiver<String>,
     tx: &Sender<WorkerEvent>,
     lang: Language,
 ) -> io::Result<TandemResult>
@@ -1023,31 +1088,78 @@ where
 
     // ФАЗА ДЕБАТОВ
     let mut consensus = false;
-    for round in 1..=rounds.max(1) {
-        let propose = tandem_propose_prompt(task, &transcript.render(), lang);
-        let step = match run_step(executor, executor_effort, &propose, RunAccess::PlanReadonly)? {
-            Some(s) => s,
-            None => return Ok(TandemResult::Cancelled),
+    let mut rounds_done = 0usize;
+    'debate: for round in 1..=rounds.max(1) {
+        rounds_done = round;
+
+        // Предложение исполнителя. Если задача/данные неясны — исполнитель шлёт NEED_INPUT,
+        // мы спрашиваем пользователя, вливаем ответ в ленту и ПЕРЕ-предлагаем (без рестарта).
+        let exec_code = loop {
+            let propose = tandem_propose_prompt(task, &transcript.render(), lang);
+            let step = match run_step(executor, executor_effort, &propose, RunAccess::PlanReadonly)?
+            {
+                Some(s) => s,
+                None => return Ok(TandemResult::Cancelled),
+            };
+            tandem_accumulate(&mut total, &step.usage);
+            // Показываем ДО кода возврата (при ошибке причина — в выводе) и БЕЗ протокольных
+            // маркеров: сырой `TANDEM: …` — служебный сигнал, не для глаз пользователя.
+            let display = strip_tandem_markers(&step.text);
+            emit_tandem_step(
+                tx,
+                "🅐",
+                executor_name,
+                &format!("{} {round} · {}", lang.choose("раунд", "round"), exec_role),
+                &display,
+            );
+
+            if step.code == 0 && tandem_needs_input(&step.text) {
+                // Исполнитель просит уточнений: вопросы — в ленту как контекст, дальше ждём
+                // текстовый ответ пользователя (по каналу), затем пере-предлагаем с ним.
+                transcript.push(exec_role, lang.choose("вопрос", "question"), &display);
+                emit_tandem_status(
+                    tx,
+                    lang.choose(
+                        "⚠ Нужны уточнения — ответь и Enter",
+                        "⚠ Needs input — answer and press Enter",
+                    ),
+                );
+                let _ = tx.send(WorkerEvent::TandemNeedsInput);
+                let answer = loop {
+                    if cancel_rx.try_recv().is_ok() {
+                        return Ok(TandemResult::Cancelled);
+                    }
+                    match input_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Ok(a) => break Some(a),
+                        // Нет UI (headless) — спрашивать некого; идём дальше без ответа.
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break None,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    }
+                };
+                match answer {
+                    Some(a) => {
+                        transcript.push(
+                            lang.choose("Пользователь", "User"),
+                            lang.choose("уточнение", "clarification"),
+                            a.trim(),
+                        );
+                        continue; // пере-предлагаем — теперь с ответом в ленте
+                    }
+                    None => break step.code, // headless: вопросы уже в ленте, идём к критику
+                }
+            }
+
+            transcript.push(
+                exec_role,
+                &format!(
+                    "{} {round}",
+                    lang.choose("предложение, раунд", "proposal, round")
+                ),
+                &display,
+            );
+            break step.code;
         };
-        tandem_accumulate(&mut total, &step.usage);
-        // Вывод показываем ДО кода возврата: при ошибке причина «код N» — в самом выводе
-        // исполнителя, и глотать её (как было) значит оставить пользователя без диагностики.
-        emit_tandem_step(
-            tx,
-            "🅐",
-            executor_name,
-            &format!("{} {round} · {}", lang.choose("раунд", "round"), exec_role),
-            &step.text,
-        );
-        transcript.push(
-            exec_role,
-            &format!(
-                "{} {round}",
-                lang.choose("предложение, раунд", "proposal, round")
-            ),
-            &step.text,
-        );
-        if step.code != 0 {
+        if exec_code != 0 {
             tandem_notice(
                 tx,
                 format!(
@@ -1056,7 +1168,7 @@ where
                     lang.choose("вернул ошибку", "returned an error")
                 ),
             );
-            return Ok(TandemResult::Completed(step.code, opt_usage(total)));
+            return Ok(TandemResult::Completed(exec_code, opt_usage(total)));
         }
 
         let challenge = tandem_challenge_prompt(task, &transcript.render(), lang);
@@ -1065,12 +1177,13 @@ where
             None => return Ok(TandemResult::Cancelled),
         };
         tandem_accumulate(&mut total, &step.usage);
+        let display = strip_tandem_markers(&step.text);
         emit_tandem_step(
             tx,
             "🅒",
             critic_name,
             &format!("{} {round} · {}", lang.choose("раунд", "round"), crit_role),
-            &step.text,
+            &display,
         );
         transcript.push(
             crit_role,
@@ -1078,7 +1191,7 @@ where
                 "{} {round}",
                 lang.choose("критика, раунд", "critique, round")
             ),
-            &step.text,
+            &display,
         );
         if step.code != 0 {
             tandem_notice(
@@ -1092,10 +1205,22 @@ where
             return Ok(TandemResult::Completed(step.code, opt_usage(total)));
         }
 
+        // Сырой маркер спрятан — вместо него человеческий статус раунда.
         if parse_tandem_signal(&step.text) {
             consensus = true;
-            break;
+            emit_tandem_status(
+                tx,
+                lang.choose("✓ Консенсус достигнут", "✓ Consensus reached"),
+            );
+            break 'debate;
         }
+        emit_tandem_status(
+            tx,
+            lang.choose(
+                "↳ Есть замечания — продолжаем",
+                "↳ Objections raised — continuing",
+            ),
+        );
     }
     // Нет консенсуса → НЕ пишем молча. Раньше отсюда молча шли в исполнение с доступом на
     // запись — ровно это давало «внезапно изменённые файлы»: агенты не договорились, а файлы
@@ -1133,18 +1258,15 @@ where
     tandem_accumulate(&mut total, &step.usage);
     // Вывод исполнения показываем ДО кода: при ошибке (как в прогоне пользователя — код 1) причина
     // была в самом выводе Claude, а он глотался — оставался только «вернул ошибку», нечего отлаживать.
+    let display = strip_tandem_markers(&step.text);
     emit_tandem_step(
         tx,
         "🅐",
         executor_name,
         &format!("{} · {}", lang.choose("исполнение", "execution"), exec_role),
-        &step.text,
+        &display,
     );
-    transcript.push(
-        exec_role,
-        lang.choose("исполнение", "execution"),
-        &step.text,
-    );
+    transcript.push(exec_role, lang.choose("исполнение", "execution"), &display);
     if step.code != 0 {
         dirty_notice(tx);
         tandem_notice(
@@ -1168,17 +1290,29 @@ where
         }
     };
     tandem_accumulate(&mut total, &step.usage);
+    let display = strip_tandem_markers(&step.text);
     emit_tandem_step(
         tx,
         "🅒",
         critic_name,
         &format!("{} · {}", lang.choose("ревью", "review"), crit_role),
-        &step.text,
+        &display,
     );
-    transcript.push(crit_role, lang.choose("ревью", "review"), &step.text);
+    transcript.push(crit_role, lang.choose("ревью", "review"), &display);
     let review_ok = step.code == 0 && parse_tandem_signal(&step.text);
+    if step.code == 0 {
+        emit_tandem_status(
+            tx,
+            if review_ok {
+                lang.choose("✓ Ревью пройдено", "✓ Review passed")
+            } else {
+                lang.choose("↳ Есть правки — исправляю", "↳ Fixes needed — applying")
+            },
+        );
+    }
 
     // ФИНАЛЬНАЯ ПРАВКА + ПОДТВЕРЖДЕНИЕ (P4)
+    let mut leftover = false;
     if !review_ok {
         let review_text = step.text.clone();
         if cancel_rx.try_recv().is_ok() {
@@ -1194,6 +1328,7 @@ where
             }
         };
         tandem_accumulate(&mut total, &step.usage);
+        let display = strip_tandem_markers(&step.text);
         emit_tandem_step(
             tx,
             "🅐",
@@ -1203,12 +1338,12 @@ where
                 lang.choose("финальная правка", "final fix"),
                 exec_role
             ),
-            &step.text,
+            &display,
         );
         transcript.push(
             exec_role,
             lang.choose("финальная правка", "final fix"),
-            &step.text,
+            &display,
         );
         // Фаза правки — мутирующая (PlanExecute). Её ошибку/таймаут НЕ глотаем, как и
         // фазы дебатов/исполнения: иначе провалившийся прогон отдал бы код 0 (успех).
@@ -1226,6 +1361,7 @@ where
             }
         };
         tandem_accumulate(&mut total, &step.usage);
+        let display = strip_tandem_markers(&step.text);
         emit_tandem_step(
             tx,
             "🅒",
@@ -1235,7 +1371,7 @@ where
                 lang.choose("подтверждение", "confirmation"),
                 crit_role
             ),
-            &step.text,
+            &display,
         );
         // Провал самой фазы подтверждения (код≠0/таймаут) тоже не выдаём за успех.
         if step.code != 0 {
@@ -1243,6 +1379,7 @@ where
             return Ok(TandemResult::Completed(step.code, opt_usage(total)));
         }
         if !parse_tandem_signal(&step.text) {
+            leftover = true;
             tandem_notice(
                 tx,
                 lang.choose(
@@ -1254,7 +1391,48 @@ where
         }
     }
 
+    // Человеческий итог тандема: что произошло, а не голый код возврата. Идёт последней
+    // строкой ленты — пользователю сразу виден статус и прогресс.
+    tandem_notice(
+        tx,
+        tandem_summary(rounds_done, consensus, review_ok, leftover, lang),
+    );
     Ok(TandemResult::Completed(0, opt_usage(total)))
+}
+
+/// Однострочный человеческий итог успешного прогона тандема (код 0): консенсус за N раундов
+/// или исполнение по решению пользователя; была ли правка после ревью и остались ли замечания.
+fn tandem_summary(
+    rounds_done: usize,
+    consensus: bool,
+    review_ok: bool,
+    leftover: bool,
+    lang: Language,
+) -> String {
+    let head = if consensus {
+        format!(
+            "{} {rounds_done} {}",
+            lang.choose("✓ Тандем: консенсус за", "✓ Tandem: consensus in"),
+            lang.choose("р.", "round(s)")
+        )
+    } else {
+        lang.choose(
+            "✓ Тандем: без консенсуса, исполнено по твоему решению",
+            "✓ Tandem: no consensus, executed on your approval",
+        )
+        .to_string()
+    };
+    let tail = if leftover {
+        lang.choose(
+            " · правка внесена, но остались замечания",
+            " · fix applied, issues remain",
+        )
+    } else if review_ok {
+        lang.choose(" · исполнение подтверждено", " · execution confirmed")
+    } else {
+        lang.choose(" · исполнение с правкой", " · executed with a fix")
+    };
+    format!("{head}{tail}")
 }
 
 pub(crate) struct ChatResponse {
@@ -2888,6 +3066,7 @@ mod tests {
         notices: Vec<String>,
         chat: Vec<String>,
         needs_approval: bool,
+        needs_input: bool,
     }
 
     /// Прогоняет оркестратор на СЦЕНАРИИ шагов (None = отмена внутри шага).
@@ -2898,21 +3077,38 @@ mod tests {
         rounds: usize,
         cancel_after: Option<usize>,
     ) -> TandemRun {
-        fake_tandem_gated(steps, rounds, cancel_after, TandemGate::Execute)
+        fake_tandem_full(steps, rounds, cancel_after, TandemGate::Execute, &[])
     }
 
-    /// То же, но с явным решением гейта — предзагружается в канал до старта, поэтому
-    /// заблокированный воркер получает его сразу, как только упрётся в гейт.
+    /// То же, но с явным решением гейта «нет консенсуса».
     fn fake_tandem_gated(
         steps: Vec<Option<TandemStep>>,
         rounds: usize,
         cancel_after: Option<usize>,
         gate: TandemGate,
     ) -> TandemRun {
+        fake_tandem_full(steps, rounds, cancel_after, gate, &[])
+    }
+
+    /// Полный харнесс: `inputs` — ответы пользователя на ввод-гейт `NEED_INPUT`,
+    /// предзагружаются по порядку; затем канал закрывается, поэтому лишний `NEED_INPUT`
+    /// без ответа даёт Disconnected → воркер идёт дальше (как headless), а не виснет.
+    fn fake_tandem_full(
+        steps: Vec<Option<TandemStep>>,
+        rounds: usize,
+        cancel_after: Option<usize>,
+        gate: TandemGate,
+        inputs: &[&str],
+    ) -> TandemRun {
         let (tx, rx) = mpsc::channel();
         let (cancel_tx, cancel_rx) = mpsc::channel();
         let (gate_tx, gate_rx) = mpsc::channel();
         gate_tx.send(gate).expect("решение гейта уходит в канал");
+        let (input_tx, input_rx) = mpsc::channel();
+        for answer in inputs {
+            input_tx.send(answer.to_string()).expect("ответ в канал");
+        }
+        drop(input_tx); // ответы исчерпаны → Disconnected, без зависания
         let mut calls = Vec::new();
         let mut scripted = steps.into_iter();
         let mut done = 0usize;
@@ -2934,6 +3130,7 @@ mod tests {
             rounds,
             &cancel_rx,
             &gate_rx,
+            &input_rx,
             &tx,
             Language::Ru,
         )
@@ -2943,11 +3140,13 @@ mod tests {
         let mut notices = Vec::new();
         let mut chat = Vec::new();
         let mut needs_approval = false;
+        let mut needs_input = false;
         for event in rx.iter() {
             match event {
                 WorkerEvent::Line(line) => notices.push(line),
                 WorkerEvent::ChatLine(line) => chat.push(line),
                 WorkerEvent::TandemNeedsApproval => needs_approval = true,
+                WorkerEvent::TandemNeedsInput => needs_input = true,
                 _ => {}
             }
         }
@@ -2957,6 +3156,7 @@ mod tests {
             notices,
             chat,
             needs_approval,
+            needs_input,
         }
     }
 
@@ -3017,10 +3217,29 @@ mod tests {
             }
             TandemResult::Cancelled => panic!("не отменяли"),
         }
+        // Успех даёт человеческий итог (а не голый код) и НИ одного предупреждения.
         assert!(
-            run.notices.is_empty(),
-            "успешный тандем ничем не предупреждает: {:?}",
             run.notices
+                .iter()
+                .any(|l| l.contains("✓ Тандем") && l.contains("консенсус")),
+            "успешный тандем даёт человеческий итог: {:?}",
+            run.notices
+        );
+        assert!(
+            !run.notices.iter().any(|l| l.contains('⚠')),
+            "предупреждений быть не должно: {:?}",
+            run.notices
+        );
+        // Сырой протокольный маркер спрятан, вместо него — человеческий статус.
+        assert!(
+            !run.chat.iter().any(|l| l.contains("TANDEM: CONSENSUS")),
+            "сырой TANDEM: CONSENSUS не должен течь в ленту: {:?}",
+            run.chat
+        );
+        assert!(
+            run.chat.iter().any(|l| l.contains("✓ Консенсус")),
+            "вместо маркера — человеческий статус: {:?}",
+            run.chat
         );
         assert!(
             run.chat
@@ -3142,7 +3361,113 @@ mod tests {
             None,
         );
         assert_eq!(resolved.calls.len(), 6);
-        assert!(resolved.notices.is_empty(), "{:?}", resolved.notices);
+        // Подтверждение получено → «остались замечания» НЕ выводим, но человеческий итог есть.
+        assert!(
+            !resolved
+                .notices
+                .iter()
+                .any(|line| line.contains("Остались замечания")),
+            "замечаний не осталось: {:?}",
+            resolved.notices
+        );
+        assert!(
+            resolved.notices.iter().any(|l| l.contains("✓ Тандем")),
+            "успех даёт человеческий итог: {:?}",
+            resolved.notices
+        );
+    }
+
+    #[test]
+    fn tandem_marker_helpers_detect_and_strip() {
+        // NEED_INPUT — только когда это ПОСЛЕДНИЙ значимый сигнал.
+        assert!(tandem_needs_input("вопросы к тебе\nTANDEM: NEED_INPUT"));
+        assert!(!tandem_needs_input("TANDEM: CONSENSUS"));
+        assert!(!tandem_needs_input("обычный ответ без сигнала"));
+
+        // Стрип: чистый маркер уходит целиком, человеческий хвост возражений сохраняется.
+        assert_eq!(strip_tandem_markers("план\nTANDEM: CONSENSUS"), "план");
+        assert_eq!(
+            strip_tandem_markers("критика\nTANDEM: CONTINUE — течёт память"),
+            "критика\nтечёт память"
+        );
+        assert_eq!(strip_tandem_markers("**TANDEM: CONSENSUS**"), "");
+        assert_eq!(strip_tandem_markers("обычный ответ"), "обычный ответ");
+    }
+
+    #[test]
+    fn tandem_pauses_for_input_then_resumes_with_answer() {
+        // Раунд 1: исполнитель просит уточнений (NEED_INPUT). Пользователь отвечает →
+        // исполнитель ПЕРЕ-предлагает (уже с ответом в ленте), критик даёт консенсус.
+        let run = fake_tandem_full(
+            vec![
+                step("Задача не задана. Вопросы:\nTANDEM: NEED_INPUT"),
+                step("Теперь понятно — предлагаю X"),
+                step("TANDEM: CONSENSUS"),
+                step("сделал"),
+                step("ревью ок\nTANDEM: CONSENSUS"),
+            ],
+            2,
+            None,
+            TandemGate::Execute,
+            &["Задача: почини баг в X"],
+        );
+        assert!(
+            run.needs_input,
+            "исполнитель запросил ввод → событие поднято"
+        );
+        assert_eq!(
+            run.calls.len(),
+            5,
+            "предложение(need_input) + пере-предложение + критик + исполнение + ревью: {:?}",
+            run.calls
+        );
+        assert_eq!(run.calls[0], ("claude", RunAccess::PlanReadonly));
+        assert_eq!(
+            run.calls[1],
+            ("claude", RunAccess::PlanReadonly),
+            "повтор — тоже дебаты"
+        );
+        // Сырой NEED_INPUT спрятан, вместо него человеческий статус.
+        assert!(
+            !run.chat.iter().any(|l| l.contains("TANDEM: NEED_INPUT")),
+            "маркер не течёт в ленту: {:?}",
+            run.chat
+        );
+        assert!(
+            run.chat.iter().any(|l| l.contains("Нужны уточнения")),
+            "человеческий статус запроса: {:?}",
+            run.chat
+        );
+        match run.result {
+            TandemResult::Completed(code, _) => assert_eq!(code, 0),
+            TandemResult::Cancelled => panic!("не отменяли"),
+        }
+    }
+
+    #[test]
+    fn tandem_need_input_without_answerer_proceeds_not_hangs() {
+        // Нет ответчика (headless): NEED_INPUT → канал закрыт → воркер идёт к критику,
+        // а не виснет навсегда. Завершение теста и есть доказательство отсутствия зависания.
+        let run = fake_tandem_full(
+            vec![
+                step("Вопросы:\nTANDEM: NEED_INPUT"),
+                step("TANDEM: CONTINUE"),
+                step("сделал"),
+                step("ревью\nTANDEM: CONSENSUS"),
+            ],
+            1,
+            None,
+            TandemGate::Execute,
+            &[], // ответов нет → Disconnected → идём дальше
+        );
+        assert!(run.needs_input, "запрос ввода поднят даже без ответчика");
+        assert_eq!(
+            run.calls.len(),
+            4,
+            "предложение(need_input→дальше) + критик + исполнение + ревью: {:?}",
+            run.calls
+        );
+        assert!(matches!(run.result, TandemResult::Completed(0, _)));
     }
 
     #[test]

@@ -510,6 +510,22 @@ pub(crate) fn handle_input_key(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
+    // Ввод-гейт тандема «нужны уточнения»: воркер ждёт текстовый ответ. Печать/навигация
+    // идут как обычно (набираешь ответ), Enter — отправить его воркеру, Esc — отменить тандем.
+    if app.tandem_input_gate_active() && !ctrl && !alt {
+        match key.code {
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                app.tandem_submit_input();
+                return;
+            }
+            KeyCode::Esc => {
+                app.tandem_input_cancel();
+                return;
+            }
+            _ => {} // символы/навигация — обычным путём (набор ответа)
+        }
+    }
+
     // Гейт тандема «нет консенсуса»: воркер жив (running=true) и заблокирован в ожидании.
     // Enter — исполнить последнюю версию, Esc — отмена. Прочие клавиши пропускаем насквозь
     // (скролл ленты, чтобы перечитать дебаты перед решением); Ctrl+C для полной отмены идёт
@@ -1211,6 +1227,65 @@ mod tests {
         handle_input_key(&mut app, ctrl(KeyCode::Enter));
         assert!(rx.try_recv().is_err(), "Ctrl+Enter решение не шлёт");
         assert!(app.tandem_gate, "Ctrl+Enter гейт не закрывает");
+    }
+
+    /// App с активным ВВОД-гейтом тандема + приёмники ответа и отмены.
+    fn app_with_tandem_input_gate() -> (
+        App,
+        std::sync::mpsc::Receiver<String>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let mut app = app_for_keys();
+        let (in_tx, in_rx) = std::sync::mpsc::channel();
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+        app.running = true;
+        app.tandem_input_gate = true;
+        app.tandem_input_tx = Some(in_tx);
+        app.cancel_tx = Some(cancel_tx);
+        (app, in_rx, cancel_rx)
+    }
+
+    #[test]
+    fn tandem_input_gate_enter_sends_typed_answer() {
+        let (mut app, in_rx, _cancel_rx) = app_with_tandem_input_gate();
+        app.input = "почини баг в X".to_string();
+        app.cursor = app.input.len();
+        handle_input_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            in_rx.try_recv().ok().as_deref(),
+            Some("почини баг в X"),
+            "Enter шлёт набранный ответ воркеру"
+        );
+        assert!(!app.tandem_input_gate, "гейт закрыт после ответа");
+        assert!(app.input.is_empty(), "инпут очищен");
+    }
+
+    #[test]
+    fn tandem_input_gate_empty_answer_is_ignored() {
+        // Пустой ответ не отправляем — ждём текст (иначе воркер получил бы пустую строку).
+        let (mut app, in_rx, _cancel_rx) = app_with_tandem_input_gate();
+        app.input = "   ".to_string();
+        handle_input_key(&mut app, key(KeyCode::Enter));
+        assert!(in_rx.try_recv().is_err(), "пустой ответ не уходит");
+        assert!(app.tandem_input_gate, "гейт остаётся открыт");
+    }
+
+    #[test]
+    fn tandem_input_gate_esc_cancels_tandem() {
+        let (mut app, _in_rx, cancel_rx) = app_with_tandem_input_gate();
+        handle_input_key(&mut app, key(KeyCode::Esc));
+        assert!(cancel_rx.try_recv().is_ok(), "Esc отменяет тандем");
+        assert!(!app.tandem_input_gate, "гейт закрыт");
+    }
+
+    #[test]
+    fn tandem_input_gate_passes_typing_through() {
+        // Обычные символы на ввод-гейте — это НАБОР ответа, а не спецклавиши.
+        let (mut app, in_rx, _cancel_rx) = app_with_tandem_input_gate();
+        handle_input_key(&mut app, key(KeyCode::Char('a')));
+        assert_eq!(app.input, "a", "символ ушёл в набор ответа");
+        assert!(in_rx.try_recv().is_err(), "набор ничего не отправляет");
+        assert!(app.tandem_input_gate, "гейт открыт, пока печатаешь");
     }
 
     fn key(code: KeyCode) -> KeyEvent {

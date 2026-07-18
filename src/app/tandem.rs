@@ -31,6 +31,41 @@ impl App {
         self.tandem_gate = false;
     }
 
+    /// Активен ли ввод-гейт тандема «нужны уточнения» (воркер ждёт текстовый ответ).
+    pub(crate) fn tandem_input_gate_active(&self) -> bool {
+        self.tandem_input_gate
+    }
+
+    /// Enter на ввод-гейте: отправить набранный ответ заблокированному воркеру — тот
+    /// вольёт его в ленту и пере-предложит. Пустой ответ не отправляем (ждём текст).
+    pub(crate) fn tandem_submit_input(&mut self) {
+        let answer = self.input.trim().to_string();
+        if answer.is_empty() {
+            return;
+        }
+        if let Some(tx) = self.tandem_input_tx.as_ref() {
+            let _ = tx.send(answer);
+        }
+        self.input.clear();
+        self.cursor = 0;
+        self.tandem_input_gate = false;
+        self.status = self
+            .lang
+            .choose("продолжаю тандем...", "resuming tandem...")
+            .to_string();
+    }
+
+    /// Esc на ввод-гейте: отменить весь тандем. Мы на фазе дебатов — файлы не тронуты;
+    /// cancel_rx ловит сигнал, воркер вернёт `Cancelled`, обработчик доснимет состояние.
+    pub(crate) fn tandem_input_cancel(&mut self) {
+        if let Some(tx) = self.cancel_tx.as_ref() {
+            let _ = tx.send(());
+        }
+        self.tandem_input_gate = false;
+        self.input.clear();
+        self.cursor = 0;
+    }
+
     /// Запустить тандем: исполнитель (architect) + критик (reviewer) из текущего Mode.
     pub(crate) fn start_tandem(&mut self, task: String) {
         if self.running {
@@ -63,6 +98,8 @@ impl App {
         // Отдельный канал решения на гейте «нет консенсуса»: воркер блокируется на нём,
         // UI отвечает Execute/Abort из handle_input_key.
         let (gate_tx, gate_rx) = mpsc::channel();
+        // Канал текстового ответа на ввод-гейте «нужны уточнения».
+        let (input_tx, input_rx) = mpsc::channel();
 
         self.set_chat_title_from_prompt_if_needed(&task);
 
@@ -75,6 +112,8 @@ impl App {
         self.cancel_tx = Some(cancel_tx);
         self.tandem_gate = false;
         self.tandem_gate_tx = Some(gate_tx);
+        self.tandem_input_gate = false;
+        self.tandem_input_tx = Some(input_tx);
         self.last_ctrl_c_at = None;
         self.status = self.lang.choose("тандем...", "tandem...").to_string();
         self.push_system(format!("◆ {task}"));
@@ -110,6 +149,7 @@ impl App {
                     &work_dir,
                     cancel_rx,
                     gate_rx,
+                    input_rx,
                     tx.clone(),
                     lang,
                 );
