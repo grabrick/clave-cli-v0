@@ -27,6 +27,9 @@ pub(crate) enum WorkerEvent {
     /// Тандем не достиг консенсуса: воркер заблокирован и ждёт решения пользователя
     /// (исполнить последнюю версию / отменить). Открывает гейт `tandem_gate`.
     TandemNeedsApproval,
+    /// Исполнителю не хватает данных: воркер заблокирован и ждёт ТЕКСТОВЫЙ ответ
+    /// пользователя (вопросы уже показаны). Открывает ввод-гейт `tandem_input_gate`.
+    TandemNeedsInput,
 }
 
 pub(crate) enum ChatRunResult {
@@ -248,10 +251,12 @@ impl App {
                     | WorkerEvent::Failed(_)
             ) {
                 self.refresh_git_ref();
-                // Тандемный гейт живёт только пока воркер ждёт решения; любой терминальный
-                // исход (в т.ч. Ctrl+C во время гейта → Cancelled) обязан его погасить.
+                // Тандемные гейты живут только пока воркер ждёт решения/ответа; любой
+                // терминальный исход (в т.ч. Ctrl+C во время гейта → Cancelled) их гасит.
                 self.tandem_gate = false;
                 self.tandem_gate_tx = None;
+                self.tandem_input_gate = false;
+                self.tandem_input_tx = None;
             }
 
             match event {
@@ -454,6 +459,19 @@ impl App {
                     self.status = self
                         .lang
                         .choose("нет консенсуса — Enter/Esc", "no consensus — Enter/Esc")
+                        .to_string();
+                }
+                WorkerEvent::TandemNeedsInput => {
+                    // Исполнителю не хватает данных — вопросы уже в шаге. Проявляем накопленное
+                    // и открываем ввод-гейт: пользователь печатает ответ, Enter — отправить.
+                    self.tandem_input_gate = true;
+                    self.flush_reveal_buffer();
+                    self.status = self
+                        .lang
+                        .choose(
+                            "нужны уточнения — ответь и Enter",
+                            "needs input — answer + Enter",
+                        )
                         .to_string();
                 }
             }
@@ -926,6 +944,32 @@ mod tests {
         app.drain_worker_events();
         assert!(!app.tandem_gate, "терминальный исход закрывает гейт");
         assert!(app.tandem_gate_tx.is_none(), "канал ответа снят");
+    }
+
+    /// Ввод-гейт «нужны уточнения»: событие поднимает флаг и проявляет вопросы; терминальный
+    /// исход его гасит и снимает канал ответа.
+    #[test]
+    fn tandem_input_gate_event_opens_and_terminal_event_closes_it() {
+        let (mut app, _dir) = app_for_events();
+        app.running = true;
+        app.reveal_buffer = vec!["🅐 вопросы к тебе".to_string()];
+
+        app.tx.send(WorkerEvent::TandemNeedsInput).expect("send");
+        app.drain_worker_events();
+        assert!(app.tandem_input_gate, "событие открывает ввод-гейт");
+        assert!(app.reveal_buffer.is_empty(), "вопросы проявлены");
+
+        let (dummy_tx, _rx) = std::sync::mpsc::channel::<String>();
+        app.tandem_input_tx = Some(dummy_tx);
+        app.tx
+            .send(WorkerEvent::ChatDone(Provider::Claude, 0, None))
+            .expect("send");
+        app.drain_worker_events();
+        assert!(
+            !app.tandem_input_gate,
+            "терминальный исход закрывает ввод-гейт"
+        );
+        assert!(app.tandem_input_tx.is_none(), "канал ответа снят");
     }
 
     /// Отмена плана/движка (реплика уже в ленте): пометка нужна, а неотправленный
