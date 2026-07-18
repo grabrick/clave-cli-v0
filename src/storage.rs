@@ -215,6 +215,11 @@ pub(crate) fn load_config(path: &Path) -> AppConfig {
                     config.mode = mode;
                 }
             }
+            "chat_mode" => {
+                if let Some(chat_mode) = ChatMode::from_str(value) {
+                    config.chat_mode = chat_mode;
+                }
+            }
             "direct_provider" | "chat_provider" | "direct_chat_provider" => {
                 if let Some(provider) = Provider::from_str(value) {
                     config.direct_provider = provider;
@@ -367,6 +372,7 @@ pub(crate) fn save_config(path: &Path, config: &AppConfig) -> io::Result<()> {
         concat!(
             "onboarding_done={}\n",
             "mode=\"{}\"\n",
+            "chat_mode=\"{}\"\n",
             "direct_provider=\"{}\"\n",
             "theme=\"{}\"\n",
             "lang=\"{}\"\n",
@@ -382,6 +388,7 @@ pub(crate) fn save_config(path: &Path, config: &AppConfig) -> io::Result<()> {
         ),
         config.onboarding_done,
         config.mode.as_str(),
+        config.chat_mode.as_str(),
         config.direct_provider.as_str(),
         config.theme.as_str(),
         config.lang.as_str(),
@@ -923,6 +930,7 @@ mod tests {
         let saved = AppConfig {
             onboarding_done: true,
             mode: Mode::CodexClaude,
+            chat_mode: ChatMode::Tandem,
             direct_provider: Provider::Claude,
             theme: Theme::Amber,
             lang: Language::En,
@@ -943,6 +951,11 @@ mod tests {
         let loaded = load_config(&path);
         assert!(loaded.onboarding_done);
         assert_eq!(loaded.mode, Mode::CodexClaude);
+        assert_eq!(
+            loaded.chat_mode,
+            ChatMode::Tandem,
+            "chat_mode переживает round-trip"
+        );
         assert_eq!(loaded.direct_provider, Provider::Claude);
         assert_eq!(loaded.theme, Theme::Amber);
         assert_eq!(loaded.lang, Language::En);

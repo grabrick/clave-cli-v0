@@ -614,7 +614,12 @@ pub(crate) fn handle_input_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => app.insert_newline(),
         KeyCode::Enter => app.submit_input(),
         KeyCode::Tab => app.complete_command(),
-        KeyCode::BackTab => app.chat_mode = app.chat_mode.next(),
+        KeyCode::BackTab => {
+            // Смена режима переживает перезапуск: сохраняем сразу (двойной Ctrl+C мог бы
+            // выйти мимо сохранения), а не полагаемся на save где-то ещё.
+            app.chat_mode = app.chat_mode.next();
+            app.save_current_config(true);
+        }
         KeyCode::Backspace => app.backspace(),
         KeyCode::Delete => app.delete(),
         KeyCode::Left => app.move_left(),
@@ -1620,6 +1625,21 @@ mod tests {
         handle_input_key(&mut app, key(KeyCode::BackTab));
         assert_eq!(app.chat_mode, ChatMode::Discussion.next());
         assert_ne!(app.chat_mode, ChatMode::Discussion);
+    }
+
+    #[test]
+    fn backtab_persists_chat_mode_across_restart() {
+        // Регресс: режим (Tandem) сбрасывался на Discussion при перезапуске — Shift+Tab не
+        // сохранял конфиг. Теперь смена пишется на диск сразу и переживает выход.
+        let mut app = app_for_keys();
+        handle_input_key(&mut app, key(KeyCode::BackTab)); // Discussion → Plan
+        assert_eq!(app.chat_mode, ChatMode::Plan);
+        let reloaded = crate::storage::load_config(&app.config_path);
+        assert_eq!(
+            reloaded.chat_mode,
+            ChatMode::Plan,
+            "Shift+Tab сохранил режим на диск"
+        );
     }
 
     #[test]

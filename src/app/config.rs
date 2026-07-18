@@ -4,6 +4,9 @@ use super::*;
 pub(crate) struct AppConfig {
     pub(crate) onboarding_done: bool,
     pub(crate) mode: Mode,
+    /// Режим прямого чата (Shift+Tab): Discussion/Plan/FullAccess/Tandem. Переживает
+    /// перезапуск — иначе Tandem каждый раз сбрасывается на Discussion.
+    pub(crate) chat_mode: ChatMode,
     pub(crate) direct_provider: Provider,
     pub(crate) theme: Theme,
     pub(crate) lang: Language,
@@ -24,6 +27,7 @@ impl Default for AppConfig {
         Self {
             onboarding_done: false,
             mode: Mode::CodexOnly,
+            chat_mode: ChatMode::Discussion,
             direct_provider: Provider::Codex,
             theme: Theme::Purple,
             lang: Language::Ru,
@@ -45,6 +49,7 @@ impl App {
         AppConfig {
             onboarding_done,
             mode: self.mode,
+            chat_mode: self.chat_mode,
             direct_provider: self.direct_provider,
             theme: self.theme,
             lang: self.lang,

@@ -271,7 +271,7 @@ impl App {
         Self {
             mode: config.mode,
             direct_provider: config.direct_provider,
-            chat_mode: ChatMode::default(),
+            chat_mode: config.chat_mode,
             theme: config.theme,
             lang: config.lang,
             rounds: config.rounds,
