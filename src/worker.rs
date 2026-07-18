@@ -479,7 +479,7 @@ const ENGINEERING_PRINCIPLES: &str = "Engineering principles (every step):\n\
 - YAGNI: build what the task needs now, not speculative generality.";
 
 /// Добавка для роли критика: судить, а не поддакивать.
-const CRITIC_DISCIPLINE: &str = "Judge, don't rubber-stamp: do NOT trust the other agent's answer at face value. Read what was actually proposed/changed, verify it against the real code, and form your OWN reasoned opinion. Agree only after checking; when you disagree, be specific. Actively flag any unjustified dependency, heavy library, or added complexity, and name the leaner alternative.";
+const CRITIC_DISCIPLINE: &str = "Judge, don't rubber-stamp: do NOT trust the other agent's answer at face value. Read what was actually proposed/changed, verify it against the real code, and form your OWN reasoned opinion. Agree only after checking; when you disagree, be specific. Actively flag any unjustified dependency, heavy library, or added complexity, and name the leaner alternative. But CONVERGE decisively — judge against the TASK's scope, not perfection: separate BLOCKING defects (the approach is wrong, broken, or insecure FOR THIS TASK) from non-blocking notes (nice-to-haves, out of scope, v2, things the user did not ask for). Signal CONSENSUS as soon as there are no BLOCKING defects and list any remaining non-blocking notes AFTER the marker. Withholding consensus for perfectionism, scope-creep, or endlessly raising NEW unrelated issues only wastes rounds.";
 
 /// Добавка для роли исполнителя: минимализм.
 const EXECUTOR_DISCIPLINE: &str = "Reach for the minimal change first; if you add a dependency or abstraction, justify it in one line.";
@@ -514,18 +514,30 @@ pub(crate) fn tandem_propose_prompt(task: &str, transcript: &str, lang: Language
     )
 }
 
-pub(crate) fn tandem_challenge_prompt(task: &str, transcript: &str, lang: Language) -> String {
+pub(crate) fn tandem_challenge_prompt(
+    task: &str,
+    transcript: &str,
+    round: usize,
+    rounds: usize,
+    lang: Language,
+) -> String {
     format!(
         "You are {APP_NAME}, the CRITIC working in a pair with an EXECUTOR. PLAN MODE.\n\
          Study the code (read-only) and STRICTLY evaluate the executor's proposed approach: \
          gaps, risks, what is missing, better alternatives. Do NOT agree out of politeness. \
-         End with EXACTLY one line: `TANDEM: CONSENSUS` only if the approach is genuinely \
-         correct and complete, otherwise `TANDEM: CONTINUE` followed by concrete objections. \
-         Use ONLY these two markers — never invent variants (no CLOSED/DONE/etc.).\n\n\
+         End with EXACTLY one line: `TANDEM: CONSENSUS` only if the approach has no BLOCKING \
+         defect for this task, otherwise `TANDEM: CONTINUE` followed by concrete objections. \
+         Use ONLY these two markers — never invent variants (no CLOSED/DONE/etc.).\n\
+         This is debate round {round} of {rounds}. There is a hard round budget: by round \
+         {rounds} you MUST either signal CONSENSUS (no blocking defects) or, if the task is \
+         too vague or too large to converge, say so PLAINLY on the CONTINUE line so it goes \
+         to the user for direction. Do NOT keep the debate spinning with new issues each round.\n\n\
          {principles}\n\n{discipline}\n\n\
          {hint}\n\n\
          Task:\n{task}\n\n\
          Tandem transcript so far:\n{transcript}",
+        round = round,
+        rounds = rounds,
         principles = ENGINEERING_PRINCIPLES,
         discipline = CRITIC_DISCIPLINE,
         hint = tandem_lang_hint(lang),
@@ -1200,7 +1212,8 @@ where
             return Ok(TandemResult::Completed(exec_code, opt_usage(total)));
         }
 
-        let challenge = tandem_challenge_prompt(task, &transcript.render(), lang);
+        let challenge =
+            tandem_challenge_prompt(task, &transcript.render(), round, rounds.max(1), lang);
         let step = match run_step(critic, critic_effort, &challenge, RunAccess::PlanReadonly)? {
             Some(s) => s,
             None => return Ok(TandemResult::Cancelled),
@@ -2322,10 +2335,17 @@ mod tests {
 
     #[test]
     fn tandem_prompts_carry_role_and_signal_rules() {
-        let ch = tandem_challenge_prompt("do x", "", Language::En);
+        let ch = tandem_challenge_prompt("do x", "", 2, 3, Language::En);
         assert!(ch.contains("CRITIC"));
         assert!(ch.contains("TANDEM: CONSENSUS"));
         assert!(ch.contains("Do NOT agree out of politeness"));
+        // Сходимость: критик знает про блокеры-vs-не-блокеры и про бюджет раундов —
+        // иначе перфекционизм крутил бы дебаты вечно.
+        assert!(ch.contains("BLOCKING"), "критик отделяет блокеры: {ch}");
+        assert!(
+            ch.contains("round 2 of 3"),
+            "критик осознаёт бюджет раундов: {ch}"
+        );
 
         let ex = tandem_execute_prompt("do x", "approach", Language::En);
         assert!(ex.contains("EXECUTOR"));
@@ -2405,7 +2425,7 @@ mod tests {
             );
         }
         let crit = [
-            tandem_challenge_prompt("t", "", Language::En),
+            tandem_challenge_prompt("t", "", 1, 2, Language::En),
             tandem_review_prompt("t", "", Language::En),
             tandem_confirm_prompt("t", "", Language::En),
         ];
@@ -2414,6 +2434,12 @@ mod tests {
             assert!(
                 p.contains("do NOT trust the other agent's answer"),
                 "critic prompt #{i} has critic discipline"
+            );
+            // Сходимость доезжает во ВСЕ критик-промпты (дебаты/ревью/подтверждение),
+            // иначе перфекционизм не давал бы консенсуса.
+            assert!(
+                p.contains("CONVERGE decisively"),
+                "critic prompt #{i} has convergence discipline"
             );
         }
     }
