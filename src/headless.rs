@@ -110,6 +110,12 @@ fn print_event(event: &WorkerEvent) {
         WorkerEvent::StreamDelta(s) | WorkerEvent::ReasoningDelta(s) => {
             print!("{s}");
         }
+        // headless неинтерактивен: гейт «нет консенсуса» некому подтвердить, воркер
+        // авто-исполняет (см. предзагрузку Execute в run_headless). Печатаем, чтобы в
+        // логах self-dev было видно, что консенсуса не было.
+        WorkerEvent::TandemNeedsApproval => {
+            println!("⚠ Консенсус не достигнут — headless исполняет последнюю версию.");
+        }
         WorkerEvent::Done(_)
         | WorkerEvent::ChatDone(..)
         | WorkerEvent::PlanReady(..)
@@ -225,9 +231,17 @@ pub(crate) fn run_headless(args: &[String]) -> AnyResult<()> {
     let rounds = params.rounds;
     let work_dir = params.work_dir.clone();
     let lang = params.lang;
+    // headless неинтерактивен: гейт «нет консенсуса» некому подтвердить. Предзагружаем
+    // Execute — это в точности прежнее поведение (нет консенсуса → исполнить последнюю),
+    // на которое настроен self-dev гейт; иначе воркер завис бы на gate_rx навсегда.
+    let (gate_tx, gate_rx) = mpsc::channel();
+    gate_tx
+        .send(TandemGate::Execute)
+        .expect("предзагрузка решения гейта");
     let handle = thread::spawn(move || {
         run_tandem(
-            executor, critic, &effort, &effort, &task_run, rounds, &work_dir, cancel_rx, tx, lang,
+            executor, critic, &effort, &effort, &task_run, rounds, &work_dir, cancel_rx, gate_rx,
+            tx, lang,
         )
     });
 
