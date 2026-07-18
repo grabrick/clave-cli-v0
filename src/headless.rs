@@ -118,7 +118,7 @@ fn print_event(event: &WorkerEvent) {
         }
         // Исполнитель просит уточнений, но в headless отвечать некому — воркер идёт дальше
         // (канал ввода закрыт → Disconnected). Печатаем, чтобы это было видно в логах.
-        WorkerEvent::TandemNeedsInput => {
+        WorkerEvent::TandemNeedsInput(_) => {
             println!("⚠ Исполнителю нужны уточнения — в headless некому ответить, продолжаю.");
         }
         WorkerEvent::Done(_)
