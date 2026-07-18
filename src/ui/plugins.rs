@@ -222,13 +222,11 @@ fn plugin_list_footer(app: &App, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-/// Область деталей выбранного плагина: разделитель, имя, описание (перенос до 2 строк), автор.
-/// Пусто, если у выбранного описания нет (codex или отсутствует в кэше) — тогда просто подсказка.
+/// Область деталей выбранного плагина: разделитель, имя, описание (перенос до 2 строк, если есть),
+/// автор и ИСТОЧНИК (маркетплейс). Имя и источник показываем всегда — видно, откуда плагин; для
+/// codex/без описания — только они. Пусто, если в табе нет выбранного плагина.
 fn plugin_detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     let Some(entry) = app.filtered_plugins().get(app.plugins_index).copied() else {
-        return Vec::new();
-    };
-    let Some(detail) = app.plugin_details.get(&entry.qualified_name()) else {
         return Vec::new();
     };
     let mut lines = vec![
@@ -240,15 +238,23 @@ fn plugin_detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         )),
     ];
-    for line in wrap_text(&detail.description, width.saturating_sub(2) as usize, 2) {
-        lines.push(Line::from(Span::styled(
-            format!("  {line}"),
-            Style::default().fg(app.theme.accent_soft()),
-        )));
+    if let Some(detail) = app.plugin_details.get(&entry.qualified_name()) {
+        for line in wrap_text(&detail.description, width.saturating_sub(2) as usize, 2) {
+            lines.push(Line::from(Span::styled(
+                format!("  {line}"),
+                Style::default().fg(app.theme.accent_soft()),
+            )));
+        }
+        if let Some(author) = &detail.author {
+            lines.push(Line::from(Span::styled(
+                format!("  ↳ {author}"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
-    if let Some(author) = &detail.author {
+    if !entry.marketplace.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!("  ↳ {author}"),
+            format!("  ⌂ {}", entry.marketplace),
             Style::default().fg(Color::DarkGray),
         )));
     }

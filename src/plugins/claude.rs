@@ -257,6 +257,99 @@ pub(crate) fn parse_claude_plugin_updates(
     out
 }
 
+/// Разбирает манифест СТОРОННЕГО маркетплейса (`marketplaces/<name>/.claude-plugin/marketplace.json`)
+/// в записи-плагины. Официальный каталог-кэш их не содержит — без этого сторонние плагины в панели
+/// не видны. `marketplace` — имя каталога источника (оно же в `install <name>@<marketplace>`).
+/// Установлен/включён определяется по общим `installed`/`settings` (ключ `name@marketplace`).
+pub(crate) fn parse_marketplace_plugins(
+    manifest_json: &str,
+    marketplace: &str,
+    installed_json: &str,
+    settings_json: &str,
+) -> Vec<PluginEntry> {
+    let installed = claude_installed_versions(installed_json);
+    let enabled = claude_enabled_set(settings_json);
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(manifest_json) else {
+        return Vec::new();
+    };
+    let Some(plugins) = value.get("plugins").and_then(|p| p.as_array()) else {
+        return Vec::new();
+    };
+    plugins
+        .iter()
+        .filter_map(|plugin| {
+            let name = plugin.get("name")?.as_str()?.to_string();
+            let key = format!("{name}@{marketplace}");
+            let version = plugin
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or_else(|| installed.get(&key).cloned())
+                .filter(|v| v != "unknown");
+            Some(PluginEntry {
+                provider: Provider::Claude,
+                name,
+                marketplace: marketplace.to_string(),
+                installed: installed.contains_key(&key),
+                enabled: enabled.contains(&key),
+                version,
+            })
+        })
+        .collect()
+}
+
+/// Описания плагинов стороннего маркетплейса из его манифеста (для области деталей). Автор — из
+/// плагина, иначе владелец маркетплейса (`owner`). Без описания запись пропускаем.
+pub(crate) fn parse_marketplace_details(
+    manifest_json: &str,
+    marketplace: &str,
+) -> BTreeMap<String, PluginDetail> {
+    let mut out = BTreeMap::new();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(manifest_json) else {
+        return out;
+    };
+    let owner = value.get("owner").and_then(json_name);
+    let Some(plugins) = value.get("plugins").and_then(|p| p.as_array()) else {
+        return out;
+    };
+    for plugin in plugins {
+        let Some(name) = plugin.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let description = plugin
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if description.is_empty() {
+            continue;
+        }
+        let author = plugin
+            .get("author")
+            .and_then(json_name)
+            .or_else(|| owner.clone());
+        out.insert(
+            format!("{name}@{marketplace}"),
+            PluginDetail {
+                description,
+                author,
+            },
+        );
+    }
+    out
+}
+
+/// Имя из поля, которое может быть строкой или объектом `{ "name" }` (owner/author в манифестах
+/// claude встречаются в обоих видах). Пустое → `None`.
+fn json_name(value: &serde_json::Value) -> Option<String> {
+    let name = value
+        .as_str()
+        .or_else(|| value.get("name").and_then(|n| n.as_str()))?
+        .trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +540,46 @@ mod tests {
             parse_claude_plugin_updates("", "").is_empty(),
             "битый вход — пусто"
         );
+    }
+
+    #[test]
+    fn marketplace_manifest_plugins_and_details_are_parsed() {
+        // Формат манифеста стороннего маркетплейса: {name, owner, plugins:[{name,description,...}]}.
+        let manifest = r#"{"name":"skills","owner":"alice","plugins":[
+            {"name":"marketing","description":"Marketing skills","source":"./m"},
+            {"name":"seo","description":"SEO skills"}
+        ]}"#;
+        let installed = r#"{"version":2,"plugins":{"marketing@my-mkt":[{"version":"1.0"}]}}"#;
+        let settings = r#"{"enabledPlugins":{"marketing@my-mkt":true}}"#;
+
+        let plugins = parse_marketplace_plugins(manifest, "my-mkt", installed, settings);
+        assert_eq!(plugins.len(), 2, "оба плагина манифеста");
+        let marketing = plugins.iter().find(|p| p.name == "marketing").unwrap();
+        assert_eq!(
+            marketing.marketplace, "my-mkt",
+            "источник = имя маркетплейса"
+        );
+        assert!(
+            marketing.installed && marketing.enabled,
+            "статус по ключу name@marketplace"
+        );
+        let seo = plugins.iter().find(|p| p.name == "seo").unwrap();
+        assert!(!seo.installed, "seo не установлен");
+
+        let details = parse_marketplace_details(manifest, "my-mkt");
+        let d = details
+            .get("marketing@my-mkt")
+            .expect("описание из манифеста");
+        assert_eq!(d.description, "Marketing skills");
+        assert_eq!(
+            d.author.as_deref(),
+            Some("alice"),
+            "автор — owner маркетплейса"
+        );
+
+        // Битый/пустой вход — без паники.
+        assert!(parse_marketplace_plugins("{ битый", "m", "", "").is_empty());
+        assert!(parse_marketplace_details("", "m").is_empty());
     }
 
     #[test]
