@@ -116,6 +116,11 @@ fn print_event(event: &WorkerEvent) {
         WorkerEvent::TandemNeedsApproval => {
             println!("⚠ Консенсус не достигнут — headless исполняет последнюю версию.");
         }
+        // Исполнитель просит уточнений, но в headless отвечать некому — воркер идёт дальше
+        // (канал ввода закрыт → Disconnected). Печатаем, чтобы это было видно в логах.
+        WorkerEvent::TandemNeedsInput => {
+            println!("⚠ Исполнителю нужны уточнения — в headless некому ответить, продолжаю.");
+        }
         WorkerEvent::Done(_)
         | WorkerEvent::ChatDone(..)
         | WorkerEvent::PlanReady(..)
@@ -238,10 +243,14 @@ pub(crate) fn run_headless(args: &[String]) -> AnyResult<()> {
     gate_tx
         .send(TandemGate::Execute)
         .expect("предзагрузка решения гейта");
+    // Ввод-гейт «нужны уточнения» тоже некому обслужить: сразу закрываем канал ответа →
+    // recv даёт Disconnected → воркер идёт дальше, а не виснет (та же логика, что у gate).
+    let (input_tx, input_rx) = mpsc::channel::<String>();
+    drop(input_tx);
     let handle = thread::spawn(move || {
         run_tandem(
             executor, critic, &effort, &effort, &task_run, rounds, &work_dir, cancel_rx, gate_rx,
-            tx, lang,
+            input_rx, tx, lang,
         )
     });
 
