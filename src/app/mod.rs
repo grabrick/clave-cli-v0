@@ -105,6 +105,9 @@ pub(crate) struct App {
     pub(crate) tandem_input_gate: bool,
     /// Канал текстового ответа заблокированному воркеру тандема (Enter отправляет инпут).
     pub(crate) tandem_input_tx: Option<Sender<String>>,
+    /// Идёт прогон тандема: его шаги фиксируются в ленту по мере готовности, а живой
+    /// `⏺`-стрим НЕ показывается (он двоил бы готовые блоки `🅐`/`🅒`).
+    pub(crate) is_tandem_run: bool,
     pub(crate) last_ctrl_c_at: Option<Instant>,
     pub(crate) footer_notice: Option<(String, Instant)>,
     pub(crate) footer_right_text: String,
@@ -299,6 +302,7 @@ impl App {
             tandem_gate_tx: None,
             tandem_input_gate: false,
             tandem_input_tx: None,
+            is_tandem_run: false,
             last_ctrl_c_at: None,
             footer_notice: None,
             footer_right_text: String::new(),

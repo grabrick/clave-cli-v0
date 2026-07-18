@@ -31,6 +31,9 @@ pub(crate) enum WorkerEvent {
     /// (вопросы уже показаны). `Some` — закрытый вопрос, открываем селектор выбора;
     /// `None` — открытый вопрос, текстовый ввод-гейт.
     TandemNeedsInput(Option<AskPrompt>),
+    /// Шаг тандема (или его статус) полностью выведен — фиксируем его в ленте СРАЗУ и гасим
+    /// живой стрим. Иначе шаги копились бы в буфере до гейта/конца, а `⏺`-стрим двоил бы их.
+    TandemStepEnd,
 }
 
 pub(crate) enum ChatRunResult {
@@ -216,6 +219,7 @@ impl App {
                 self.tandem_gate_tx = None;
                 self.tandem_input_gate = false;
                 self.tandem_input_tx = None;
+                self.is_tandem_run = false;
             }
 
             match event {
@@ -422,6 +426,13 @@ impl App {
                         .lang
                         .choose("нет консенсуса — Enter/Esc", "no consensus — Enter/Esc")
                         .to_string();
+                }
+                WorkerEvent::TandemStepEnd => {
+                    // Шаг завершён: сразу выводим его в ленту (готовым блоком, как и было —
+                    // через push_system) и гасим живой стрим, чтобы `⏺` не двоил тот же текст.
+                    self.flush_reveal_buffer();
+                    self.live_answer.clear();
+                    self.live_reasoning.clear();
                 }
                 WorkerEvent::TandemNeedsInput(prompt) => {
                     // Исполнителю не хватает данных — вопросы уже в шаге. Гасим дубль-стрим
@@ -946,6 +957,33 @@ mod tests {
             "терминальный исход закрывает ввод-гейт"
         );
         assert!(app.tandem_input_tx.is_none(), "канал ответа снят");
+    }
+
+    /// Шаг тандема фиксируется в ленте СРАЗУ (по TandemStepEnd), а живой стрим гасится —
+    /// чтобы `⏺` не двоил готовый блок и шаги не копились до гейта/конца.
+    #[test]
+    fn tandem_step_end_commits_step_and_clears_live_stream() {
+        let (mut app, _dir) = app_for_events();
+        app.running = true;
+        app.reveal_buffer = vec!["🅐 Claude · раунд 1".to_string(), "тело шага".to_string()];
+        app.live_answer = "сырой стрим".to_string();
+        app.live_reasoning = "раздумья".to_string();
+
+        app.tx.send(WorkerEvent::TandemStepEnd).expect("send");
+        app.drain_worker_events();
+
+        assert!(app.reveal_buffer.is_empty(), "буфер шага слит в ленту");
+        assert!(
+            app.transcript
+                .iter()
+                .any(|l| l.contains("🅐 Claude · раунд 1")),
+            "блок шага в ленте: {:?}",
+            app.transcript
+        );
+        assert!(
+            app.live_answer.is_empty() && app.live_reasoning.is_empty(),
+            "живой стрим погашен"
+        );
     }
 
     /// Отмена плана/движка (реплика уже в ленте): пометка нужна, а неотправленный
