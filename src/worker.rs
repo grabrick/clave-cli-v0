@@ -879,10 +879,19 @@ pub(crate) fn run_provider_once(
                 let stdout = stdout_handle
                     .map(|handle| handle.join().unwrap_or_default())
                     .unwrap_or_default();
-                let _ = stderr_handle.map(|handle| handle.join().unwrap_or_default());
+                let stderr = stderr_handle
+                    .map(|handle| handle.join().unwrap_or_default())
+                    .unwrap_or_default();
 
-                let (text, usage, is_error) = provider_result(provider, &stdout, codex_out.read());
+                let (mut text, usage, is_error) =
+                    provider_result(provider, &stdout, codex_out.read());
                 let code = final_code(status.code(), is_error);
+                // Ошибка без ответа: причина — в stderr (или транзиент, если и он пуст). Раньше
+                // stderr здесь ВЫБРАСЫВАЛСЯ (`let _ =`), фаза отдавала пустой текст, и пользователь
+                // видел «код N» без единой строки причины. Чат-путь stderr сохраняет — тандем теперь тоже.
+                if code != 0 && text.trim().is_empty() {
+                    text = provider_error_detail_lines(&stderr, lang).join("\n");
+                }
                 return Ok(Some(TandemStep { text, code, usage }));
             }
             None => {
@@ -1671,26 +1680,33 @@ pub(crate) fn chat_error_lines(
         lang.choose("вернул ошибку", "returned an error"),
         lang.choose("код", "exit code"),
     )];
+    for line in provider_error_detail_lines(stderr, lang) {
+        out.push(format!("⎿ {line}"));
+    }
+    out
+}
 
+/// Детали ошибки провайдера: непустой stderr (первые 40 непустых строк) либо честная
+/// подсказка о транзиенте, если stderr пуст. Общий источник для чат-ошибки (`chat_error_lines`)
+/// И для шага тандема (`run_provider_once`) — иначе тандем отдаёт пустой текст, и «код N»
+/// остаётся без причины.
+fn provider_error_detail_lines(stderr: &str, lang: Language) -> Vec<String> {
     let stderr = stderr.trim();
     if stderr.is_empty() {
-        out.push(
-            lang.choose(
-                "⎿ без вывода — вероятно транзиентный сбой (сеть / лимит / таймаут). Повтори запрос.",
-                "⎿ no output — likely a transient failure (network / rate limit / timeout). Try again.",
+        vec![lang
+            .choose(
+                "без вывода — вероятно транзиентный сбой (сеть / лимит / таймаут). Повтори запрос.",
+                "no output — likely a transient failure (network / rate limit / timeout). Try again.",
             )
-            .to_string(),
-        );
+            .to_string()]
     } else {
-        for line in stderr
+        stderr
             .lines()
             .filter(|line| !line.trim().is_empty())
             .take(40)
-        {
-            out.push(format!("⎿ {line}"));
-        }
+            .map(str::to_string)
+            .collect()
     }
-    out
 }
 
 pub(crate) fn engine_path() -> Option<PathBuf> {
@@ -3297,6 +3313,33 @@ mod tests {
             "вывод падающего исполнения должен попасть в чат: {:?}",
             execute.chat
         );
+    }
+
+    #[test]
+    fn provider_error_detail_surfaces_stderr_or_transient_hint() {
+        // Непустой stderr — показываем его строки (пустые отбрасываем). Это то, что раньше
+        // тандем выбрасывал: причина провала фазы исполнения жила ровно здесь.
+        let detail = provider_error_detail_lines(
+            "\nError: permission denied\n\n/path/key-guard.ts\n",
+            Language::Ru,
+        );
+        assert_eq!(
+            detail,
+            vec!["Error: permission denied", "/path/key-guard.ts"]
+        );
+
+        // Пустой stderr — честная подсказка о транзиенте, а не немой провал.
+        let empty = provider_error_detail_lines("   ", Language::Ru);
+        assert_eq!(empty.len(), 1);
+        assert!(
+            empty[0].contains("транзиентный сбой"),
+            "пустой stderr → подсказка о транзиенте: {empty:?}"
+        );
+
+        // chat_error_lines строит поверх того же помощника: заголовок с кодом + детали.
+        let lines = chat_error_lines("claude", 1, "boom", Language::Ru);
+        assert!(lines[0].contains("код 1"), "{lines:?}");
+        assert!(lines.iter().any(|l| l == "⎿ boom"), "{lines:?}");
     }
 
     #[test]
