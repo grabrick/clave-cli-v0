@@ -517,6 +517,24 @@ pub(crate) fn handle_input_key(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
+    // Гейт тандема «нет консенсуса»: воркер жив (running=true) и заблокирован в ожидании.
+    // Enter — исполнить последнюю версию, Esc — отмена. Прочие клавиши пропускаем насквозь
+    // (скролл ленты, чтобы перечитать дебаты перед решением); Ctrl+C для полной отмены идёт
+    // своим путём — он ctrl и сюда не попадает.
+    if app.tandem_gate_active() && !ctrl && !alt {
+        match key.code {
+            KeyCode::Enter => {
+                app.tandem_gate_approve();
+                return;
+            }
+            KeyCode::Esc => {
+                app.tandem_gate_abort();
+                return;
+            }
+            _ => {}
+        }
+    }
+
     // Гейт плана: Enter/Esc имеют особую семантику; остальное — обычный ввод
     // (набор замечания для доработки). Ctrl/Alt-комбинации не перехватываем.
     if app.plan_gate_active() && !ctrl && !alt {
@@ -1155,6 +1173,51 @@ mod tests {
             plan: "шаг 1".to_string(),
         });
         app
+    }
+
+    /// App с активным гейтом тандема (`tandem_gate` + `running`) и приёмником, чтобы
+    /// проверить, какое решение ушло заблокированному воркеру.
+    fn app_with_tandem_gate() -> (App, std::sync::mpsc::Receiver<TandemGate>) {
+        let mut app = app_for_keys();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.running = true;
+        app.tandem_gate = true;
+        app.tandem_gate_tx = Some(tx);
+        (app, rx)
+    }
+
+    #[test]
+    fn tandem_gate_enter_approves_execution() {
+        let (mut app, rx) = app_with_tandem_gate();
+        handle_input_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(TandemGate::Execute),
+            "Enter на гейте → исполнить последнюю версию"
+        );
+        assert!(!app.tandem_gate, "гейт закрыт после решения");
+    }
+
+    #[test]
+    fn tandem_gate_esc_aborts_without_writing() {
+        let (mut app, rx) = app_with_tandem_gate();
+        handle_input_key(&mut app, key(KeyCode::Esc));
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(TandemGate::Abort),
+            "Esc на гейте → отмена без записи"
+        );
+        assert!(!app.tandem_gate, "гейт закрыт после решения");
+    }
+
+    #[test]
+    fn tandem_gate_ignores_ctrl_combinations() {
+        // Ctrl+Enter НЕ одобряет исполнение: комбинации редактора/прерывания сюда не
+        // относятся, иначе случайный Ctrl+Enter молча запускал бы запись.
+        let (mut app, rx) = app_with_tandem_gate();
+        handle_input_key(&mut app, ctrl(KeyCode::Enter));
+        assert!(rx.try_recv().is_err(), "Ctrl+Enter решение не шлёт");
+        assert!(app.tandem_gate, "Ctrl+Enter гейт не закрывает");
     }
 
     fn key(code: KeyCode) -> KeyEvent {

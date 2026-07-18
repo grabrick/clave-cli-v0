@@ -24,6 +24,9 @@ pub(crate) enum WorkerEvent {
     MarketplacesLoaded(Vec<Marketplace>),
     /// Добавление/удаление источника завершено — перезагружаем список источников.
     MarketplaceActionDone,
+    /// Тандем не достиг консенсуса: воркер заблокирован и ждёт решения пользователя
+    /// (исполнить последнюю версию / отменить). Открывает гейт `tandem_gate`.
+    TandemNeedsApproval,
 }
 
 pub(crate) enum ChatRunResult {
@@ -245,6 +248,10 @@ impl App {
                     | WorkerEvent::Failed(_)
             ) {
                 self.refresh_git_ref();
+                // Тандемный гейт живёт только пока воркер ждёт решения; любой терминальный
+                // исход (в т.ч. Ctrl+C во время гейта → Cancelled) обязан его погасить.
+                self.tandem_gate = false;
+                self.tandem_gate_tx = None;
             }
 
             match event {
@@ -434,6 +441,21 @@ impl App {
                 WorkerEvent::PluginActionDone => self.plugin_action_done(),
                 WorkerEvent::MarketplacesLoaded(markets) => self.marketplaces_loaded(markets),
                 WorkerEvent::MarketplaceActionDone => self.marketplace_action_done(),
+                WorkerEvent::TandemNeedsApproval => {
+                    // Дебаты кончились без консенсуса — воркер заблокирован и ждёт. Проявляем
+                    // накопленные шаги (иначе гейт всплыл бы без контекста дебатов) и показываем
+                    // промпт прямо в ленте; ответ уйдёт в воркер по каналу из handle_input_key.
+                    self.tandem_gate = true;
+                    self.flush_reveal_buffer();
+                    self.push_system(self.lang.choose(
+                        "⚠ Консенсус не достигнут за раунды. Enter — исполнить последнюю версию · Esc — отмена, файлы не тронуты.",
+                        "⚠ No consensus within the rounds. Enter — execute the latest version · Esc — cancel, files untouched.",
+                    ));
+                    self.status = self
+                        .lang
+                        .choose("нет консенсуса — Enter/Esc", "no consensus — Enter/Esc")
+                        .to_string();
+                }
             }
         }
     }
@@ -870,6 +892,40 @@ mod tests {
             "отменённый чат не оставляет пометки: {:?}",
             app.transcript
         );
+    }
+
+    /// Гейт тандема: событие поднимает флаг и проявляет накопленные дебаты с промптом;
+    /// любой терминальный исход (здесь Cancelled после отказа) гейт гасит и снимает канал.
+    #[test]
+    fn tandem_gate_event_opens_and_terminal_event_closes_it() {
+        let (mut app, _dir) = app_for_events();
+        app.running = true;
+        app.reveal_buffer = vec!["🅐 предложение".to_string(), "🅒 возражение".to_string()];
+
+        app.tx.send(WorkerEvent::TandemNeedsApproval).expect("send");
+        app.drain_worker_events();
+
+        assert!(app.tandem_gate, "событие открывает гейт");
+        assert!(
+            app.reveal_buffer.is_empty(),
+            "накопленные дебаты проявлены перед решением"
+        );
+        assert!(
+            app.transcript
+                .iter()
+                .any(|l| l.contains("Консенсус не достигнут")),
+            "промпт гейта виден в ленте: {:?}",
+            app.transcript
+        );
+
+        // Во время гейта канал ответа занят (в проде его ставит start_tandem).
+        let (dummy_tx, _rx) = std::sync::mpsc::channel::<TandemGate>();
+        app.tandem_gate_tx = Some(dummy_tx);
+
+        app.tx.send(WorkerEvent::Cancelled).expect("send");
+        app.drain_worker_events();
+        assert!(!app.tandem_gate, "терминальный исход закрывает гейт");
+        assert!(app.tandem_gate_tx.is_none(), "канал ответа снят");
     }
 
     /// Отмена плана/движка (реплика уже в ленте): пометка нужна, а неотправленный

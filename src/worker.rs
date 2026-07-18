@@ -790,6 +790,14 @@ pub(crate) enum TandemResult {
     Cancelled,
 }
 
+/// Решение пользователя на гейте «нет консенсуса»: исполнять последнюю версию или
+/// отменить, не тронув файлы. Приходит по каналу в заблокированный воркер.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TandemGate {
+    Execute,
+    Abort,
+}
+
 /// Лента тандема, передаётся целиком в каждый промпт (P6: усечение при росте).
 struct TandemTranscript {
     entries: Vec<String>,
@@ -941,6 +949,7 @@ pub(crate) fn run_tandem(
     rounds: usize,
     work_dir: &Path,
     cancel_rx: Receiver<()>,
+    gate_rx: Receiver<TandemGate>,
     tx: Sender<WorkerEvent>,
     lang: Language,
 ) -> io::Result<TandemResult> {
@@ -958,6 +967,7 @@ pub(crate) fn run_tandem(
         task,
         rounds,
         &cancel_rx,
+        &gate_rx,
         &tx,
         lang,
     )
@@ -976,6 +986,7 @@ fn run_tandem_with<R>(
     task: &str,
     rounds: usize,
     cancel_rx: &Receiver<()>,
+    gate_rx: &Receiver<TandemGate>,
     tx: &Sender<WorkerEvent>,
     lang: Language,
 ) -> io::Result<TandemResult>
@@ -1010,17 +1021,8 @@ where
             None => return Ok(TandemResult::Cancelled),
         };
         tandem_accumulate(&mut total, &step.usage);
-        if step.code != 0 {
-            tandem_notice(
-                tx,
-                format!(
-                    "{} {}",
-                    executor_name,
-                    lang.choose("вернул ошибку", "returned an error")
-                ),
-            );
-            return Ok(TandemResult::Completed(step.code, opt_usage(total)));
-        }
+        // Вывод показываем ДО кода возврата: при ошибке причина «код N» — в самом выводе
+        // исполнителя, и глотать её (как было) значит оставить пользователя без диагностики.
         emit_tandem_step(
             tx,
             "🅐",
@@ -1036,6 +1038,17 @@ where
             ),
             &step.text,
         );
+        if step.code != 0 {
+            tandem_notice(
+                tx,
+                format!(
+                    "{} {}",
+                    executor_name,
+                    lang.choose("вернул ошибку", "returned an error")
+                ),
+            );
+            return Ok(TandemResult::Completed(step.code, opt_usage(total)));
+        }
 
         let challenge = tandem_challenge_prompt(task, &transcript.render(), lang);
         let step = match run_step(critic, critic_effort, &challenge, RunAccess::PlanReadonly)? {
@@ -1043,17 +1056,6 @@ where
             None => return Ok(TandemResult::Cancelled),
         };
         tandem_accumulate(&mut total, &step.usage);
-        if step.code != 0 {
-            tandem_notice(
-                tx,
-                format!(
-                    "{} {}",
-                    critic_name,
-                    lang.choose("вернул ошибку", "returned an error")
-                ),
-            );
-            return Ok(TandemResult::Completed(step.code, opt_usage(total)));
-        }
         emit_tandem_step(
             tx,
             "🅒",
@@ -1069,21 +1071,42 @@ where
             ),
             &step.text,
         );
+        if step.code != 0 {
+            tandem_notice(
+                tx,
+                format!(
+                    "{} {}",
+                    critic_name,
+                    lang.choose("вернул ошибку", "returned an error")
+                ),
+            );
+            return Ok(TandemResult::Completed(step.code, opt_usage(total)));
+        }
 
         if parse_tandem_signal(&step.text) {
             consensus = true;
             break;
         }
     }
+    // Нет консенсуса → НЕ пишем молча. Раньше отсюда молча шли в исполнение с доступом на
+    // запись — ровно это давало «внезапно изменённые файлы»: агенты не договорились, а файлы
+    // уже переписаны. Теперь показываем гейт и ЖДЁМ решения пользователя, продолжая слушать
+    // отмену. Пока ждём — файлы не тронуты (исполнение ещё впереди).
     if !consensus {
-        tandem_notice(
-            tx,
-            lang.choose(
-                "⚠ Консенсус не достигнут за раунды — исполняю последнюю версию.",
-                "⚠ No consensus within the rounds — executing the latest proposal.",
-            )
-            .to_string(),
-        );
+        let _ = tx.send(WorkerEvent::TandemNeedsApproval);
+        loop {
+            if cancel_rx.try_recv().is_ok() {
+                return Ok(TandemResult::Cancelled);
+            }
+            match gate_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(TandemGate::Execute) => break,
+                // Отказ пользователя или пропавший UI — исполнять нечего, файлы не тронуты.
+                Ok(TandemGate::Abort) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Ok(TandemResult::Cancelled);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            }
+        }
     }
 
     // ФАЗА ИСПОЛНЕНИЯ
@@ -1099,18 +1122,8 @@ where
         }
     };
     tandem_accumulate(&mut total, &step.usage);
-    if step.code != 0 {
-        dirty_notice(tx);
-        tandem_notice(
-            tx,
-            format!(
-                "{} {}",
-                executor_name,
-                lang.choose("вернул ошибку", "returned an error")
-            ),
-        );
-        return Ok(TandemResult::Completed(step.code, opt_usage(total)));
-    }
+    // Вывод исполнения показываем ДО кода: при ошибке (как в прогоне пользователя — код 1) причина
+    // была в самом выводе Claude, а он глотался — оставался только «вернул ошибку», нечего отлаживать.
     emit_tandem_step(
         tx,
         "🅐",
@@ -1123,6 +1136,18 @@ where
         lang.choose("исполнение", "execution"),
         &step.text,
     );
+    if step.code != 0 {
+        dirty_notice(tx);
+        tandem_notice(
+            tx,
+            format!(
+                "{} {}",
+                executor_name,
+                lang.choose("вернул ошибку", "returned an error")
+            ),
+        );
+        return Ok(TandemResult::Completed(step.code, opt_usage(total)));
+    }
 
     // ФАЗА РЕВЬЮ
     let review = tandem_review_prompt(task, &transcript.render(), lang);
@@ -2846,17 +2871,32 @@ mod tests {
         calls: Vec<(&'static str, RunAccess)>,
         notices: Vec<String>,
         chat: Vec<String>,
+        needs_approval: bool,
     }
 
     /// Прогоняет оркестратор на СЦЕНАРИИ шагов (None = отмена внутри шага).
-    /// `cancel_after` — послать отмену в канал после N-го шага.
+    /// `cancel_after` — послать отмену в канал после N-го шага. Решение гейта «нет
+    /// консенсуса» по умолчанию — `Execute` (путь «нет консенсуса → исполнение»).
     fn fake_tandem(
         steps: Vec<Option<TandemStep>>,
         rounds: usize,
         cancel_after: Option<usize>,
     ) -> TandemRun {
+        fake_tandem_gated(steps, rounds, cancel_after, TandemGate::Execute)
+    }
+
+    /// То же, но с явным решением гейта — предзагружается в канал до старта, поэтому
+    /// заблокированный воркер получает его сразу, как только упрётся в гейт.
+    fn fake_tandem_gated(
+        steps: Vec<Option<TandemStep>>,
+        rounds: usize,
+        cancel_after: Option<usize>,
+        gate: TandemGate,
+    ) -> TandemRun {
         let (tx, rx) = mpsc::channel();
         let (cancel_tx, cancel_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel();
+        gate_tx.send(gate).expect("решение гейта уходит в канал");
         let mut calls = Vec::new();
         let mut scripted = steps.into_iter();
         let mut done = 0usize;
@@ -2877,6 +2917,7 @@ mod tests {
             "задача",
             rounds,
             &cancel_rx,
+            &gate_rx,
             &tx,
             Language::Ru,
         )
@@ -2885,10 +2926,12 @@ mod tests {
         drop(tx);
         let mut notices = Vec::new();
         let mut chat = Vec::new();
+        let mut needs_approval = false;
         for event in rx.iter() {
             match event {
                 WorkerEvent::Line(line) => notices.push(line),
                 WorkerEvent::ChatLine(line) => chat.push(line),
+                WorkerEvent::TandemNeedsApproval => needs_approval = true,
                 _ => {}
             }
         }
@@ -2897,6 +2940,7 @@ mod tests {
             calls,
             notices,
             chat,
+            needs_approval,
         }
     }
 
@@ -2973,8 +3017,10 @@ mod tests {
     }
 
     #[test]
-    fn tandem_warns_when_rounds_end_without_consensus() {
-        let run = fake_tandem(
+    fn tandem_gates_execution_when_rounds_end_without_consensus() {
+        // Fix B: нет консенсуса → воркер НЕ пишет молча. Он эмитит запрос одобрения и
+        // блокируется. С предзагруженным Execute (дефолт) — проходит в исполнение и ревью.
+        let approved = fake_tandem(
             vec![
                 step("предложение 1"),
                 step("TANDEM: CONTINUE"),
@@ -2986,17 +3032,52 @@ mod tests {
             2,
             None,
         );
+        assert!(
+            approved.needs_approval,
+            "нет консенсуса → обязан запросить одобрение, а не писать молча"
+        );
         assert_eq!(
-            run.calls.len(),
+            approved.calls.len(),
             6,
-            "оба раунда дебатов + исполнение + ревью"
+            "одобрено → оба раунда дебатов + исполнение + ревью"
+        );
+        assert_eq!(
+            approved.calls[4],
+            ("claude", RunAccess::PlanExecute),
+            "5-й вызов — исполнение с доступом на запись, но ТОЛЬКО после одобрения"
+        );
+
+        // Esc/Abort на гейте: исполнение не запускается, файлы не тронуты, ран отменён.
+        let aborted = fake_tandem_gated(
+            vec![
+                step("предложение 1"),
+                step("TANDEM: CONTINUE"),
+                step("предложение 2"),
+                step("TANDEM: CONTINUE"),
+                step("сделал"), // недостижимо: гейт отклонён до исполнения
+                step("TANDEM: CONSENSUS"),
+            ],
+            2,
+            None,
+            TandemGate::Abort,
+        );
+        assert!(aborted.needs_approval, "гейт показан и при отказе");
+        assert_eq!(
+            aborted.calls.len(),
+            4,
+            "отказ на гейте → только дебаты; фаза исполнения не запускалась"
         );
         assert!(
-            run.notices
+            matches!(aborted.result, TandemResult::Cancelled),
+            "отказ = отмена без записи"
+        );
+        assert!(
+            !aborted
+                .notices
                 .iter()
-                .any(|line| line.contains("Консенсус не достигнут")),
-            "{:?}",
-            run.notices
+                .any(|l| l.contains("Файлы были изменены")),
+            "до исполнения файлы не трогали: {:?}",
+            aborted.notices
         );
     }
 
@@ -3150,6 +3231,71 @@ mod tests {
                 .any(|line| line.contains("Файлы были изменены")),
             "{:?}",
             execute.notices
+        );
+    }
+
+    #[test]
+    fn tandem_surfaces_step_output_before_reporting_an_error() {
+        // Регресс Fix A: при code≠0 вывод шага раньше ГЛОТАЛСЯ (emit шёл после return),
+        // и пользователь видел только «вернул ошибку» — причина (в самом выводе провайдера)
+        // пропадала, отлаживать было нечего. Теперь текст падающего шага обязан уйти в чат
+        // ДО обработки кода — в каждой мутирующей/дебатной фазе.
+        let has = |chat: &[String], needle: &str| chat.iter().any(|l| l.contains(needle));
+
+        // Дебаты — исполнитель падает, причина в его выводе.
+        let debate_exec = fake_tandem(
+            vec![Some(TandemStep {
+                text: "не нашёл модуль loader".to_string(),
+                code: 1,
+                usage: None,
+            })],
+            2,
+            None,
+        );
+        assert!(
+            has(&debate_exec.chat, "не нашёл модуль loader"),
+            "вывод падающего исполнителя в дебатах должен попасть в чат: {:?}",
+            debate_exec.chat
+        );
+
+        // Дебаты — критик падает, причина в его выводе.
+        let debate_crit = fake_tandem(
+            vec![
+                step("предложение"),
+                Some(TandemStep {
+                    text: "критик: таймаут провайдера".to_string(),
+                    code: 1,
+                    usage: None,
+                }),
+            ],
+            2,
+            None,
+        );
+        assert!(
+            has(&debate_crit.chat, "критик: таймаут провайдера"),
+            "вывод падающего критика в дебатах должен попасть в чат: {:?}",
+            debate_crit.chat
+        );
+
+        // Исполнение падает с кодом 1 (ровно кейс реального прогона): вывод исполнителя —
+        // единственная диагностика, и он обязан быть виден до «вернул ошибку».
+        let execute = fake_tandem(
+            vec![
+                step("предложение"),
+                step("TANDEM: CONSENSUS"),
+                Some(TandemStep {
+                    text: "написал ключ-гард, но упал на сборке".to_string(),
+                    code: 1,
+                    usage: None,
+                }),
+            ],
+            1,
+            None,
+        );
+        assert!(
+            has(&execute.chat, "написал ключ-гард, но упал на сборке"),
+            "вывод падающего исполнения должен попасть в чат: {:?}",
+            execute.chat
         );
     }
 

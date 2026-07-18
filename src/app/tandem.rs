@@ -1,6 +1,36 @@
 use super::*;
 
 impl App {
+    /// Активен ли гейт тандема «нет консенсуса»: воркер жив и ждёт решения. В отличие от
+    /// plan-гейта (`plan_gate_active`), здесь `running` остаётся true — воркер заблокирован,
+    /// а не завершён.
+    pub(crate) fn tandem_gate_active(&self) -> bool {
+        self.tandem_gate
+    }
+
+    /// Enter на гейте: исполнить последнюю версию. Разблокирует воркер — тот идёт в фазу
+    /// исполнения. `take` канала гасит гейт и исключает повторную отправку.
+    pub(crate) fn tandem_gate_approve(&mut self) {
+        if let Some(tx) = self.tandem_gate_tx.take() {
+            let _ = tx.send(TandemGate::Execute);
+        }
+        self.tandem_gate = false;
+        self.status = self.lang.choose("исполняю...", "executing...").to_string();
+        self.push_system(self.lang.choose(
+            "▶ Исполняю последнюю версию.",
+            "▶ Executing the latest version.",
+        ));
+    }
+
+    /// Esc на гейте: отменить, файлы не тронуты. Разблокирует воркер — тот вернёт
+    /// `Cancelled`, а его обработчик доснимет состояние прогона.
+    pub(crate) fn tandem_gate_abort(&mut self) {
+        if let Some(tx) = self.tandem_gate_tx.take() {
+            let _ = tx.send(TandemGate::Abort);
+        }
+        self.tandem_gate = false;
+    }
+
     /// Запустить тандем: исполнитель (architect) + критик (reviewer) из текущего Mode.
     pub(crate) fn start_tandem(&mut self, task: String) {
         if self.running {
@@ -30,6 +60,9 @@ impl App {
         let work_dir = self.resolved_work_dir();
         let task_run = task.clone();
         let (cancel_tx, cancel_rx) = mpsc::channel();
+        // Отдельный канал решения на гейте «нет консенсуса»: воркер блокируется на нём,
+        // UI отвечает Execute/Abort из handle_input_key.
+        let (gate_tx, gate_rx) = mpsc::channel();
 
         self.set_chat_title_from_prompt_if_needed(&task);
 
@@ -40,6 +73,8 @@ impl App {
         self.run_token_estimate = Some(estimate_tokens(&task));
         self.run_activity.clear();
         self.cancel_tx = Some(cancel_tx);
+        self.tandem_gate = false;
+        self.tandem_gate_tx = Some(gate_tx);
         self.last_ctrl_c_at = None;
         self.status = self.lang.choose("тандем...", "tandem...").to_string();
         self.push_system(format!("◆ {task}"));
@@ -74,6 +109,7 @@ impl App {
                     rounds,
                     &work_dir,
                     cancel_rx,
+                    gate_rx,
                     tx.clone(),
                     lang,
                 );
