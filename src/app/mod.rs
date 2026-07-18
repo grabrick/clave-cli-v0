@@ -96,6 +96,11 @@ pub(crate) struct App {
     pub(crate) run_token_estimate: Option<usize>,
     pub(crate) run_activity: VecDeque<String>,
     pub(crate) cancel_tx: Option<Sender<()>>,
+    /// Активен ли гейт тандема «нет консенсуса»: воркер жив, но заблокирован в ожидании
+    /// решения. В отличие от plan-гейта, `running` при этом остаётся true.
+    pub(crate) tandem_gate: bool,
+    /// Канал ответа заблокированному воркеру тандема (Enter → Execute, Esc → Abort).
+    pub(crate) tandem_gate_tx: Option<Sender<TandemGate>>,
     pub(crate) last_ctrl_c_at: Option<Instant>,
     pub(crate) footer_notice: Option<(String, Instant)>,
     pub(crate) footer_right_text: String,
@@ -286,6 +291,8 @@ impl App {
             run_token_estimate: None,
             run_activity: VecDeque::new(),
             cancel_tx: None,
+            tandem_gate: false,
+            tandem_gate_tx: None,
             last_ctrl_c_at: None,
             footer_notice: None,
             footer_right_text: String::new(),
