@@ -1,10 +1,6 @@
 use super::*;
 
 impl App {
-    pub(crate) fn resolved_work_dir(&self) -> PathBuf {
-        resolve_work_dir(&self.work_dir, &launch_work_dir())
-    }
-
     pub(crate) fn start_chat(&mut self, message: String) {
         // Во время выполнения сообщение не теряется, а встаёт в очередь и
         // запускается после завершения текущего рана (см. process_pending_messages).
@@ -131,191 +127,6 @@ impl App {
             }),
         );
     }
-
-    pub(crate) fn start_task(&mut self, task: String) {
-        if self.running {
-            self.push_system(
-                self.lang
-                    .choose("Clave уже выполняется.", "Clave is already running."),
-            );
-            return;
-        }
-
-        if !self.ensure_auth_ready_for_current_mode() {
-            return;
-        }
-
-        let engine = match engine_path() {
-            Some(path) => path,
-            None => {
-                self.status = "engine missing".to_string();
-                self.push_system(self.lang.choose(
-                    "spec-clave не найден. Задай CLAVE_ENGINE или запусти из корня проекта.",
-                    "spec-clave engine not found. Set CLAVE_ENGINE or run from project root.",
-                ));
-                return;
-            }
-        };
-        let (cancel_tx, cancel_rx) = mpsc::channel();
-
-        self.set_chat_title_from_prompt_if_needed(&task);
-
-        self.running = true;
-        self.run_started_at = Some(Instant::now());
-        self.last_run_duration = None;
-        self.run_label = ENGINE_NAME.to_string();
-        self.run_token_estimate = Some(estimate_tokens(&task));
-        self.run_activity.clear();
-        self.cancel_tx = Some(cancel_tx);
-        self.last_ctrl_c_at = None;
-        self.status = self.lang.choose("запущено", "running").to_string();
-        self.push_system(format!("◆ {task}"));
-        self.push_system(format!(
-            "{} {} {} {} · effort {}.",
-            self.lang.choose("⏺ Запускаю режим", "⏺ Running"),
-            self.mode.as_str(),
-            self.lang.choose("на раундов:", "with round(s):"),
-            self.rounds,
-            self.effort_summary()
-        ));
-
-        let tx = self.tx.clone();
-        let mode = self.mode;
-        let rounds = self.rounds.to_string();
-        let out_dir = self.out_dir.clone();
-        let common_effort = effort_label(self.effort_index).to_string();
-        let architect_provider = mode.architect_provider();
-        let reviewer_provider = mode.reviewer_provider();
-        let architect_effort = self
-            .provider_effort(architect_provider.as_str())
-            .to_string();
-        let reviewer_effort = self.provider_effort(reviewer_provider.as_str()).to_string();
-        let work_dir = self.resolved_work_dir();
-        let work_dir_arg = work_dir.to_string_lossy().to_string();
-        self.push_run_activity(format!(
-            "{} {}",
-            self.lang.choose("инструмент:", "tool:"),
-            ENGINE_NAME
-        ));
-        self.push_run_activity(format!(
-            "{} {}",
-            self.lang.choose("cwd:", "cwd:"),
-            work_dir.display()
-        ));
-        self.push_run_activity(format!(
-            "{} {} · {} {}",
-            self.lang.choose("исполнитель:", "executor:"),
-            architect_provider.as_str(),
-            self.lang.choose("ревьюер:", "reviewer:"),
-            reviewer_provider.as_str()
-        ));
-        self.push_run_activity(format!(
-            "{} {} · {} {} · out {}",
-            self.lang.choose("effort:", "effort:"),
-            self.effort_summary(),
-            self.lang.choose("раунды:", "rounds:"),
-            self.rounds,
-            self.out_dir
-        ));
-
-        (self.run_hooks.spawn)(
-            self.tx.clone(),
-            Box::new(move || {
-                let mut args = Vec::new();
-
-                match mode {
-                    Mode::CodexOnly => args.push("--codex-only".to_string()),
-                    Mode::ClaudeOnly => {
-                        args.extend([
-                            "--architect".to_string(),
-                            "claude".to_string(),
-                            "--reviewer".to_string(),
-                            "claude".to_string(),
-                        ]);
-                    }
-                    Mode::ClaudeCodex => {
-                        args.extend([
-                            "--architect".to_string(),
-                            "claude".to_string(),
-                            "--reviewer".to_string(),
-                            "codex".to_string(),
-                        ]);
-                    }
-                    Mode::CodexClaude => {
-                        args.extend([
-                            "--architect".to_string(),
-                            "codex".to_string(),
-                            "--reviewer".to_string(),
-                            "claude".to_string(),
-                        ]);
-                    }
-                }
-
-                args.extend([
-                    "--cwd".to_string(),
-                    work_dir_arg,
-                    "--rounds".to_string(),
-                    rounds,
-                    "--out".to_string(),
-                    out_dir,
-                    "--effort".to_string(),
-                    common_effort,
-                    "--architect-effort".to_string(),
-                    architect_effort,
-                    "--reviewer-effort".to_string(),
-                    reviewer_effort,
-                    task,
-                ]);
-
-                let mut engine_command = Command::new(&engine);
-                engine_command
-                    .current_dir(&work_dir)
-                    .args(args)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                configure_process_group(&mut engine_command);
-                let mut child = match engine_command.spawn() {
-                    Ok(child) => child,
-                    Err(err) => {
-                        let _ = tx.send(WorkerEvent::Failed(format!(
-                            "Failed to spawn {}: {err}",
-                            engine.display()
-                        )));
-                        return;
-                    }
-                };
-
-                if let Some(stdout) = child.stdout.take() {
-                    spawn_reader(stdout, tx.clone());
-                }
-
-                if let Some(stderr) = child.stderr.take() {
-                    spawn_reader(stderr, tx.clone());
-                }
-
-                loop {
-                    if cancel_rx.try_recv().is_ok() {
-                        // Убиваем всю группу движка (spec-clave + порождённые им claude/codex).
-                        kill_process_tree(&mut child);
-                        let _ = tx.send(WorkerEvent::Cancelled);
-                        return;
-                    }
-
-                    match child.try_wait() {
-                        Ok(Some(status)) => {
-                            let _ = tx.send(WorkerEvent::Done(status.code().unwrap_or(1)));
-                            return;
-                        }
-                        Ok(None) => thread::sleep(Duration::from_millis(80)),
-                        Err(err) => {
-                            let _ = tx.send(WorkerEvent::Failed(format!("Wait failed: {err}")));
-                            return;
-                        }
-                    }
-                }
-            }),
-        );
-    }
 }
 
 /// Тело чат-воркера в отрыве от спавна: гейт логина → запуск → эмит результата.
@@ -409,42 +220,11 @@ fn emit_chat_run_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::runs::testkit::*;
     use std::sync::mpsc;
 
     fn drain(rx: &mpsc::Receiver<WorkerEvent>) -> Vec<WorkerEvent> {
         rx.try_iter().collect()
-    }
-
-    fn noop_spawn(_tx: Sender<WorkerEvent>, _body: Box<dyn FnOnce() + Send + 'static>) {}
-
-    /// App с ФЕЙКОВЫМИ хуками: спавн — no-op (тело дропается, реального воркера нет),
-    /// логин — «залогинен». Позволяет наблюдать диспетч start_chat и guard-ы без
-    /// подпроцессов и живых auth-проб.
-    fn runs_app() -> App {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static SEQ: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "clave-runs-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::create_dir_all(&dir);
-        let config = AppConfig {
-            onboarding_done: true,
-            ..AppConfig::default()
-        };
-        let mut app = App::from_config(
-            config,
-            dir.join("config.json"),
-            dir.join("history"),
-            dir.clone(),
-        );
-        app.lang = Language::En;
-        app.run_hooks = RunHooks {
-            spawn: noop_spawn,
-            authenticated: |_| true,
-        };
-        app
     }
 
     // --- Мутант 111:16 (delete `!` в логин-гейте) ---
@@ -667,25 +447,6 @@ mod tests {
             .any(|e| matches!(e, WorkerEvent::ChatDone(..))));
     }
 
-    // --- Мутант mod.rs:178 (`real_spawn → ()`): дефолтный хук обязан выполнить тело ---
-    // Берём фн-указатель через RunHooks::real(), спавним тело, шлющее сигнал, и ждём с таймаутом.
-
-    #[test]
-    fn real_spawn_hook_actually_runs_the_body() {
-        let hooks = RunHooks::real();
-        let (tx, _rx) = mpsc::channel::<WorkerEvent>();
-        let (done_tx, done_rx) = mpsc::channel();
-        (hooks.spawn)(
-            tx,
-            Box::new(move || {
-                let _ = done_tx.send(());
-            }),
-        );
-        done_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("real_spawn обязан выполнить тело в потоке");
-    }
-
     // --- Диспетч start_chat по режиму (delete match arm Plan/Tandem) ---
 
     #[test]
@@ -758,19 +519,5 @@ mod tests {
         // и стартовал ран. Корректно — гейт плана блокирует.
         assert!(!app.running, "гейт плана открыт → ран не стартует");
         assert_eq!(app.pending_messages.len(), 1, "очередь не тронута");
-    }
-
-    // --- guard start_task (delete `!ensure_auth_ready`) ---
-
-    #[test]
-    fn start_task_bails_and_opens_auth_when_not_authenticated() {
-        let mut app = runs_app();
-        app.mode = Mode::ClaudeCodex; // режим требует обоих провайдеров
-        app.run_hooks.authenticated = |_| false; // не залогинен
-        app.start_task("t".into());
-        // Корректно: `!ensure_auth_ready` → ранний return, открыт экран авторизации.
-        // Мутант (delete `!`) полез бы к движку (onboarding остался бы None).
-        assert!(app.onboarding.is_some(), "не залогинен → экран авторизации");
-        assert!(!app.running, "ран не стартует без логина");
     }
 }
